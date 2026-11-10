@@ -9,7 +9,7 @@ mod prompt;
 mod provider;
 mod remote;
 
-use std::{sync::Arc, time::Duration};
+use std::sync::Arc;
 
 use koharu_ml::Device;
 
@@ -18,8 +18,8 @@ use local::LocalTranslator;
 
 pub use backend::{TranslationContext, TranslationRequest};
 pub use language::Language;
-pub use model::{GenerationConfig, Model, ModelSelection, Quantization};
-pub(crate) use model::{ModelGeneration, QuantizationDefinition, display_name};
+pub use model::{GenerationConfig, ModelSelection};
+pub(crate) use model::{ModelGeneration, QuantizationDefinition};
 pub use provider::{Provider, ProviderConfig, ProvidersConfig};
 
 #[derive(Clone)]
@@ -137,24 +137,6 @@ impl Translator {
         Ok((provider_id, translated))
     }
 
-    #[tracing::instrument(skip_all)]
-    pub async fn models() -> anyhow::Result<Vec<Model>> {
-        static CLIENT: tokio::sync::OnceCell<reqwest::Client> = tokio::sync::OnceCell::const_new();
-
-        let providers = ProvidersConfig::load()?;
-        let providers = providers.read()?.clone();
-        let client = CLIENT
-            .get_or_try_init(|| async {
-                reqwest::Client::builder()
-                    .timeout(Duration::from_secs(5))
-                    .build()
-            })
-            .await?;
-        let mut models = local::models();
-        models.extend(remote::models(client, &providers).await);
-        Ok(models)
-    }
-
     async fn local(&self, selection: &ModelSelection) -> Result<Arc<LocalTranslator>> {
         let mut loaded = self.local.lock().await;
         if loaded
@@ -193,21 +175,21 @@ mod tests {
     #[test]
     fn local_vision_requires_capability_and_generation_setting() {
         assert!(Translator::supports_vision(
-            &local_selection("gemma4-e2b-it"),
+            &local_selection("gemma4-e4b-it"),
             &GenerationConfig {
                 vision: Some(true),
                 ..GenerationConfig::default()
             }
         ));
         assert!(!Translator::supports_vision(
-            &local_selection("gemma4-e2b-it"),
+            &local_selection("gemma4-e4b-it"),
             &GenerationConfig {
                 vision: Some(false),
                 ..GenerationConfig::default()
             }
         ));
         assert!(!Translator::supports_vision(
-            &local_selection("lfm2.5-1.2b-instruct"),
+            &local_selection("unknown-model"),
             &GenerationConfig {
                 vision: Some(true),
                 ..GenerationConfig::default()

@@ -5,11 +5,7 @@ use strum::{Display, EnumIter, EnumString, IntoStaticStr, VariantArray};
 
 use crate::{
     local::LocalConfig,
-    remote::{
-        CaiyunConfig, ClaudeConfig, DeepLConfig, DeepSeekConfig, GeminiConfig, GoogleCloudConfig,
-        GrokConfig, LmStudioConfig, MiniMaxConfig, OpenAiCompatibleConfig, OpenAiConfig,
-        OpenRouterConfig,
-    },
+    remote::{OpenAiCompatibleConfig, OpenRouterConfig},
 };
 
 macro_rules! define_providers {
@@ -121,42 +117,6 @@ define_providers! {
         field: local,
         config: LocalConfig,
     }
-    OpenAi {
-        id: "openai",
-        name: "OpenAI",
-        field: openai,
-        config: OpenAiConfig,
-    }
-    Gemini {
-        id: "gemini",
-        name: "Gemini",
-        field: gemini,
-        config: GeminiConfig,
-    }
-    Claude {
-        id: "claude",
-        name: "Claude",
-        field: claude,
-        config: ClaudeConfig,
-    }
-    Grok {
-        id: "grok",
-        name: "Grok",
-        field: grok,
-        config: GrokConfig,
-    }
-    MiniMax {
-        id: "minimax",
-        name: "MiniMax",
-        field: minimax,
-        config: MiniMaxConfig,
-    }
-    DeepSeek {
-        id: "deepseek",
-        name: "DeepSeek",
-        field: deepseek,
-        config: DeepSeekConfig,
-    }
     OpenAiCompatible {
         id: "openai-compatible",
         name: "OpenAI-compatible",
@@ -168,30 +128,6 @@ define_providers! {
         name: "OpenRouter",
         field: openrouter,
         config: OpenRouterConfig,
-    }
-    LmStudio {
-        id: "lm-studio",
-        name: "LM Studio",
-        field: lm_studio,
-        config: LmStudioConfig,
-    }
-    DeepL {
-        id: "deepl",
-        name: "DeepL",
-        field: deepl,
-        config: DeepLConfig,
-    }
-    GoogleCloudTranslation {
-        id: "google-cloud-translation",
-        name: "Google Cloud Translation",
-        field: google_cloud_translation,
-        config: GoogleCloudConfig,
-    }
-    Caiyun {
-        id: "caiyun",
-        name: "Caiyun",
-        field: caiyun,
-        config: CaiyunConfig,
     }
 }
 

@@ -10,12 +10,9 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
 use super::send_json;
-use crate::{
-    GenerationConfig, Model, Provider, Result, TranslationRequest, backend::encode_image, prompt,
-};
+use crate::{GenerationConfig, Result, TranslationRequest, backend::encode_image, prompt};
 
 const CHAT_URL: &str = "https://openrouter.ai/api/v1/chat/completions";
-const MODELS_URL: &str = "https://openrouter.ai/api/v1/models";
 
 #[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize, specta::Type)]
 #[serde(default)]
@@ -95,65 +92,6 @@ pub(super) async fn translate(
         &text,
         &request.segments,
     )?)
-}
-
-pub(super) async fn models(client: &Client) -> Result<Vec<Model>> {
-    let Some(api_key) = koharu_secrets::get("openrouter")? else {
-        return Ok(Vec::new());
-    };
-    let discovered: Result<ModelsResponse> = super::send_json(
-        "openrouter",
-        client.get(MODELS_URL).bearer_auth(api_key.expose_secret()),
-    )
-    .await;
-    Ok(match discovered {
-        Ok(discovered) => discovered
-            .data
-            .into_iter()
-            .map(|model| Model {
-                provider: Provider::OpenRouter,
-                name: model.name,
-                model: Some(model.id),
-                quantizations: Vec::new(),
-                vision: model
-                    .architecture
-                    .input_modalities
-                    .iter()
-                    .any(|modality| modality == "image"),
-                reasoning: model.reasoning.is_some()
-                    || model
-                        .supported_parameters
-                        .iter()
-                        .any(|parameter| parameter == "reasoning"),
-            })
-            .collect(),
-        Err(error) => {
-            tracing::warn!(%error, "failed to list OpenRouter models");
-            Vec::new()
-        }
-    })
-}
-
-#[derive(Deserialize)]
-struct ModelsResponse {
-    data: Vec<ListedModel>,
-}
-
-#[derive(Deserialize)]
-struct ListedModel {
-    id: String,
-    name: String,
-    architecture: Architecture,
-    supported_parameters: Vec<String>,
-    reasoning: Option<ReasoningCapabilities>,
-}
-
-#[derive(Deserialize)]
-struct ReasoningCapabilities {}
-
-#[derive(Deserialize)]
-struct Architecture {
-    input_modalities: Vec<String>,
 }
 
 #[derive(Serialize)]
@@ -243,32 +181,6 @@ struct ResponseMessage {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn reads_reasoning_capability_from_model_list() {
-        let response: ModelsResponse = serde_json::from_value(serde_json::json!({
-            "data": [
-                {
-                    "id": "provider/reasoning-model",
-                    "name": "Reasoning Model",
-                    "architecture": { "input_modalities": ["text"] },
-                    "supported_parameters": ["reasoning"],
-                    "reasoning": {
-                        "supported_efforts": ["high", "medium", "low"]
-                    }
-                },
-                {
-                    "id": "provider/chat-model",
-                    "name": "Chat Model",
-                    "architecture": { "input_modalities": ["text"] },
-                    "supported_parameters": []
-                }
-            ]
-        }))
-        .unwrap();
-        assert!(response.data[0].reasoning.is_some());
-        assert!(response.data[1].reasoning.is_none());
-    }
 
     #[test]
     fn serializes_openrouter_request_contract() {

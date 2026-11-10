@@ -7,10 +7,7 @@ use serde::{Deserialize, Serialize};
 use url::Url;
 
 use super::send_json;
-use crate::{
-    GenerationConfig, Model, Provider, Result, TranslationRequest, backend::encode_image,
-    display_name, prompt,
-};
+use crate::{GenerationConfig, Result, TranslationRequest, backend::encode_image, prompt};
 
 const DEFAULT_BASE_URL: &str = "http://localhost:11434/v1";
 
@@ -102,28 +99,6 @@ pub(super) async fn translate(
     )?)
 }
 
-pub(super) async fn models(client: &Client, config: &OpenAiCompatibleConfig) -> Result<Vec<Model>> {
-    let api_key = koharu_secrets::get("openai-compatible")?;
-    let request = client.get(endpoint(config.base_url.as_ref(), "models"));
-    let request = match api_key {
-        Some(api_key) => request.bearer_auth(api_key.expose_secret()),
-        None => request,
-    };
-    let response: ModelsResponse = send_json("openai-compatible", request).await?;
-    Ok(response
-        .data
-        .into_iter()
-        .map(|model| Model {
-            provider: Provider::OpenAiCompatible,
-            name: display_name(&model.id),
-            model: Some(model.id),
-            quantizations: Vec::new(),
-            vision: true,
-            reasoning: true,
-        })
-        .collect())
-}
-
 fn endpoint(base_url: Option<&Url>, suffix: &str) -> String {
     let base_url = base_url.map_or(DEFAULT_BASE_URL, Url::as_str);
     format!(
@@ -204,16 +179,6 @@ struct Choice {
 #[derive(Deserialize)]
 struct ResponseMessage {
     content: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct ModelsResponse {
-    data: Vec<ListedModel>,
-}
-
-#[derive(Deserialize)]
-struct ListedModel {
-    id: String,
 }
 
 #[cfg(test)]
