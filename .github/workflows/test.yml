@@ -24,6 +24,8 @@ jobs:
             libclang-dev \
             cmake \
             libfontconfig-dev \
+            libvulkan1 \
+            mesa-vulkan-drivers \
             fonts-noto-cjk
       - uses: actions/checkout@v7
       - uses: Swatinem/rust-cache@v2
