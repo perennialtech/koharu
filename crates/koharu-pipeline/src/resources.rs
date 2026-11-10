@@ -56,7 +56,13 @@ impl ResourceMonitor {
         let monitor = Arc::downgrade(self);
         let device = self.device.clone();
         runtime.spawn(async move {
-            let mut system = System::new();
+            let mut system = match System::new() {
+                Ok(system) => Some(system),
+                Err(error) => {
+                    tracing::warn!(%error, "host resource telemetry is unavailable");
+                    None
+                }
+            };
             let mut vram = vram::Monitor::new(device.clone());
             let mut vram_unavailable = false;
             let pid = get_current_pid().ok();
@@ -73,17 +79,21 @@ impl ResourceMonitor {
                 let Some(monitor) = monitor.upgrade() else {
                     return;
                 };
-                if host_refresh_tick == 0 {
+                if host_refresh_tick == 0
+                    && let Some(system) = system.as_mut()
+                {
                     system.refresh_memory();
                     if let Some(pid) = pid {
                         system.refresh_processes(ProcessesToUpdate::Some(&[pid]), true);
                     }
                 }
                 host_refresh_tick = (host_refresh_tick + 1) % 5;
-                let process = pid.and_then(|pid| system.process(pid));
+                let process = system
+                    .as_ref()
+                    .and_then(|system| pid.and_then(|pid| system.process(pid)));
                 let system_memory = vram::SystemMemory {
-                    total_bytes: system.total_memory(),
-                    used_bytes: system.used_memory(),
+                    total_bytes: system.as_ref().map_or(0, System::total_memory),
+                    used_bytes: system.as_ref().map_or(0, System::used_memory),
                 };
                 let devices = match vram.sample(system_memory) {
                     Ok(devices) => {
