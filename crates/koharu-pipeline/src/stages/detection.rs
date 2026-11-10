@@ -608,12 +608,19 @@ fn mask_angle(points: &[MaskPoint], [left, top, right, bottom]: [f32; 4]) -> (f3
             ]
         },
     );
+    // One large text mask otherwise serializes the whole page's detection
+    // output, so the angles are scored in parallel and compared in order.
+    let scores = (-ANGLE_SEARCH_HALF_STEPS..=ANGLE_SEARCH_HALF_STEPS)
+        .into_par_iter()
+        .map(|step| {
+            let angle_degrees = f64::from(step) * ANGLE_SEARCH_STEP_DEGREES;
+            let (sin, cos) = angle_degrees.to_radians().sin_cos();
+            (angle_degrees, projection_scores(points, bounds, sin, cos))
+        })
+        .collect::<Vec<_>>();
     let mut horizontal = (f64::NEG_INFINITY, 0.0);
     let mut vertical = (f64::NEG_INFINITY, 0.0);
-    for step in -ANGLE_SEARCH_HALF_STEPS..=ANGLE_SEARCH_HALF_STEPS {
-        let angle_degrees = f64::from(step) * ANGLE_SEARCH_STEP_DEGREES;
-        let (sin, cos) = angle_degrees.to_radians().sin_cos();
-        let (horizontal_score, vertical_score) = projection_scores(points, bounds, sin, cos);
+    for (angle_degrees, (horizontal_score, vertical_score)) in scores {
         if horizontal_score > horizontal.0 {
             horizontal = (horizontal_score, angle_degrees);
         }
@@ -646,13 +653,15 @@ fn projection_scores(points: &[MaskPoint], bounds: [f64; 4], sin: f64, cos: f64)
     let mut vertical = vec![0.0; vertical_length];
     for point in points {
         let horizontal_projection = point.y * cos - point.x * sin - horizontal_origin;
-        let horizontal_index = horizontal_projection.floor() as usize;
+        // Projections are non-negative relative to the floored origin, so the
+        // truncating cast is the floor without a libm call per point.
+        let horizontal_index = horizontal_projection as usize;
         let horizontal_fraction = horizontal_projection - horizontal_index as f64;
         horizontal[horizontal_index] += 1.0 - horizontal_fraction;
         horizontal[horizontal_index + 1] += horizontal_fraction;
 
         let vertical_projection = point.x * cos + point.y * sin - vertical_origin;
-        let vertical_index = vertical_projection.floor() as usize;
+        let vertical_index = vertical_projection as usize;
         let vertical_fraction = vertical_projection - vertical_index as f64;
         vertical[vertical_index] += 1.0 - vertical_fraction;
         vertical[vertical_index + 1] += vertical_fraction;
