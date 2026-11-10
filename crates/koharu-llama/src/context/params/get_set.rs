@@ -129,6 +129,22 @@ impl LlamaContextParams {
         self.context_params.n_seq_max
     }
 
+    /// Set the maximum number of outputs in a ubatch; `0` uses `n_batch`.
+    ///
+    /// The compute buffer is reserved for this many logit rows.
+    #[must_use]
+    pub fn with_n_outputs_max(mut self, n_outputs_max: u32) -> Self {
+        self.context_params.n_outputs_max = n_outputs_max;
+        self
+    }
+
+    /// Set the maximum number of outputs per sequence; `0` uses `n_outputs_max`.
+    #[must_use]
+    pub fn with_n_outputs_max_per_seq(mut self, n_outputs_max_per_seq: u32) -> Self {
+        self.context_params.n_outputs_max_per_seq = n_outputs_max_per_seq;
+        self
+    }
+
     /// Set the number of recurrent-state rollback snapshots per sequence.
     #[must_use]
     pub fn with_n_rs_seq(mut self, n_rs_seq: u32) -> Self {

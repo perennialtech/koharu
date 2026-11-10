@@ -771,10 +771,14 @@ fn model_params(
 
 fn context_config(prepared: &PreparedPrompt, options: &GenerationOptions) -> Result<ContextConfig> {
     let values = context_values(prepared, options)?;
+    // Generation reads logits for only the last token of each decode, so the
+    // compute buffer needs one output row instead of one per batch token; for
+    // a 262k-token vocabulary that is about 1 MiB per row.
     let mut params = LlamaContextParams::default()
         .with_n_ctx(Some(values.n_ctx))
         .with_n_batch(values.n_batch)
-        .with_n_ubatch(values.n_ubatch);
+        .with_n_ubatch(values.n_ubatch)
+        .with_n_outputs_max(1);
     if prepared.non_causal {
         params = params.with_attention_type(LlamaAttentionType::NonCausal);
     }
@@ -826,6 +830,8 @@ fn batch_context_config(
         .with_n_batch(n_batch)
         .with_n_ubatch(n_ubatch)
         .with_n_seq_max(sequences)
+        .with_n_outputs_max(sequences)
+        .with_n_outputs_max_per_seq(1)
         .with_kv_unified(false);
     if non_causal {
         params = params.with_attention_type(LlamaAttentionType::NonCausal);
