@@ -75,6 +75,17 @@ impl Llm {
         self.inference_with_callback(input, options, |_| Ok(GenerationControl::Continue))
     }
 
+    /// Generates unconstrained text for several inputs together.
+    ///
+    /// Returns one generation per input, in input order.
+    pub fn inference_batch(
+        &self,
+        inputs: &[Input<'_>],
+        options: &GenerationOptions,
+    ) -> Result<Vec<Generation>> {
+        self.model.inference_batch(inputs, options)
+    }
+
     /// Generates text and invokes `on_token` after each decoded token.
     pub fn inference_with_callback<F>(
         &self,

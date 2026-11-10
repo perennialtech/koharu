@@ -12,6 +12,10 @@ use crate::{
 
 const MAX_NEW_TOKENS: usize = 512;
 const REPETITION_PENALTY: f32 = 1.2;
+// Each sequence keeps its own KV stream sized for the prompt plus
+// MAX_NEW_TOKENS, about 14 MiB here, so pages with many text regions are
+// recognized in groups to bound VRAM.
+const BATCH_SIZE: usize = 8;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PaddleOCRVLTask {
@@ -69,29 +73,40 @@ impl PaddleOCRVLQuantized {
         Ok(Self { model })
     }
 
+    /// Recognizes each image with the same task, returning results in order.
     pub fn inference(
         &self,
-        image: &DynamicImage,
+        images: &[&DynamicImage],
         task: PaddleOCRVLTask,
-    ) -> Result<PaddleOCRVLResult> {
+    ) -> Result<Vec<PaddleOCRVLResult>> {
         let prompt = self.model.render_chat_prompt(&[ChatMessage::user(format!(
             "{}{}",
             mtmd_default_marker(),
             task.prompt()
         ))])?;
-        let generation = self.model.inference(
-            &Input::new(&prompt).with_image(image),
-            &GenerationOptions {
-                max_tokens: MAX_NEW_TOKENS,
-                temperature: 0.0,
-                repeat_penalty: REPETITION_PENALTY,
-                repeat_last_n: MAX_NEW_TOKENS as i32,
-                add_special: true,
-                ..GenerationOptions::default()
-            },
-        )?;
-        Ok(PaddleOCRVLResult {
-            text: generation.text,
-        })
+        let options = GenerationOptions {
+            max_tokens: MAX_NEW_TOKENS,
+            temperature: 0.0,
+            repeat_penalty: REPETITION_PENALTY,
+            repeat_last_n: MAX_NEW_TOKENS as i32,
+            add_special: true,
+            ..GenerationOptions::default()
+        };
+        let mut results = Vec::with_capacity(images.len());
+        for group in images.chunks(BATCH_SIZE) {
+            let inputs = group
+                .iter()
+                .map(|image| Input::new(&prompt).with_image(image))
+                .collect::<Vec<_>>();
+            results.extend(
+                self.model
+                    .inference_batch(&inputs, &options)?
+                    .into_iter()
+                    .map(|generation| PaddleOCRVLResult {
+                        text: generation.text,
+                    }),
+            );
+        }
+        Ok(results)
     }
 }

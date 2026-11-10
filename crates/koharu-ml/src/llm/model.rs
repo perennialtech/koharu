@@ -254,6 +254,7 @@ impl Model {
             &mut context,
             &mut sampler,
             context_config.n_batch,
+            0,
         )?;
         let prompt_duration = prompt_start.elapsed();
         drop(mtmd);
@@ -346,6 +347,148 @@ impl Model {
         })
     }
 
+    /// Generates unconstrained text for several inputs in one context.
+    ///
+    /// Each input is prefilled into its own sequence; the sequences then decode
+    /// together, one token each per step, so a step costs about as much as a
+    /// single-sequence step on a small model.
+    pub(super) fn inference_batch(
+        &self,
+        inputs: &[Input<'_>],
+        options: &GenerationOptions,
+    ) -> Result<Vec<Generation>> {
+        validate_generation_options(options)?;
+        ensure!(
+            !self.model.has_encoder(),
+            "batched generation does not support encoder-decoder models"
+        );
+        if inputs.is_empty() || options.max_tokens == 0 {
+            return Ok(inputs
+                .iter()
+                .map(|_| Generation::empty(FinishReason::Length))
+                .collect());
+        }
+
+        let mtmd = if inputs.iter().all(|input| input.images().is_empty()) {
+            None
+        } else {
+            Some(
+                self.mtmd
+                    .as_ref()
+                    .context("image input requires an MTMD projector")?
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("MTMD projector lock is poisoned"))?,
+            )
+        };
+        let prepared = inputs
+            .iter()
+            .map(|input| self.prepare_prompt(input, options.add_special, mtmd.as_deref()))
+            .collect::<Result<Vec<_>>>()?;
+        let context_config = batch_context_config(&prepared, options)?;
+        let mut context = self
+            .model
+            .new_context(self.backend, context_config.params)
+            .context("failed to create llama.cpp context")?;
+
+        struct Sequence {
+            sampler: LlamaSampler,
+            decoder: encoding_rs::Decoder,
+            next_token: LlamaToken,
+            position: i32,
+            generation: Generation,
+            done: bool,
+        }
+        let mut sequences = Vec::with_capacity(prepared.len());
+        for (index, prepared) in prepared.iter().enumerate() {
+            let (mut sampler, _) = self.build_sampler(options, None, &prepared.history_tokens)?;
+            let prompt_start = Instant::now();
+            let (next_token, position) = self.prefill(
+                prepared,
+                mtmd.as_deref(),
+                &mut context,
+                &mut sampler,
+                context_config.n_batch,
+                i32::try_from(index).context("sequence index exceeds i32")?,
+            )?;
+            let mut generation = Generation::empty(FinishReason::Length);
+            generation.prompt_tokens = prepared.prompt_tokens;
+            generation.prompt_duration = prompt_start.elapsed();
+            sequences.push(Sequence {
+                sampler,
+                decoder: encoding_rs::UTF_8.new_decoder(),
+                next_token,
+                position,
+                generation,
+                done: false,
+            });
+        }
+        drop(mtmd);
+
+        let generation_start = Instant::now();
+        let mut batch = LlamaBatch::new(sequences.len(), 1);
+        let mut decoding = Vec::with_capacity(sequences.len());
+        loop {
+            batch.clear();
+            decoding.clear();
+            for (index, sequence) in sequences.iter_mut().enumerate() {
+                if sequence.done {
+                    continue;
+                }
+                let generation = &mut sequence.generation;
+                if self.should_stop(sequence.next_token) {
+                    generation.finish_reason = FinishReason::StopToken;
+                    sequence.done = true;
+                    continue;
+                }
+                let piece = self
+                    .model
+                    .token_to_piece(sequence.next_token, &mut sequence.decoder, true, None)
+                    .context("failed to decode generated token")?;
+                generation.text.push_str(&piece);
+                generation.generated_tokens += 1;
+                if generation.generated_tokens >= options.max_tokens {
+                    sequence.done = true;
+                    continue;
+                }
+                batch
+                    .add(
+                        sequence.next_token,
+                        sequence.position,
+                        &[i32::try_from(index).context("sequence index exceeds i32")?],
+                        true,
+                    )
+                    .context("failed to build generated-token batch")?;
+                sequence.position = sequence
+                    .position
+                    .checked_add(1)
+                    .context("generated position exceeds i32")?;
+                decoding.push(index);
+            }
+            if decoding.is_empty() {
+                break;
+            }
+            context
+                .decode(&mut batch)
+                .context("failed to decode generated tokens")?;
+            for (output, &index) in decoding.iter().enumerate() {
+                let sequence = &mut sequences[index];
+                sequence.next_token = sequence.sampler.sample(
+                    &context,
+                    i32::try_from(output).context("batch output exceeds i32")?,
+                );
+            }
+        }
+
+        let generation_duration = generation_start.elapsed();
+        Ok(sequences
+            .into_iter()
+            .map(|sequence| Generation {
+                generation_duration,
+                ..sequence.generation
+            })
+            .collect())
+    }
+
     fn prepare_prompt(
         &self,
         input: &Input<'_>,
@@ -430,12 +573,13 @@ impl Model {
         context: &mut LlamaContext<'_>,
         sampler: &mut LlamaSampler,
         n_batch: u32,
+        sequence: i32,
     ) -> Result<(LlamaToken, i32)> {
         match &prepared.kind {
             PreparedPromptKind::Text(tokens) => {
                 let mut batch = LlamaBatch::new(tokens.len(), 1);
                 batch
-                    .add_sequence(tokens, 0, false)
+                    .add_sequence(tokens, sequence, false)
                     .context("failed to build prompt batch")?;
                 if self.model.has_encoder() {
                     context
@@ -457,7 +601,7 @@ impl Model {
                         mtmd,
                         context,
                         0,
-                        0,
+                        sequence,
                         i32::try_from(n_batch).context("batch size exceeds i32")?,
                         true,
                     )
@@ -644,6 +788,55 @@ fn context_config(prepared: &PreparedPrompt, options: &GenerationOptions) -> Res
         params,
         n_batch: values.n_batch,
     })
+}
+
+/// Context for [`Model::inference_batch`]: one KV stream per sequence, each
+/// sized like a single-sequence context, and a batch that holds a token from
+/// every sequence.
+fn batch_context_config(
+    prepared: &[PreparedPrompt],
+    options: &GenerationOptions,
+) -> Result<ContextConfig> {
+    let sequences = u32::try_from(prepared.len()).context("too many sequences")?;
+    let mut n_ctx = 1;
+    let mut n_batch = sequences;
+    let mut non_causal = false;
+    for prepared in prepared {
+        let values = context_values(prepared, options)?;
+        n_ctx = n_ctx.max(values.n_ctx.get());
+        n_batch = n_batch.max(values.n_batch);
+        non_causal |= prepared.non_causal;
+    }
+    let n_ubatch = if non_causal {
+        n_batch
+    } else {
+        options
+            .n_ubatch
+            .unwrap_or_else(|| n_batch.min(DEFAULT_MAX_UBATCH))
+            .clamp(1, n_batch)
+    };
+    // llama.cpp pads the context to a multiple of 256 cells and then splits it
+    // evenly between sequences, so pad each sequence's share first.
+    let n_ctx = n_ctx
+        .checked_next_multiple_of(256)
+        .and_then(|n_ctx| n_ctx.checked_mul(sequences))
+        .context("context size exceeds u32")?;
+    let mut params = LlamaContextParams::default()
+        .with_n_ctx(NonZeroU32::new(n_ctx))
+        .with_n_batch(n_batch)
+        .with_n_ubatch(n_ubatch)
+        .with_n_seq_max(sequences)
+        .with_kv_unified(false);
+    if non_causal {
+        params = params.with_attention_type(LlamaAttentionType::NonCausal);
+    }
+    if let Some(n_threads) = options.n_threads {
+        params = params.with_n_threads(n_threads);
+    }
+    if let Some(n_threads_batch) = options.n_threads_batch {
+        params = params.with_n_threads_batch(n_threads_batch);
+    }
+    Ok(ContextConfig { params, n_batch })
 }
 
 struct ContextValues {
