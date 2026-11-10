@@ -73,8 +73,13 @@ impl KoharuLayoutRFDetrSeg2XL {
         koharu_torch::no_grad(|| {
             let pixel_values = self.processor.preprocess(image, self.device)?;
             let output = self.model.forward(&pixel_values);
-            self.processor
-                .postprocess(&output, image.width(), image.height(), thresholds)
+            self.processor.postprocess(
+                &self.model,
+                &output,
+                image.width(),
+                image.height(),
+                thresholds,
+            )
         })
     }
 

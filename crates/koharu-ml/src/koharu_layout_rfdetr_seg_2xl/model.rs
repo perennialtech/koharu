@@ -27,7 +27,8 @@ const DECODER_LAYERS: usize = 6;
 pub(super) struct Output {
     pub pred_logits: Tensor,
     pub pred_boxes: Tensor,
-    pub pred_masks: Tensor,
+    spatial_features: Tensor,
+    query_features: Tensor,
 }
 
 #[derive(Debug)]
@@ -116,14 +117,22 @@ impl Model {
         )
         .i(-1);
         let pred_logits = self.class_embed.forward(&hs).i(-1);
-        let pred_masks =
-            self.segmentation_head
-                .forward(&features[0], &hs.i(-1), (RESOLUTION, RESOLUTION));
         Output {
             pred_logits,
             pred_boxes,
-            pred_masks,
+            spatial_features: features[0].shallow_clone(),
+            query_features: hs.i(-1),
         }
+    }
+
+    pub(super) fn masks(&self, output: &Output, query_indexes: &Tensor) -> Tensor {
+        // The spatial segmentation network is query-independent. Compute
+        // per-query masks only for detections retained by postprocessing.
+        self.segmentation_head.forward(
+            &output.spatial_features,
+            &output.query_features.index_select(1, query_indexes),
+            (RESOLUTION, RESOLUTION),
+        )
     }
 }
 
