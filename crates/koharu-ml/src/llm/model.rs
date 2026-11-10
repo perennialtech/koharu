@@ -9,7 +9,7 @@ use std::{
     fmt::{Debug, Formatter},
     num::NonZeroU32,
     path::{Path, PathBuf},
-    sync::{Mutex, OnceLock},
+    sync::{Arc, Mutex, OnceLock, PoisonError},
     time::Instant,
 };
 
@@ -40,7 +40,7 @@ const CHAT_TEMPLATE_NAME: &str = "chat";
 
 pub(super) struct Model {
     backend: &'static LlamaBackend,
-    model: LlamaModel,
+    model: Arc<LlamaModel>,
     mtmd: Option<Mutex<MtmdContext>>,
     capabilities: Capabilities,
     eos_token: LlamaToken,
@@ -136,8 +136,10 @@ impl Model {
         ensure_file(&model_path, "GGUF model")?;
         let backend = crate::llama_backend().context("llama.cpp backend is not initialized")?;
         let params = model_params(backend, device, &options)?;
-        let model = LlamaModel::load_from_file(backend, &model_path, &params)
-            .with_context(|| format!("failed to load GGUF model {}", model_path.display()))?;
+        let model = Arc::new(
+            LlamaModel::load_from_file(backend, &model_path, &params)
+                .with_context(|| format!("failed to load GGUF model {}", model_path.display()))?,
+        );
         ensure!(
             model.has_decoder(),
             "GGUF model does not advertise a decoder graph"
@@ -255,7 +257,8 @@ impl Model {
             .model
             .new_context(self.backend, context_config.params)
             .context("failed to create llama.cpp context")?;
-        let mut sampler = self.build_sampler(options, json_schema, &prepared.history_tokens)?;
+        let (mut sampler, grammar) =
+            self.build_sampler(options, json_schema, &prepared.history_tokens)?;
 
         let prompt_start = Instant::now();
         let (mut next_token, mut position) = self.prefill(
@@ -274,44 +277,73 @@ impl Model {
         let mut generated_tokens = 0;
         let mut finish_reason = FinishReason::Length;
 
-        while generated_tokens < options.max_tokens {
-            if self.should_stop(next_token) {
-                finish_reason = FinishReason::StopToken;
-                break;
+        let n_batch =
+            usize::try_from(context_config.n_batch).context("batch size exceeds usize")?;
+        let mut pending = Vec::with_capacity(n_batch);
+        'generation: while generated_tokens < options.max_tokens {
+            // llguidance fast-forward: tokens the grammar forces after the sampled
+            // one are decoded in the same batch instead of one decode per token.
+            // A forced token is the only unmasked candidate, so sampling it would
+            // select it anyway; it is accepted into the chain to keep penalties and
+            // the matcher in step.
+            pending.clear();
+            pending.push(next_token);
+            if let Some(grammar) = &grammar {
+                let forced = grammar
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .compute_ff_tokens();
+                for token in forced.into_iter().take(n_batch - 1) {
+                    let token = LlamaToken::new(token.cast_signed());
+                    sampler.accept(token);
+                    pending.push(token);
+                }
             }
 
-            let piece = self
-                .model
-                .token_to_piece(next_token, &mut decoder, true, None)
-                .context("failed to decode generated token")?;
-            text.push_str(&piece);
-            generated_tokens += 1;
+            for &token in &pending {
+                if self.should_stop(token) {
+                    finish_reason = FinishReason::StopToken;
+                    break 'generation;
+                }
+                let piece = self
+                    .model
+                    .token_to_piece(token, &mut decoder, true, None)
+                    .context("failed to decode generated token")?;
+                text.push_str(&piece);
+                generated_tokens += 1;
 
-            if matches!(
-                on_token(TokenChunk {
-                    token: next_token,
-                    piece: &piece,
-                    text: &text,
-                    generated_tokens,
-                })?,
-                GenerationControl::Stop
-            ) {
-                finish_reason = FinishReason::Callback;
-                break;
-            }
-            if generated_tokens >= options.max_tokens {
-                break;
+                if matches!(
+                    on_token(TokenChunk {
+                        token,
+                        piece: &piece,
+                        text: &text,
+                        generated_tokens,
+                    })?,
+                    GenerationControl::Stop
+                ) {
+                    finish_reason = FinishReason::Callback;
+                    break 'generation;
+                }
+                if generated_tokens >= options.max_tokens {
+                    break 'generation;
+                }
             }
 
-            let mut batch = LlamaBatch::new(1, 1);
-            batch
-                .add(next_token, position, &[0], true)
-                .context("failed to build generated-token batch")?;
+            let mut batch = LlamaBatch::new(pending.len(), 1);
+            let last = pending.len() - 1;
+            for (offset, &token) in pending.iter().enumerate() {
+                let token_position = position
+                    .checked_add(i32::try_from(offset).context("batch offset exceeds i32")?)
+                    .context("generated position exceeds i32")?;
+                batch
+                    .add(token, token_position, &[0], offset == last)
+                    .context("failed to build generated-token batch")?;
+            }
             context
                 .decode(&mut batch)
                 .context("failed to decode generated token")?;
             position = position
-                .checked_add(1)
+                .checked_add(i32::try_from(pending.len()).context("batch size exceeds i32")?)
                 .context("generated position exceeds i32")?;
             // llama_sampler_sample applies the chain and accepts the selected token.
             next_token = sampler.sample(&context, -1);
@@ -497,8 +529,9 @@ impl Model {
         options: &GenerationOptions,
         json_schema: Option<&serde_json::Value>,
         history_tokens: &[LlamaToken],
-    ) -> Result<LlamaSampler> {
+    ) -> Result<(LlamaSampler, Option<Arc<Mutex<Matcher>>>)> {
         let mut samplers = Vec::new();
+        let mut grammar = None;
 
         if let Some(schema) = json_schema {
             let mut schema = schema.clone();
@@ -522,12 +555,14 @@ impl Model {
                 .as_ref()
                 .map_err(|error| anyhow::Error::msg(error.clone()))
                 .context("failed to initialize structured output tokenizer")?;
-            let grammar = TopLevelGrammar::from_tagged_str("json_schema", &schema)
+            let schema = TopLevelGrammar::from_tagged_str("json_schema", &schema)
                 .context("failed to compile structured output schema")?;
             let parser = factory
-                .create_parser(grammar)
+                .create_parser(schema)
                 .context("failed to create structured output parser")?;
-            samplers.push(LlamaSampler::from(Matcher::new(Ok(parser))));
+            let matcher = Arc::new(Mutex::new(Matcher::new(Ok(parser))));
+            samplers.push(LlamaSampler::from(Arc::clone(&matcher)));
+            grammar = Some(matcher);
         }
 
         let has_repeat =
@@ -552,7 +587,7 @@ impl Model {
 
         if options.temperature <= 0.0 {
             samplers.push(LlamaSampler::greedy());
-            return Ok(LlamaSampler::chain_simple(samplers));
+            return Ok((LlamaSampler::chain_simple(samplers), grammar));
         }
         if let Some(top_k) = options.top_k.filter(|value| *value > 0) {
             samplers.push(LlamaSampler::top_k(
@@ -567,7 +602,7 @@ impl Model {
         }
         samplers.push(LlamaSampler::temp(options.temperature));
         samplers.push(LlamaSampler::dist(options.seed));
-        Ok(LlamaSampler::chain_simple(samplers))
+        Ok((LlamaSampler::chain_simple(samplers), grammar))
     }
 
     fn should_stop(&self, token: LlamaToken) -> bool {

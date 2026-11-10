@@ -4,18 +4,68 @@
 //! to enforce grammar constraints (JSON schema, regex, Lark, etc.) during token sampling.
 
 use std::ffi::c_void;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use llguidance::Matcher;
-use toktrie::{ApproximateTokEnv, TokEnv, TokRxInfo, TokTrie};
+use toktrie::{TokEnv, TokRxInfo, TokTrie, TokenId, TokenizerEnv};
 
 use crate::model::LlamaModel;
 use crate::sampling::LlamaSampler;
 use crate::token::LlamaToken;
 
 /// Internal state for the llguidance sampler.
+///
+/// The matcher is shared so the generation loop can read grammar-forced tokens
+/// after each sampled token without a second matcher to keep in step.
 struct LlgContext {
-    matcher: Matcher,
+    matcher: Arc<Mutex<Matcher>>,
+}
+
+impl LlgContext {
+    fn matcher(&self) -> MutexGuard<'_, Matcher> {
+        self.matcher.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+/// Tokenizer environment backed by the model's own tokenizer.
+///
+/// llguidance computes fast-forward tokens only for canonical tokenizers, so
+/// forced grammar text is tokenized exactly as llama.cpp would tokenize it.
+struct LlamaTokEnv {
+    model: Arc<LlamaModel>,
+    trie: TokTrie,
+}
+
+impl TokenizerEnv for LlamaTokEnv {
+    fn tok_trie(&self) -> &TokTrie {
+        &self.trie
+    }
+
+    fn tokenize_bytes(&self, s: &[u8]) -> Vec<TokenId> {
+        let Ok(len) = i32::try_from(s.len()) else {
+            return Vec::new();
+        };
+        let tokenize = |tokens: &mut Vec<TokenId>| unsafe {
+            koharu_llama_sys::llama_tokenize(
+                self.model.vocab_ptr(),
+                s.as_ptr().cast(),
+                len,
+                tokens.as_mut_ptr().cast(),
+                i32::try_from(tokens.capacity()).unwrap_or(i32::MAX),
+                false,
+                false,
+            )
+        };
+        let mut tokens = Vec::with_capacity(s.len() + 1);
+        let mut count = tokenize(&mut tokens);
+        if count < 0 {
+            tokens.reserve_exact(count.unsigned_abs() as usize);
+            count = tokenize(&mut tokens);
+        }
+        // Safety: llama_tokenize initialized `count` tokens within capacity.
+        unsafe { tokens.set_len(usize::try_from(count).unwrap_or(0)) };
+        tokens
+    }
 }
 
 /// Build a [`toktrie::TokEnv`] from a [`LlamaModel`]'s vocabulary.
@@ -27,7 +77,7 @@ struct LlgContext {
 /// This mirrors the logic in upstream `llguidance.cpp` — for each token:
 /// - Try normal detokenize (special=false)
 /// - If empty, detokenize with special=true and prefix with 0xFF marker byte
-pub fn llguidance_build_tok_env(model: &LlamaModel) -> TokEnv {
+pub fn llguidance_build_tok_env(model: &Arc<LlamaModel>) -> TokEnv {
     let n_vocab = model.n_vocab().cast_unsigned();
     let tok_eos = {
         let eot = unsafe { koharu_llama_sys::llama_vocab_eot(model.vocab_ptr()) };
@@ -66,8 +116,10 @@ pub fn llguidance_build_tok_env(model: &LlamaModel) -> TokEnv {
         }
     }
 
-    let trie = TokTrie::from(&info, &words).with_eos_tokens(&eog_tokens);
-    Arc::new(ApproximateTokEnv::new(trie))
+    Arc::new(LlamaTokEnv {
+        model: Arc::clone(model),
+        trie: TokTrie::from(&info, &words).with_eos_tokens(&eog_tokens),
+    })
 }
 
 // --- extern "C" vtable callbacks ---
@@ -82,21 +134,22 @@ unsafe extern "C" fn llg_accept(
     smpl: *mut koharu_llama_sys::llama_sampler,
     token: koharu_llama_sys::llama_token,
 ) {
-    let ctx = unsafe { &mut *(*smpl).ctx.cast::<LlgContext>() };
-    if ctx.matcher.is_stopped() {
+    let ctx = unsafe { &*(*smpl).ctx.cast::<LlgContext>() };
+    let mut matcher = ctx.matcher();
+    if matcher.is_stopped() {
         return;
     }
-    let _ = ctx.matcher.consume_token(token.cast_unsigned());
+    let _ = matcher.consume_token(token.cast_unsigned());
 }
 
 unsafe extern "C" fn llg_apply(
     smpl: *mut koharu_llama_sys::llama_sampler,
     cur_p: *mut koharu_llama_sys::llama_token_data_array,
 ) {
-    let ctx = unsafe { &mut *(*smpl).ctx.cast::<LlgContext>() };
+    let ctx = unsafe { &*(*smpl).ctx.cast::<LlgContext>() };
     let cur_p = unsafe { &mut *cur_p };
 
-    let Ok(mask) = ctx.matcher.compute_mask_or_eos() else {
+    let Ok(mask) = ctx.matcher().compute_mask_or_eos() else {
         return;
     };
 
@@ -109,8 +162,8 @@ unsafe extern "C" fn llg_apply(
 }
 
 unsafe extern "C" fn llg_reset(smpl: *mut koharu_llama_sys::llama_sampler) {
-    let ctx = unsafe { &mut *(*smpl).ctx.cast::<LlgContext>() };
-    let _ = ctx.matcher.reset();
+    let ctx = unsafe { &*(*smpl).ctx.cast::<LlgContext>() };
+    let _ = ctx.matcher().reset();
 }
 
 unsafe extern "C" fn llg_clone(
@@ -118,7 +171,7 @@ unsafe extern "C" fn llg_clone(
 ) -> *mut koharu_llama_sys::llama_sampler {
     let ctx = unsafe { &*(*smpl).ctx.cast::<LlgContext>() };
     let new_ctx = Box::new(LlgContext {
-        matcher: ctx.matcher.deep_clone(),
+        matcher: Arc::new(Mutex::new(ctx.matcher().deep_clone())),
     });
     unsafe {
         koharu_llama_sys::llama_sampler_init(
@@ -150,9 +203,12 @@ static mut LLG_SAMPLER_I: koharu_llama_sys::llama_sampler_i = koharu_llama_sys::
     copy_state: None,
 };
 
-/// Wrap an already-built [`llguidance::Matcher`] in a llama.cpp sampler.
-impl From<Matcher> for LlamaSampler {
-    fn from(matcher: Matcher) -> Self {
+/// Wrap a shared [`llguidance::Matcher`] in a llama.cpp sampler.
+///
+/// The sampler consumes every accepted token into the matcher, so a caller
+/// holding the same matcher sees the grammar state after each sample.
+impl From<Arc<Mutex<Matcher>>> for LlamaSampler {
+    fn from(matcher: Arc<Mutex<Matcher>>) -> Self {
         let ctx = Box::new(LlgContext { matcher });
         let sampler = unsafe {
             koharu_llama_sys::llama_sampler_init(
