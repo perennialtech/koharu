@@ -33,8 +33,11 @@ koharu-ml = { path = "crates/koharu-ml" }
 koharu-translator = { path = "crates/koharu-translator" }
 koharu-renderer = { path = "crates/koharu-renderer" }
 koharu-rasterizer = { path = "crates/koharu-rasterizer", default-features = false }
+koharu-pipeline = { path = "crates/koharu-pipeline" }
 
 # external dependencies
+axum = "0.8.8"
+sha2 = "0.11.0"
 arc-swap = "1.9.2"
 image = "0.25.10"
 webp = { version = "0.3.1" }
@@ -44,7 +47,7 @@ async-trait = "0.1.92"
 backon = { version = "1.6.0", default-features = false, features = ["std", "tokio-sleep"] }
 imageproc = "0.27.0"
 ab_glyph = "0.2.32"
-clap = { version = "4.6.7", features = ["derive"] }
+clap = { version = "4.6.7", features = ["derive", "env"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 specta = { version = "=2.0.0-rc.26", features = ["derive", "url", "uuid"] }

@@ -9,8 +9,8 @@ use futures::{StreamExt as _, stream::FuturesUnordered};
 use koharu_scene::{EntityId, Snapshot};
 
 use crate::{
-    Committer, ErrorKind, PipelineError, Progress, ProgressSink, Report, Request, RunStatus, Stage,
-    StageOutput, StopToken,
+    Committer, ErrorKind, PipelineError, Progress, ProgressSink, Report, Request,
+    RequestTranslation, RunStatus, Stage, StageOutput, StopToken,
     images::ImageCache,
     progress,
     resources::ResourceMonitor,
@@ -36,6 +36,7 @@ pub(crate) struct Execution<'a> {
     base: koharu_scene::Revision,
     started: Instant,
     inpainting_mask: Option<crate::InpaintingMask>,
+    translation: Option<RequestTranslation>,
 }
 
 impl<'a> Execution<'a> {
@@ -88,6 +89,7 @@ impl<'a> Execution<'a> {
             base,
             started,
             inpainting_mask: request.inpainting_mask,
+            translation: request.translation,
         })
     }
 
@@ -144,7 +146,8 @@ impl<'a> Execution<'a> {
                     .as_ref()
                     .filter(|mask| stage == Stage::Inpainting && mask.page == page)
                     .cloned(),
-            ),
+            )
+            .with_translation(self.translation.clone()),
             self.stop.clone(),
             self.progress.clone(),
         ))
