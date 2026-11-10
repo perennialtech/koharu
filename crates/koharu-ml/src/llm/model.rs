@@ -687,7 +687,6 @@ impl Model {
         let has_presence = options.presence_penalty.abs() >= f32::EPSILON;
         if has_repeat || has_frequency || has_presence {
             let mut penalties = LlamaSampler::penalties(
-                &self.model,
                 options.repeat_last_n,
                 if has_repeat {
                     options.repeat_penalty
