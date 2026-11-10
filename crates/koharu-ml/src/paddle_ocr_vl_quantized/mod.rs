@@ -1,6 +1,6 @@
 //! Quantized PaddleOCR-VL-1.6 inference through llama.cpp.
 
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result};
 use image::DynamicImage;
 use koharu_llama::mtmd::mtmd_default_marker;
 use serde::{Deserialize, Serialize};
@@ -66,10 +66,6 @@ impl PaddleOCRVLQuantized {
         )
         .await
         .context("failed to load quantized PaddleOCR-VL-1.6")?;
-        ensure!(
-            model.capabilities().vision,
-            "PaddleOCR-VL-1.6 projector does not support images"
-        );
         Ok(Self { model })
     }
 

@@ -17,13 +17,13 @@ const DEFAULT_GPU_LAYERS: u32 = 1000;
 const DEFAULT_MAX_TOKENS: usize = 512;
 const DEFAULT_SEED: u32 = 299_792_458;
 
-/// Marker consumed by llama.cpp's multimodal tokenizer for one attached media input.
+/// Marker consumed by llama.cpp's multimodal tokenizer for one attached image.
 #[must_use]
 pub fn media_marker() -> &'static str {
     koharu_llama::mtmd::mtmd_default_marker()
 }
 
-/// A loaded GGUF language model with optional multimodal support.
+/// A loaded GGUF language model with optional image input.
 #[derive(Debug)]
 pub struct Llm {
     model: Model,
@@ -44,12 +44,6 @@ impl Llm {
         let model_path = model_path.into();
         let model = tokio_rayon::spawn(move || Model::new(&device, model_path, options)).await?;
         Ok(Self { model })
-    }
-
-    /// Returns the input modalities advertised by the loaded model and projector.
-    #[must_use]
-    pub fn capabilities(&self) -> Capabilities {
-        self.model.capabilities()
     }
 
     /// Converts the model's beginning-of-sequence token to its textual form.
@@ -148,7 +142,7 @@ impl Default for LoadOptions {
     }
 }
 
-/// Configuration for llama.cpp's multimodal (MTMD) projector.
+/// Configuration for llama.cpp's multimodal (MTMD) image projector.
 #[derive(Debug, Clone)]
 pub struct MtmdOptions {
     pub projector_path: PathBuf,
@@ -176,27 +170,11 @@ impl MtmdOptions {
     }
 }
 
-/// Input modalities supported by an [`Llm`].
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct Capabilities {
-    pub vision: bool,
-    pub audio: bool,
-    /// PCM sample rate expected by an audio projector, when advertised.
-    pub audio_sample_rate: Option<u32>,
-}
-
-impl Capabilities {
-    #[must_use]
-    pub fn multimodal(self) -> bool {
-        self.vision || self.audio
-    }
-}
-
-/// A raw prompt and any media referenced by its MTMD markers.
+/// A raw prompt and any images referenced by its MTMD markers.
 #[derive(Debug)]
 pub struct Input<'a> {
     prompt: &'a str,
-    media: Vec<Media<'a>>,
+    images: Vec<&'a DynamicImage>,
 }
 
 impl<'a> Input<'a> {
@@ -204,19 +182,13 @@ impl<'a> Input<'a> {
     pub fn new(prompt: &'a str) -> Self {
         Self {
             prompt,
-            media: Vec::new(),
+            images: Vec::new(),
         }
     }
 
     #[must_use]
     pub fn with_image(mut self, image: &'a DynamicImage) -> Self {
-        self.media.push(Media::Image(image));
-        self
-    }
-
-    #[must_use]
-    pub fn with_audio(mut self, samples: &'a [f32]) -> Self {
-        self.media.push(Media::Audio(samples));
+        self.images.push(image);
         self
     }
 
@@ -226,16 +198,9 @@ impl<'a> Input<'a> {
     }
 
     #[must_use]
-    pub fn media(&self) -> &[Media<'a>] {
-        &self.media
+    pub fn images(&self) -> &[&'a DynamicImage] {
+        &self.images
     }
-}
-
-/// Image or PCM F32 audio attached to an [`Input`].
-#[derive(Debug, Clone, Copy)]
-pub enum Media<'a> {
-    Image(&'a DynamicImage),
-    Audio(&'a [f32]),
 }
 
 /// Sampling and context settings for one inference call.

@@ -1,9 +1,12 @@
-﻿//! Safe wrapper around `gguf_context` for reading GGUF file metadata.
+//! Safe wrapper around `gguf_context` for reading GGUF file metadata and
+//! writing tensor subsets of GGUF files.
 //!
 //! Provides metadata-only access to GGUF files without loading tensor data.
 //! Useful for inspecting model architecture parameters before loading a model.
 
 use std::ffi::{CStr, CString};
+use std::fs::File;
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 use std::ptr::NonNull;
 
@@ -71,6 +74,11 @@ impl GgufContext {
         unsafe { koharu_llama_sys::gguf_get_val_i32(self.ctx.as_ptr(), idx) }
     }
 
+    /// Read a `bool` value.
+    pub fn val_bool(&self, idx: i64) -> bool {
+        unsafe { koharu_llama_sys::gguf_get_val_bool(self.ctx.as_ptr(), idx) }
+    }
+
     /// Read a `uint64` value.
     pub fn val_u64(&self, idx: i64) -> u64 {
         unsafe { koharu_llama_sys::gguf_get_val_u64(self.ctx.as_ptr(), idx) }
@@ -96,4 +104,108 @@ impl Drop for GgufContext {
     fn drop(&mut self) {
         unsafe { koharu_llama_sys::gguf_free(self.ctx.as_ptr()) }
     }
+}
+
+/// Write a copy of the GGUF file at `source` that keeps only the tensors whose
+/// names satisfy `keep`, with each `flags` key set to its boolean value.
+///
+/// Tensor data is streamed from `source`; only metadata is held in memory.
+pub fn write_subset(
+    source: &Path,
+    destination: &Path,
+    keep: impl Fn(&str) -> bool,
+    flags: &[(&str, bool)],
+) -> io::Result<()> {
+    struct Owned {
+        source: *mut koharu_llama_sys::gguf_context,
+        tensors: *mut koharu_llama_sys::ggml_context,
+        output: *mut koharu_llama_sys::gguf_context,
+    }
+    impl Drop for Owned {
+        fn drop(&mut self) {
+            unsafe {
+                if !self.output.is_null() {
+                    koharu_llama_sys::gguf_free(self.output);
+                }
+                if !self.tensors.is_null() {
+                    koharu_llama_sys::ggml_free(self.tensors);
+                }
+                if !self.source.is_null() {
+                    koharu_llama_sys::gguf_free(self.source);
+                }
+            }
+        }
+    }
+
+    let invalid = |message: &str| io::Error::new(io::ErrorKind::InvalidData, message.to_owned());
+    let path = source
+        .to_str()
+        .and_then(|path| CString::new(path).ok())
+        .ok_or_else(|| invalid("GGUF path is not a valid C string"))?;
+    let mut owned = Owned {
+        source: std::ptr::null_mut(),
+        tensors: std::ptr::null_mut(),
+        output: std::ptr::null_mut(),
+    };
+    let params = koharu_llama_sys::gguf_init_params {
+        no_alloc: true,
+        ctx: &raw mut owned.tensors,
+    };
+    owned.source = unsafe { koharu_llama_sys::gguf_init_from_file(path.as_ptr(), params) };
+    if owned.source.is_null() || owned.tensors.is_null() {
+        return Err(invalid("failed to read GGUF metadata"));
+    }
+    owned.output = unsafe { koharu_llama_sys::gguf_init_empty() };
+    if owned.output.is_null() {
+        return Err(invalid("failed to create GGUF metadata"));
+    }
+    unsafe { koharu_llama_sys::gguf_set_kv(owned.output, owned.source) };
+    for (key, value) in flags {
+        let key = CString::new(*key).map_err(|_| invalid("GGUF key contains NUL"))?;
+        unsafe { koharu_llama_sys::gguf_set_val_bool(owned.output, key.as_ptr(), *value) };
+    }
+
+    let data_offset = unsafe { koharu_llama_sys::gguf_get_data_offset(owned.source) } as u64;
+    let mut ranges = Vec::new();
+    for index in 0..unsafe { koharu_llama_sys::gguf_get_n_tensors(owned.source) } {
+        let name = unsafe { koharu_llama_sys::gguf_get_tensor_name(owned.source, index) };
+        let name_str = unsafe { CStr::from_ptr(name) }
+            .to_str()
+            .map_err(|_| invalid("GGUF tensor name is not UTF-8"))?;
+        if !keep(name_str) {
+            continue;
+        }
+        let tensor = unsafe { koharu_llama_sys::ggml_get_tensor(owned.tensors, name) };
+        if tensor.is_null() {
+            return Err(invalid("GGUF tensor metadata is missing"));
+        }
+        unsafe { koharu_llama_sys::gguf_add_tensor(owned.output, tensor) };
+        ranges.push((
+            data_offset
+                + unsafe { koharu_llama_sys::gguf_get_tensor_offset(owned.source, index) } as u64,
+            unsafe { koharu_llama_sys::gguf_get_tensor_size(owned.source, index) } as u64,
+        ));
+    }
+
+    let mut metadata = vec![0_u8; unsafe { koharu_llama_sys::gguf_get_meta_size(owned.output) }];
+    unsafe { koharu_llama_sys::gguf_get_meta_data(owned.output, metadata.as_mut_ptr().cast()) };
+    let mut input = File::open(source)?;
+    let mut output = io::BufWriter::new(File::create(destination)?);
+    output.write_all(&metadata)?;
+    let mut written = metadata.len() as u64;
+    for (index, (offset, size)) in ranges.into_iter().enumerate() {
+        let target = metadata.len() as u64
+            + unsafe { koharu_llama_sys::gguf_get_tensor_offset(owned.output, index as i64) }
+                as u64;
+        io::copy(&mut io::repeat(0).take(target - written), &mut output)?;
+        input.seek(SeekFrom::Start(offset))?;
+        if io::copy(&mut (&mut input).take(size), &mut output)? != size {
+            return Err(invalid("GGUF tensor data is truncated"));
+        }
+        written = target + size;
+    }
+    output
+        .into_inner()
+        .map_err(io::IntoInnerError::into_error)?
+        .sync_all()
 }

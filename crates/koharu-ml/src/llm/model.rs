@@ -19,6 +19,7 @@ use koharu_llama::{
         LlamaContext,
         params::{LlamaAttentionType, LlamaContextParams},
     },
+    gguf::{self, GgufContext},
     llama_backend::LlamaBackend,
     llama_batch::LlamaBatch,
     model::{AddBos, LlamaModel, params::LlamaModelParams},
@@ -30,8 +31,8 @@ use llguidance::{Matcher, ParserFactory, api::TopLevelGrammar};
 use minijinja::{Environment, Error as TemplateError, ErrorKind as TemplateErrorKind, context};
 
 use super::{
-    Capabilities, ChatMessage, ChatTemplateOptions, FinishReason, Generation, GenerationControl,
-    GenerationOptions, Input, LoadOptions, Media, TokenChunk,
+    ChatMessage, ChatTemplateOptions, FinishReason, Generation, GenerationControl,
+    GenerationOptions, Input, LoadOptions, TokenChunk,
 };
 use crate::Backend;
 
@@ -42,7 +43,6 @@ pub(super) struct Model {
     backend: &'static LlamaBackend,
     model: Arc<LlamaModel>,
     mtmd: Option<Mutex<MtmdContext>>,
-    capabilities: Capabilities,
     eos_token: LlamaToken,
     chat_template: ChatTemplate,
     llguidance_factory: OnceLock<std::result::Result<ParserFactory, String>>,
@@ -52,7 +52,7 @@ impl Debug for Model {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Model")
             .field("model", &self.model)
-            .field("capabilities", &self.capabilities)
+            .field("vision", &self.mtmd.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -149,15 +149,13 @@ impl Model {
             .eos_token_id
             .map_or_else(|| model.token_eos(), LlamaToken::new);
         let chat_template = ChatTemplate::from_model(&model, eos_token)?;
-        let (mtmd, capabilities) = match options.mtmd {
+        let mtmd = match options.mtmd {
             Some(options) => {
                 ensure_file(&options.projector_path, "MTMD projector")?;
                 validate_image_token_range(options.image_min_tokens, options.image_max_tokens)?;
-                let projector_path = options.projector_path.to_str().with_context(|| {
-                    format!(
-                        "invalid MTMD projector path {}",
-                        options.projector_path.display()
-                    )
+                let projector = vision_projector(&options.projector_path)?;
+                let projector_path = projector.to_str().with_context(|| {
+                    format!("invalid MTMD projector path {}", projector.display())
                 })?;
                 let mtmd = MtmdContext::init_from_file(
                     projector_path,
@@ -172,41 +170,30 @@ impl Model {
                     },
                 )
                 .context("failed to initialize MTMD projector")?;
-                let capabilities = Capabilities {
-                    vision: mtmd.support_vision(),
-                    audio: mtmd.support_audio(),
-                    audio_sample_rate: mtmd.get_audio_sample_rate(),
-                };
                 ensure!(
-                    capabilities.multimodal(),
-                    "MTMD projector advertises neither vision nor audio support"
+                    mtmd.support_vision(),
+                    "MTMD projector does not support images"
                 );
-                (Some(Mutex::new(mtmd)), capabilities)
+                Some(Mutex::new(mtmd))
             }
-            None => (None, Capabilities::default()),
+            None => None,
         };
 
         tracing::info!(
             path = %model_path.display(),
             has_encoder = model.has_encoder(),
             has_decoder = model.has_decoder(),
-            vision = capabilities.vision,
-            audio = capabilities.audio,
+            vision = mtmd.is_some(),
             "loaded llama.cpp model"
         );
         Ok(Self {
             backend,
             model,
             mtmd,
-            capabilities,
             eos_token,
             chat_template,
             llguidance_factory: OnceLock::new(),
         })
-    }
-
-    pub(super) fn capabilities(&self) -> Capabilities {
-        self.capabilities
     }
 
     pub(super) fn bos_token(&self) -> Result<String> {
@@ -240,13 +227,13 @@ impl Model {
             return Ok(Generation::empty(FinishReason::Length));
         }
 
-        let mtmd = if input.media().is_empty() {
+        let mtmd = if input.images().is_empty() {
             None
         } else {
             Some(
                 self.mtmd
                     .as_ref()
-                    .context("media input requires an MTMD projector")?
+                    .context("image input requires an MTMD projector")?
                     .lock()
                     .map_err(|_| anyhow::anyhow!("MTMD projector lock is poisoned"))?,
             )
@@ -389,33 +376,18 @@ impl Model {
             });
         };
 
-        let mut bitmaps = Vec::with_capacity(input.media().len());
-        for media in input.media() {
-            bitmaps.push(match media {
-                Media::Image(image) => {
-                    ensure!(
-                        self.capabilities.vision,
-                        "MTMD projector does not support images"
-                    );
-                    ensure!(
-                        image.width() > 0 && image.height() > 0,
-                        "image dimensions must be non-zero"
-                    );
-                    let rgb = image.to_rgb8();
-                    let (width, height) = rgb.dimensions();
-                    MtmdBitmap::from_image_data(width, height, &rgb.into_raw())
-                        .context("failed to create MTMD image bitmap")?
-                }
-                Media::Audio(samples) => {
-                    ensure!(
-                        self.capabilities.audio,
-                        "MTMD projector does not support audio"
-                    );
-                    ensure!(!samples.is_empty(), "audio input must not be empty");
-                    MtmdBitmap::from_audio_data(samples)
-                        .context("failed to create MTMD audio bitmap")?
-                }
-            });
+        let mut bitmaps = Vec::with_capacity(input.images().len());
+        for image in input.images() {
+            ensure!(
+                image.width() > 0 && image.height() > 0,
+                "image dimensions must be non-zero"
+            );
+            let rgb = image.to_rgb8();
+            let (width, height) = rgb.dimensions();
+            bitmaps.push(
+                MtmdBitmap::from_image_data(width, height, &rgb.into_raw())
+                    .context("failed to create MTMD image bitmap")?,
+            );
         }
         let bitmap_refs = bitmaps.iter().collect::<Vec<_>>();
         let chunks = mtmd
@@ -793,6 +765,48 @@ fn token_text(model: &LlamaModel, token: LlamaToken) -> Result<String> {
     model
         .token_to_piece(token, &mut decoder, true, None)
         .map_err(Into::into)
+}
+
+/// Returns a projector that carries only its vision encoder.
+///
+/// llama.cpp loads every encoder in an MTMD projector onto the device, and
+/// Gemma 4 E-series projectors also carry an audio encoder that Koharu never
+/// uses. Its weights and compute buffer cost hundreds of MiB of VRAM, so such a
+/// projector is loaded from a vision-only copy derived next to it. Tensor and
+/// key names follow llama.cpp's MTMD loader:
+/// https://github.com/ggml-org/llama.cpp/blob/b11642/tools/mtmd/clip-impl.h
+fn vision_projector(path: &Path) -> Result<PathBuf> {
+    const AUDIO_ENCODER: &str = "clip.has_audio_encoder";
+    let metadata = GgufContext::from_file(path)
+        .with_context(|| format!("failed to read MTMD projector {}", path.display()))?;
+    let key = metadata.find_key(AUDIO_ENCODER);
+    if key < 0 || !metadata.val_bool(key) {
+        return Ok(path.to_owned());
+    }
+    drop(metadata);
+
+    let vision = path.with_extension("vision.gguf");
+    if vision.is_file() {
+        return Ok(vision);
+    }
+    let file_name = vision
+        .file_name()
+        .context("MTMD projector has no file name")?
+        .to_string_lossy();
+    let pending = vision.with_file_name(format!(".{file_name}.{}.tmp", std::process::id()));
+    let written = gguf::write_subset(
+        path,
+        &pending,
+        |name| !name.starts_with("a.") && !name.starts_with("mm.a."),
+        &[(AUDIO_ENCODER, false)],
+    )
+    .and_then(|()| std::fs::rename(&pending, &vision));
+    if let Err(error) = written {
+        let _ = std::fs::remove_file(&pending);
+        return Err(error)
+            .with_context(|| format!("failed to derive vision projector {}", vision.display()));
+    }
+    Ok(vision)
 }
 
 fn ensure_file(path: &Path, description: &str) -> Result<()> {
