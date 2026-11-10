@@ -95,6 +95,7 @@ impl Arguments {
                 ModelSelection::default()
             }
             ProviderChoice::OpenRouter | ProviderChoice::OpenAiCompatible => {
+                pipeline.translation.generation.reasoning = None;
                 let model = self
                     .model
                     .as_deref()
@@ -429,6 +430,20 @@ mod tests {
             Some("gemma4-e4b-it")
         );
         assert!(matches!(config.inpainting, InpaintingModel::RoremMixed(_)));
+    }
+
+    #[test]
+    fn hosted_models_do_not_receive_unsolicited_reasoning_parameters() {
+        let arguments = Arguments::try_parse_from([
+            "koharu-server",
+            "--provider",
+            "openai-compatible",
+            "--model",
+            "vision-model",
+        ])
+        .unwrap();
+        let (pipeline, _) = arguments.configs().unwrap();
+        assert_eq!(pipeline.translation.generation.reasoning, None);
     }
 
     #[test]
