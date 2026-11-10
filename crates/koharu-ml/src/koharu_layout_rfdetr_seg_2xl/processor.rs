@@ -10,8 +10,11 @@ use serde::Serialize;
 
 use super::{
     config::{KoharuLayoutRFDetrSeg2XLConfig, KoharuLayoutThresholds},
-    model::Output,
+    model::{Model, Output},
 };
+
+// Amortize CUDA reductions without retaining too many page-sized masks.
+const MAX_MASK_BATCH_SIZE: usize = 6;
 
 #[derive(Debug, Clone)]
 pub struct KoharuLayoutRFDetrImageProcessor {
@@ -74,6 +77,7 @@ impl KoharuLayoutRFDetrImageProcessor {
 
     pub(super) fn postprocess(
         &self,
+        model: &Model,
         output: &Output,
         image_width: u32,
         image_height: u32,
@@ -90,12 +94,6 @@ impl KoharuLayoutRFDetrImageProcessor {
             "unexpected RF-DETR box shape {:?}",
             output.pred_boxes.size()
         );
-        ensure!(
-            output.pred_masks.size() == [1, 300, 288, 288],
-            "unexpected RF-DETR mask shape {:?}",
-            output.pred_masks.size()
-        );
-
         // PostProcess ranks every query/class pair, including the checkpoint's
         // fifth background logit slot, before applying the caller threshold.
         let (scores, indexes) =
@@ -137,24 +135,25 @@ impl KoharuLayoutRFDetrImageProcessor {
             ])
             .to_device(output.pred_boxes.device());
 
-        // Gathering before interpolation is output-equivalent to upstream and
-        // avoids allocating resized masks for candidates rejected by threshold.
-        let masks = output.pred_masks.i(0).index_select(0, &query_indexes);
+        // Each selected query has the same mask as when projecting all queries.
+        let masks = model.masks(output, &query_indexes).i(0);
 
         let floats = Tensor::cat(&[scores.unsqueeze(1), boxes], 1);
         let floats = tensor_to_vec_f32(&floats)?;
         let labels = tensor_to_vec_i64(&labels)?;
 
         let mut detections = Vec::with_capacity(labels.len());
-        for (index, label) in labels.into_iter().enumerate() {
-            // RF-DETR defines masks by bilinearly projecting each native mask to
-            // the source image and thresholding at zero. Resolve one mask at a
-            // time to preserve that exact contract without retaining an
-            // N-by-page tensor, then keep only its non-zero page-space extent.
-            let mask = masks
-                .i(index as i64)
-                .unsqueeze(0)
-                .unsqueeze(0)
+        // Bound temporary mask pixels by the native model image area while
+        // batching smaller pages to amortize CUDA reductions.
+        let page_pixels = u64::from(image_width) * u64::from(image_height);
+        let native_pixels = (self.resolution * self.resolution) as u64;
+        let batch_size = (native_pixels * MAX_MASK_BATCH_SIZE as u64 / page_pixels)
+            .clamp(1, MAX_MASK_BATCH_SIZE as u64) as usize;
+        for batch_start in (0..labels.len()).step_by(batch_size) {
+            let batch_end = (batch_start + batch_size).min(labels.len());
+            let batch = masks
+                .i(batch_start as i64..batch_end as i64)
+                .unsqueeze(1)
                 .upsample_bilinear2d(
                     [i64::from(image_height), i64::from(image_width)],
                     false,
@@ -163,69 +162,72 @@ impl KoharuLayoutRFDetrImageProcessor {
                 )
                 .gt(0.0)
                 .to_kind(Kind::Uint8);
-            let rows = mask
-                .count_nonzero_dim_intlist(&[0i64, 1, 3][..])
+            let rows = batch
+                .count_nonzero_dim_intlist(&[1i64, 3][..])
                 .gt(0)
                 .to_kind(Kind::Int64);
-            let columns = mask
-                .count_nonzero_dim_intlist(&[0i64, 1, 2][..])
+            let columns = batch
+                .count_nonzero_dim_intlist(&[1i64, 2][..])
                 .gt(0)
                 .to_kind(Kind::Int64);
             let occupied = Tensor::stack(
                 &[
-                    mask.count_nonzero(None),
-                    columns.argmax(None, false),
-                    rows.argmax(None, false),
-                    i64::from(image_width) - columns.flip([0]).argmax(None, false),
-                    i64::from(image_height) - rows.flip([0]).argmax(None, false),
+                    batch.count_nonzero_dim_intlist(&[1i64, 2, 3][..]),
+                    columns.argmax(1, false),
+                    rows.argmax(1, false),
+                    i64::from(image_width) - columns.flip([1]).argmax(1, false),
+                    i64::from(image_height) - rows.flip([1]).argmax(1, false),
                 ],
-                0,
+                1,
             );
             let occupied = tensor_to_vec_i64(&occupied)?;
-            let area = occupied[0].clamp(0, i64::from(u32::MAX)) as u32;
-            let (x, y, right, bottom) = if area == 0 {
-                (0, 0, 0, 0)
-            } else {
-                (
-                    occupied[1] as u32,
-                    occupied[2] as u32,
-                    occupied[3] as u32,
-                    occupied[4] as u32,
-                )
-            };
-            let width = right.saturating_sub(x);
-            let height = bottom.saturating_sub(y);
-            let pixels = if width == 0 || height == 0 {
-                Vec::new()
-            } else {
-                tensor_to_vec_u8(
-                    &(mask.i((
-                        0,
-                        0,
-                        i64::from(y)..i64::from(bottom),
-                        i64::from(x)..i64::from(right),
-                    )) * 255),
-                )?
-            };
-            let label_id = label as usize;
-            detections.push(KoharuLayoutDetection {
-                label_id,
-                label: self
-                    .class_names
-                    .get(label_id)
-                    .cloned()
-                    .unwrap_or_else(|| "__background__".to_owned()),
-                score: floats[index * 5],
-                bbox: floats[index * 5 + 1..index * 5 + 5].try_into().unwrap(),
-                area,
-                mask: KoharuLayoutMask {
-                    x,
-                    y,
-                    width,
-                    height,
-                    pixels,
-                },
-            });
+            for (local_index, &label) in labels[batch_start..batch_end].iter().enumerate() {
+                let index = batch_start + local_index;
+                let area = occupied[local_index * 5].clamp(0, i64::from(u32::MAX)) as u32;
+                let (x, y, right, bottom) = if area == 0 {
+                    (0, 0, 0, 0)
+                } else {
+                    (
+                        occupied[local_index * 5 + 1] as u32,
+                        occupied[local_index * 5 + 2] as u32,
+                        occupied[local_index * 5 + 3] as u32,
+                        occupied[local_index * 5 + 4] as u32,
+                    )
+                };
+                let width = right.saturating_sub(x);
+                let height = bottom.saturating_sub(y);
+                let pixels = if width == 0 || height == 0 {
+                    Vec::new()
+                } else {
+                    tensor_to_vec_u8(
+                        &(batch.i((
+                            local_index as i64,
+                            0,
+                            i64::from(y)..i64::from(bottom),
+                            i64::from(x)..i64::from(right),
+                        )) * 255),
+                    )?
+                };
+                let label_id = label as usize;
+                detections.push(KoharuLayoutDetection {
+                    label_id,
+                    label: self
+                        .class_names
+                        .get(label_id)
+                        .cloned()
+                        .unwrap_or_else(|| "__background__".to_owned()),
+                    score: floats[index * 5],
+                    bbox: floats[index * 5 + 1..index * 5 + 5].try_into().unwrap(),
+                    area,
+                    mask: KoharuLayoutMask {
+                        x,
+                        y,
+                        width,
+                        height,
+                        pixels,
+                    },
+                });
+            }
         }
 
         Ok(KoharuLayoutDetections {
