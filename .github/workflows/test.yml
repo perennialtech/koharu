@@ -20,11 +20,11 @@ jobs:
           sudo apt update
           sudo apt install --no-install-recommends \
             build-essential \
+            clang \
+            libclang-dev \
+            cmake \
             libfontconfig-dev \
             fonts-noto-cjk
       - uses: actions/checkout@v7
       - uses: Swatinem/rust-cache@v2
-      - name: Run headless Rust tests
-        run: |
-          cargo test --workspace --tests
-
+      - run: ./scripts/check.sh

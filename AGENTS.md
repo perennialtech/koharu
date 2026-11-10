@@ -18,7 +18,7 @@ Document only durable, repository-specific constraints here. Do not record curre
 
 - Scene owns what a project means. Storage owns opaque payloads and immutable blobs. Analysis, content, and presentation stay separate: detection geometry is not a visible layer, translation does not drop OCR provenance, and typography does not rewrite semantic text.
 - A patch binds to a project and a base revision, records preconditions, and carries inverses. Reject a stale patch. Derived work rebases explicitly and fails if anything it observed has changed.
-- Publish missing blobs first, write the inactive state slot, then publish atomically. Opening uses the newest valid slot and can fall back. Renderer, pipeline, and Agent consume snapshots and submit patches. They do not write storage files.
+- Publish missing blobs first, write the inactive state slot, then publish atomically. Opening uses the newest valid slot and can fall back. Renderer and pipeline consume snapshots and submit patches. They do not write storage files.
 - A pipeline stage runs on one page: detection, then OCR and translation, or detection, then inpainting. Pages enter in project order. Completed detection makes that page's later stages eligible immediately. At most one job per stage runs at a time. Each committed result is its own undo step. Do not add a second translation prompt path.
 - Accelerator inference uses one admission lane, including remote translation. On out-of-memory, release the lane, unload the other models, wait for a fresh resource sample, and retry once. Any other failure unloads the failing stage. Stopping is cooperative and discards an uncommitted result.
 - One prepared frame feeds every rendered output. Translation is the only visible text. Incremental reuse must match a full render.
@@ -61,6 +61,7 @@ Document only durable, repository-specific constraints here. Do not record curre
 
 ## Verification
 
+- Before declaring a change ready, run `./scripts/check.sh`. CI runs the same command.
 - Optimize for fast development and iteration. By default, run the smallest relevant check or focused test once using the debug profile.
 - Do not run full test suites, repeatedly rerun unchanged tests or builds, or build and test profiles other than debug unless the user explicitly requests it.
 - Run end-to-end tests only when the user explicitly asks for them.
