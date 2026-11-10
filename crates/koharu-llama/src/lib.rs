@@ -26,6 +26,7 @@ use crate::llama_batch::BatchAddError;
 use std::os::raw::c_int;
 use std::path::PathBuf;
 use std::string::FromUtf8Error;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 pub mod context;
 pub mod gguf;
@@ -127,6 +128,9 @@ pub enum LlamaContextLoadError {
     /// llama.cpp returned null
     #[error("null reference from llama.cpp")]
     NullReturn,
+    /// Native allocation failed while initializing the context.
+    #[error("out of memory while creating llama.cpp context")]
+    OutOfMemory,
 }
 
 /// Errors from the safe sequence-state snapshot API.
@@ -232,6 +236,9 @@ pub enum LlamaModelLoadError {
     /// llama.cpp returned a nullptr - this could be many different causes.
     #[error("null result from llama cpp")]
     NullResult,
+    /// Native allocation failed while loading the model.
+    #[error("out of memory while loading llama.cpp model")]
+    OutOfMemory,
     /// Failed to convert the path to a rust str. This means the path was not valid unicode
     #[error("failed to convert path {0} to str")]
     PathToStrError(PathBuf),
@@ -509,6 +516,18 @@ impl LogOptions {
     }
 }
 
+// llama.cpp returns null after a native allocation failure; its error log is
+// the only signal that distinguishes memory pressure from other null results.
+static ALLOCATION_FAILED: AtomicBool = AtomicBool::new(false);
+
+pub(crate) fn clear_allocation_failure() {
+    ALLOCATION_FAILED.store(false, Ordering::SeqCst);
+}
+
+pub(crate) fn take_allocation_failure() -> bool {
+    ALLOCATION_FAILED.swap(false, Ordering::SeqCst)
+}
+
 extern "C" fn logs_to_trace(
     level: koharu_llama_sys::ggml_log_level,
     text: *const ::std::os::raw::c_char,
@@ -519,6 +538,17 @@ extern "C" fn logs_to_trace(
     // by being a dummy pass-through to tracing in the normal case of DEBUG/INFO/WARN/ERROR logs that are
     // newline terminated and limiting the slow-path of locks and/or heap allocations for other cases.
     use std::borrow::Borrow;
+
+    if level == koharu_llama_sys::GGML_LOG_LEVEL_ERROR {
+        let line = unsafe { std::ffi::CStr::from_ptr(text) };
+        let message = line.to_string_lossy().to_ascii_lowercase();
+        if message.contains("out of memory")
+            || message.contains("failed to allocate")
+            || message.contains("erroroutofdevicememory")
+        {
+            ALLOCATION_FAILED.store(true, Ordering::SeqCst);
+        }
+    }
 
     let log_state = unsafe { &*(data as *const log::State) };
 
@@ -571,5 +601,37 @@ pub fn send_logs_to_tracing(options: LogOptions) {
         koharu_llama_sys::llama_log_set(Some(logs_to_trace), llama_heap_state as *mut _);
         koharu_llama_sys::mtmd_helper_log_set(Some(logs_to_trace), llama_heap_state as *mut _);
         koharu_llama_sys::ggml_log_set(Some(logs_to_trace), ggml_heap_state as *mut _);
+    }
+}
+
+#[cfg(test)]
+mod allocation_failure_tests {
+    use super::*;
+
+    #[test]
+    fn records_allocation_failures_from_error_logs_and_clears_between_attempts() {
+        let state = log::State::new(log::Module::Ggml, LogOptions::default());
+        clear_allocation_failure();
+        for message in [
+            "cudaMalloc failed: out of memory\n",
+            "failed to allocate CUDA0 buffer\n",
+            "ErrorOutOfDeviceMemory\n",
+        ] {
+            let message = std::ffi::CString::new(message).unwrap();
+            logs_to_trace(
+                koharu_llama_sys::GGML_LOG_LEVEL_ERROR,
+                message.as_ptr(),
+                (&state as *const log::State).cast_mut().cast(),
+            );
+            assert!(take_allocation_failure(), "did not record {message:?}");
+            assert!(!take_allocation_failure());
+        }
+        let message = std::ffi::CString::new("model: failed to open file\n").unwrap();
+        logs_to_trace(
+            koharu_llama_sys::GGML_LOG_LEVEL_ERROR,
+            message.as_ptr(),
+            (&state as *const log::State).cast_mut().cast(),
+        );
+        assert!(!take_allocation_failure());
     }
 }

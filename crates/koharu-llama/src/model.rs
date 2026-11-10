@@ -780,10 +780,17 @@ impl LlamaModel {
             .ok_or(LlamaModelLoadError::PathToStrError(path.to_path_buf()))?;
 
         let cstr = CString::new(path)?;
+        crate::clear_allocation_failure();
         let llama_model =
             unsafe { koharu_llama_sys::llama_load_model_from_file(cstr.as_ptr(), params.params) };
 
-        let model = NonNull::new(llama_model).ok_or(LlamaModelLoadError::NullResult)?;
+        let model = NonNull::new(llama_model).ok_or_else(|| {
+            if crate::take_allocation_failure() {
+                LlamaModelLoadError::OutOfMemory
+            } else {
+                LlamaModelLoadError::NullResult
+            }
+        })?;
 
         tracing::debug!(?path, "Loaded model");
         Ok(LlamaModel { model })
@@ -833,10 +840,17 @@ impl LlamaModel {
         params: LlamaContextParams,
     ) -> Result<LlamaContext<'a>, LlamaContextLoadError> {
         let context_params = params.context_params;
+        crate::clear_allocation_failure();
         let context = unsafe {
             koharu_llama_sys::llama_new_context_with_model(self.model.as_ptr(), context_params)
         };
-        let context = NonNull::new(context).ok_or(LlamaContextLoadError::NullReturn)?;
+        let context = NonNull::new(context).ok_or_else(|| {
+            if crate::take_allocation_failure() {
+                LlamaContextLoadError::OutOfMemory
+            } else {
+                LlamaContextLoadError::NullReturn
+            }
+        })?;
 
         Ok(LlamaContext::new(self, context, params.embeddings()))
     }
@@ -857,10 +871,17 @@ impl LlamaModel {
     ) -> Result<LlamaContext<'a>, LlamaContextLoadError> {
         let mut context_params = params.context_params;
         context_params.ctx_other = ctx_other.context.as_ptr();
+        crate::clear_allocation_failure();
         let context = unsafe {
             koharu_llama_sys::llama_new_context_with_model(self.model.as_ptr(), context_params)
         };
-        let context = NonNull::new(context).ok_or(LlamaContextLoadError::NullReturn)?;
+        let context = NonNull::new(context).ok_or_else(|| {
+            if crate::take_allocation_failure() {
+                LlamaContextLoadError::OutOfMemory
+            } else {
+                LlamaContextLoadError::NullReturn
+            }
+        })?;
         Ok(LlamaContext::new(self, context, params.embeddings()))
     }
 
@@ -894,10 +915,17 @@ impl LlamaModel {
             context_params.samplers = sampler_configs.as_mut_ptr();
             context_params.n_samplers = sampler_configs.len();
         }
+        crate::clear_allocation_failure();
         let context = unsafe {
             koharu_llama_sys::llama_new_context_with_model(self.model.as_ptr(), context_params)
         };
-        let context = NonNull::new(context).ok_or(LlamaContextLoadError::NullReturn)?;
+        let context = NonNull::new(context).ok_or_else(|| {
+            if crate::take_allocation_failure() {
+                LlamaContextLoadError::OutOfMemory
+            } else {
+                LlamaContextLoadError::NullReturn
+            }
+        })?;
         Ok(LlamaContext::with_samplers(
             self,
             context,
