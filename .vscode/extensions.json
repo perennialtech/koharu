@@ -1,9 +1,3 @@
 {
-  "recommendations": [
-    "oxc.oxc-vscode",
-    "EditorConfig.EditorConfig",
-    "bradlc.vscode-tailwindcss",
-    "rust-lang.rust-analyzer"
-  ],
-  "unwantedRecommendations": ["dbaeumer.vscode-eslint", "esbenp.prettier-vscode"]
+  "recommendations": ["EditorConfig.EditorConfig", "rust-lang.rust-analyzer"]
 }

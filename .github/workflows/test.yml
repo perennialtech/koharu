@@ -2,7 +2,7 @@ name: Test
 
 on:
   push:
-    branches: ['main']
+    branches: ['master']
   pull_request:
 
 permissions:
@@ -19,15 +19,8 @@ jobs:
       - run: |
           sudo apt update
           sudo apt install --no-install-recommends \
-            libgtk-4-dev \
             build-essential \
-            curl \
-            wget \
-            file \
-            libxdo-dev \
-            libssl-dev \
-            libayatana-appindicator3-dev \
-            librsvg2-dev \
+            libfontconfig-dev \
             fonts-noto-cjk \
             dbus-x11 \
             gnome-keyring
@@ -37,16 +30,3 @@ jobs:
         run: |
           cargo test --workspace --tests
 
-  ui:
-    name: UI
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-      - uses: oven-sh/setup-bun@v2
-      - uses: actions/cache@v6
-        with:
-          path: ~/.bun/install/cache
-          key: ${{ runner.os }}-bun-${{ hashFiles('**/bun.lock') }}
-      - run: bun install --frozen-lockfile --ignore-scripts
-      - name: Run headless Vitest suite
-        run: bun run --filter @koharu/app test
