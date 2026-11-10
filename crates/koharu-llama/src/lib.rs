@@ -37,6 +37,7 @@ pub(crate) mod llguidance_sampler;
 mod log;
 pub mod model;
 pub mod mtmd;
+mod penalties_sampler;
 pub mod sampling;
 pub mod timing;
 pub mod token;

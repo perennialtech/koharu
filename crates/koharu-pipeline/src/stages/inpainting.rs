@@ -592,12 +592,14 @@ fn fill_uniform_regions(
 ) {
     for region in regions {
         let [left, top, right, bottom] = region.bounds;
+        let mut rows = PolygonRows::new(&region.polygon);
         let mut targets = Vec::new();
         for y in top..bottom {
+            rows.set_row(y);
             for x in left..right {
                 if pending_mask.get_pixel(x, y)[0] >= 127
                     && text_mask.get_pixel(x, y)[0] >= 127
-                    && point_in_polygon((x as f32 + 0.5, y as f32 + 0.5), &region.polygon)
+                    && rows.contains(x)
                 {
                     targets.push((x, y));
                 }
@@ -773,15 +775,12 @@ fn uniform_region_color(
     region: &FlatFillRegion,
 ) -> Option<Rgb<u8>> {
     let [left, top, right, bottom] = region.bounds;
+    let mut rows = PolygonRows::new(&region.polygon);
     let mut channels = [Vec::new(), Vec::new(), Vec::new()];
     for y in top..bottom {
+        rows.set_row(y);
         for x in left..right {
-            let point = (x as f32 + 0.5, y as f32 + 0.5);
-            if mask.get_pixel(x, y)[0] >= 127
-                || !point_in_polygon(point, &region.polygon)
-                || polygon_edge_distance_squared(point, &region.polygon)
-                    < FLAT_FILL_EDGE_MARGIN * FLAT_FILL_EDGE_MARGIN
-            {
+            if mask.get_pixel(x, y)[0] >= 127 || !rows.contains(x) || rows.near_edge(x) {
                 continue;
             }
             let pixel = image.get_pixel(x, y);
@@ -809,45 +808,97 @@ fn uniform_region_color(
     (deviations.iter().copied().fold(0.0, f64::max) < threshold).then_some(Rgb(medians))
 }
 
-fn point_in_polygon(point: (f32, f32), polygon: &[(f32, f32)]) -> bool {
-    let mut inside = false;
-    let mut previous = polygon[polygon.len() - 1];
-    for &current in polygon {
-        if (current.1 > point.1) != (previous.1 > point.1) {
-            let intersection_x = (previous.0 - current.0) * (point.1 - current.1)
-                / (previous.1 - current.1)
-                + current.0;
-            if point.0 < intersection_x {
-                inside = !inside;
-            }
-        }
-        previous = current;
-    }
-    inside
+/// Even-odd containment and edge-margin tests for the pixel centers of one
+/// polygon, evaluated a row at a time. Bubble polygons trace detector masks and
+/// can have hundreds of vertices, so testing every edge for every pixel of a
+/// bubble dominated inpainting on large pages. Each test keeps the per-edge
+/// arithmetic of a direct per-pixel test, so results are identical.
+struct PolygonRows<'a> {
+    polygon: &'a [(f32, f32)],
+    y: f32,
+    /// Sorted x coordinates where polygon edges cross the current row.
+    crossings: Vec<f32>,
+    /// Edges whose bounds lie within the edge margin of the current row.
+    nearby: Vec<((f32, f32), (f32, f32))>,
 }
 
-fn polygon_edge_distance_squared(point: (f32, f32), polygon: &[(f32, f32)]) -> f32 {
-    let mut minimum = f32::INFINITY;
-    let mut start = polygon[polygon.len() - 1];
-    for &end in polygon {
-        let segment = (end.0 - start.0, end.1 - start.1);
-        let length_squared = segment.0 * segment.0 + segment.1 * segment.1;
-        let projection = if length_squared > 0.0 {
-            ((point.0 - start.0) * segment.0 + (point.1 - start.1) * segment.1) / length_squared
-        } else {
-            0.0
+impl<'a> PolygonRows<'a> {
+    // Skipped edges are farther than this from the row, which keeps their
+    // squared distance well above the margin despite rounding.
+    const NEARBY: f32 = FLAT_FILL_EDGE_MARGIN + 1.0;
+
+    fn new(polygon: &'a [(f32, f32)]) -> Self {
+        Self {
+            polygon,
+            y: 0.0,
+            crossings: Vec::new(),
+            nearby: Vec::new(),
         }
-        .clamp(0.0, 1.0);
-        let closest = (
-            start.0 + segment.0 * projection,
-            start.1 + segment.1 * projection,
-        );
-        let dx = point.0 - closest.0;
-        let dy = point.1 - closest.1;
-        minimum = minimum.min(dx * dx + dy * dy);
-        start = end;
     }
-    minimum
+
+    fn edges(&self) -> impl Iterator<Item = ((f32, f32), (f32, f32))> + '_ {
+        let last = self.polygon[self.polygon.len() - 1];
+        std::iter::once(last)
+            .chain(self.polygon.iter().copied())
+            .zip(self.polygon.iter().copied())
+    }
+
+    fn set_row(&mut self, y: u32) {
+        let y = y as f32 + 0.5;
+        let mut crossings = std::mem::take(&mut self.crossings);
+        let mut nearby = std::mem::take(&mut self.nearby);
+        crossings.clear();
+        nearby.clear();
+        for (previous, current) in self.edges() {
+            if (current.1 > y) != (previous.1 > y) {
+                crossings.push(
+                    (previous.0 - current.0) * (y - current.1) / (previous.1 - current.1)
+                        + current.0,
+                );
+            }
+            if previous.1.min(current.1) - Self::NEARBY <= y
+                && y <= previous.1.max(current.1) + Self::NEARBY
+            {
+                nearby.push((previous, current));
+            }
+        }
+        crossings.sort_unstable_by(f32::total_cmp);
+        self.y = y;
+        self.crossings = crossings;
+        self.nearby = nearby;
+    }
+
+    fn contains(&self, x: u32) -> bool {
+        let x = x as f32 + 0.5;
+        let right = self.crossings.len() - self.crossings.partition_point(|&edge| edge <= x);
+        right % 2 == 1
+    }
+
+    fn near_edge(&self, x: u32) -> bool {
+        let point = (x as f32 + 0.5, self.y);
+        self.nearby.iter().any(|&(start, end)| {
+            if point.0 < start.0.min(end.0) - Self::NEARBY
+                || point.0 > start.0.max(end.0) + Self::NEARBY
+            {
+                return false;
+            }
+            let segment = (end.0 - start.0, end.1 - start.1);
+            let length_squared = segment.0 * segment.0 + segment.1 * segment.1;
+            let projection = if length_squared > 0.0 {
+                ((point.0 - start.0) * segment.0 + (point.1 - start.1) * segment.1) / length_squared
+            } else {
+                0.0
+            }
+            .clamp(0.0, 1.0);
+            let closest = (
+                start.0 + segment.0 * projection,
+                start.1 + segment.1 * projection,
+            );
+            let dx = point.0 - closest.0;
+            let dy = point.1 - closest.1;
+            dx * dx + dy * dy < FLAT_FILL_EDGE_MARGIN * FLAT_FILL_EDGE_MARGIN
+        })
+    }
 }
 
 fn median(values: &mut [u8]) -> u8 {

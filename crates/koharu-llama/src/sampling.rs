@@ -378,7 +378,7 @@ impl LlamaSampler {
     /// generation, and convert that matcher into a sampler with `LlamaSampler::from`.
     #[cfg(feature = "llguidance")]
     #[must_use]
-    pub fn llguidance_tok_env(model: &LlamaModel) -> toktrie::TokEnv {
+    pub fn llguidance_tok_env(model: &std::sync::Arc<LlamaModel>) -> toktrie::TokEnv {
         crate::llguidance_sampler::llguidance_build_tok_env(model)
     }
 
@@ -473,25 +473,19 @@ impl LlamaSampler {
     /// - ``penalty_repeat``: must be positive; 1.0 disables repeat penalties
     /// - ``penalty_freq``: must be finite; 0.0 disables frequency penalties
     /// - ``penalty_present``: must be finite; 0.0 disables presence penalties
-    #[allow(clippy::too_many_arguments)]
     #[must_use]
     pub fn penalties(
-        model: &LlamaModel,
         penalty_last_n: i32,
         penalty_repeat: f32,
         penalty_freq: f32,
         penalty_present: f32,
     ) -> Self {
-        let sampler = unsafe {
-            koharu_llama_sys::llama_sampler_init_penalties(
-                model.n_vocab(),
-                penalty_last_n,
-                penalty_repeat,
-                penalty_freq,
-                penalty_present,
-            )
-        };
-        Self { sampler }
+        crate::penalties_sampler::penalties(
+            penalty_last_n,
+            penalty_repeat,
+            penalty_freq,
+            penalty_present,
+        )
     }
 
     /// Mirostat 1.0 algorithm described in the paper <https://arxiv.org/abs/2007.14966>. Uses tokens instead of words.

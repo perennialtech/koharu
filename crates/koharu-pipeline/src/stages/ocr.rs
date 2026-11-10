@@ -2,7 +2,7 @@ use std::sync::{Arc, Mutex};
 
 use super::{StageInput, StageProcessor, finish, generation};
 use crate::{ModelCell, OcrModel, scope::geometry_extents};
-use anyhow::{Context as _, Result, anyhow, bail};
+use anyhow::{Context as _, Result, anyhow, bail, ensure};
 use async_trait::async_trait;
 use image::DynamicImage;
 use koharu_ml::paddle_ocr_vl_quantized::{PaddleOCRVLQuantized, PaddleOCRVLTask};
@@ -106,8 +106,12 @@ impl Model {
             }
         }
 
-        let results = infer_text(self.0.clone(), targets, |model, image| {
-            Ok(model.inference(image, PaddleOCRVLTask::Ocr)?.text)
+        let results = infer_text(self.0.clone(), targets, |model, images| {
+            Ok(model
+                .inference(images, PaddleOCRVLTask::Ocr)?
+                .into_iter()
+                .map(|result| result.text)
+                .collect())
         })
         .await?;
 
@@ -170,24 +174,34 @@ struct OcrResult {
 async fn infer_text<M: Send + 'static>(
     model: Arc<Mutex<M>>,
     targets: Vec<OcrTarget>,
-    inference: impl Fn(&M, &DynamicImage) -> Result<String> + Send + Sync + 'static,
+    inference: impl Fn(&M, &[&DynamicImage]) -> Result<Vec<String>> + Send + Sync + 'static,
 ) -> Result<Vec<OcrResult>> {
     tokio_rayon::spawn(move || {
         let model = model
             .lock()
             .map_err(|_| anyhow!("OCR model lock is poisoned"))?;
-        targets
+        let images = targets
+            .iter()
+            .map(|target| &target.image)
+            .collect::<Vec<_>>();
+        let texts = inference(&model, &images)?;
+        ensure!(
+            texts.len() == targets.len(),
+            "OCR returned {} results for {} regions",
+            texts.len(),
+            targets.len()
+        );
+        Ok(targets
             .into_iter()
-            .map(|target| {
-                Ok(OcrResult {
-                    content: target.content,
-                    region: target.region,
-                    geometry: target.geometry,
-                    previous: target.previous,
-                    text: normalize_ocr_text(inference(&model, &target.image)?),
-                })
+            .zip(texts)
+            .map(|(target, text)| OcrResult {
+                content: target.content,
+                region: target.region,
+                geometry: target.geometry,
+                previous: target.previous,
+                text: normalize_ocr_text(text),
             })
-            .collect()
+            .collect())
     })
     .await
 }
