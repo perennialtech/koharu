@@ -5,10 +5,7 @@ use crate::{ModelCell, OcrModel, scope::geometry_extents};
 use anyhow::{Context as _, Result, anyhow, bail};
 use async_trait::async_trait;
 use image::DynamicImage;
-use koharu_ml::{
-    baberu_ocr::BaberuOcr, hayai_ocr::HayaiOcr, manga_ocr::MangaOcr,
-    paddle_ocr_vl::PaddleOCRVLTask, paddle_ocr_vl_quantized::PaddleOCRVLQuantized,
-};
+use koharu_ml::paddle_ocr_vl_quantized::{PaddleOCRVLQuantized, PaddleOCRVLTask};
 use koharu_scene::{
     Authored, EntityId, Geometry, LanguageTag, OcrAnalysis, Origin, RecognizedFrom, Region,
     RegionSpec, SourceText, TextDirection, TextRegion,
@@ -17,15 +14,13 @@ use koharu_scene::{
 const PRODUCER: &str = "dev.koharu.pipeline.ocr";
 
 pub(super) struct Processor {
-    config: OcrModel,
     device: koharu_ml::Device,
     model: ModelCell<Model>,
 }
 
 impl Processor {
-    pub(super) fn new(config: OcrModel, device: koharu_ml::Device) -> Self {
+    pub(super) fn new(_config: OcrModel, device: koharu_ml::Device) -> Self {
         Self {
-            config,
             device,
             model: ModelCell::new(),
         }
@@ -35,12 +30,7 @@ impl Processor {
 #[async_trait]
 impl StageProcessor for Processor {
     fn model(&self) -> &'static str {
-        match self.config {
-            OcrModel::MangaOcr => "manga-ocr",
-            OcrModel::BaberuOcr => "baberu-ocr",
-            OcrModel::HayaiOcr => "hayai-ocr",
-            OcrModel::PaddleOcrVl1_6 => "paddleocr-vl-1.6",
-        }
+        "paddleocr-vl-1.6"
     }
 
     fn unload(&self) -> bool {
@@ -48,9 +38,7 @@ impl StageProcessor for Processor {
     }
 
     async fn load(&self) -> Result<()> {
-        self.model
-            .ensure(|| Model::load(self.device.clone(), &self.config))
-            .await
+        self.model.ensure(|| Model::load(self.device.clone())).await
     }
 
     async fn process(&self, input: StageInput) -> Result<koharu_scene::Patch> {
@@ -64,38 +52,16 @@ impl StageProcessor for Processor {
     }
 }
 
-enum Model {
-    Manga(Arc<Mutex<MangaOcr>>),
-    Baberu(Arc<Mutex<BaberuOcr>>),
-    Hayai(Arc<Mutex<HayaiOcr>>),
-    Paddle(Arc<Mutex<PaddleOCRVLQuantized>>),
-}
+struct Model(Arc<Mutex<PaddleOCRVLQuantized>>);
 
 impl Model {
-    async fn load(device: koharu_ml::Device, config: &OcrModel) -> Result<Self> {
-        match config {
-            OcrModel::MangaOcr => Ok(Self::Manga(Arc::new(Mutex::new(
-                MangaOcr::load(device).await?,
-            )))),
-            OcrModel::BaberuOcr => Ok(Self::Baberu(Arc::new(Mutex::new(
-                BaberuOcr::load(device).await?,
-            )))),
-            OcrModel::HayaiOcr => Ok(Self::Hayai(Arc::new(Mutex::new(
-                HayaiOcr::load(device).await?,
-            )))),
-            OcrModel::PaddleOcrVl1_6 => Ok(Self::Paddle(Arc::new(Mutex::new(
-                PaddleOCRVLQuantized::load(device).await?,
-            )))),
-        }
+    async fn load(device: koharu_ml::Device) -> Result<Self> {
+        Ok(Self(Arc::new(Mutex::new(
+            PaddleOCRVLQuantized::load(device).await?,
+        ))))
     }
 
     async fn run(&self, input: StageInput) -> Result<koharu_scene::Patch> {
-        let model_name = match self {
-            Self::Manga(_) => "manga-ocr",
-            Self::Baberu(_) => "baberu-ocr",
-            Self::Hayai(_) => "hayai-ocr",
-            Self::Paddle(_) => "paddleocr-vl-1.6",
-        };
         let page = input.page;
         let mut targets = Vec::new();
         let source = input
@@ -140,34 +106,12 @@ impl Model {
             }
         }
 
-        let results = match self {
-            Self::Manga(model) => {
-                infer_text(model.clone(), targets, |model, image| {
-                    model.inference(image)
-                })
-                .await?
-            }
-            Self::Baberu(model) => {
-                infer_text(model.clone(), targets, |model, image| {
-                    model.inference(image)
-                })
-                .await?
-            }
-            Self::Hayai(model) => {
-                infer_text(model.clone(), targets, |model, image| {
-                    model.inference(image)
-                })
-                .await?
-            }
-            Self::Paddle(model) => {
-                infer_text(model.clone(), targets, |model, image| {
-                    Ok(model.inference(image, PaddleOCRVLTask::Ocr)?.text)
-                })
-                .await?
-            }
-        };
+        let results = infer_text(self.0.clone(), targets, |model, image| {
+            Ok(model.inference(image, PaddleOCRVLTask::Ocr)?.text)
+        })
+        .await?;
 
-        let generation = generation(PRODUCER, model_name)?;
+        let generation = generation(PRODUCER, "paddleocr-vl-1.6")?;
         let mut edit = input.scene.edit_as(generation.clone());
         edit.observe_assets(page)?;
         for result in &results {

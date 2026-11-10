@@ -11,10 +11,7 @@ pub use catalog::LocalConfig;
 use catalog::LocalModelDescriptor;
 pub(crate) use catalog::{DEFAULT_MODEL, DEFAULT_QUANTIZATION};
 
-use crate::{
-    Device, Error, GenerationConfig, Model, ModelSelection, Provider, Quantization, Result,
-    TranslationRequest, prompt,
-};
+use crate::{Device, GenerationConfig, ModelSelection, Result, TranslationRequest, prompt};
 
 #[derive(Debug)]
 pub struct LocalTranslator {
@@ -62,16 +59,6 @@ impl LocalTranslator {
         if expected == 0 {
             return Ok(Vec::new());
         }
-        if !self
-            .descriptor
-            .target_languages
-            .contains(request.target_language)
-        {
-            return Err(Error::UnsupportedLanguage {
-                provider: "local",
-                language: request.target_language,
-            });
-        }
 
         let image = request.image.clone();
         let prompt = self.render_prompt(
@@ -111,30 +98,6 @@ impl LocalTranslator {
             )
             .context("failed to render local translation prompt")?)
     }
-}
-
-pub(crate) fn models() -> Vec<Model> {
-    catalog::MODELS
-        .iter()
-        .map(|descriptor| Model {
-            provider: Provider::Local,
-            model: Some(descriptor.id.to_owned()),
-            name: descriptor.name.to_owned(),
-            quantizations: descriptor
-                .quantizations
-                .iter()
-                .map(|quantization| Quantization {
-                    id: quantization.id.to_owned(),
-                    name: quantization.name.to_owned(),
-                    downloaded: std::iter::once(quantization.filename)
-                        .chain(descriptor.projector)
-                        .all(|filename| descriptor.file(filename).exists()),
-                })
-                .collect(),
-            vision: descriptor.projector.is_some(),
-            reasoning: descriptor.reasoning,
-        })
-        .collect()
 }
 
 pub(crate) fn supports_vision(selection: &ModelSelection) -> bool {

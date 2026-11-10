@@ -1,4 +1,4 @@
-use anyhow::{Result, bail};
+use anyhow::Result;
 use koharu_translator::{GenerationConfig, Language};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use specta::Type;
@@ -61,9 +61,6 @@ impl Serialize for PipelineConfig {
         };
         let ocr = match &self.ocr {
             OcrModel::PaddleOcrVl1_6 => "paddleocr-vl-1.6",
-            OcrModel::MangaOcr => "manga-ocr",
-            OcrModel::BaberuOcr => "baberu-ocr",
-            OcrModel::HayaiOcr => "hayai-ocr",
         };
         let inpainting = match &self.inpainting {
             InpaintingModel::LaMa {} => "lama",
@@ -123,9 +120,6 @@ impl<'de> Deserialize<'de> for PipelineConfig {
         };
         let ocr = match file.ocr.model.as_str() {
             "paddleocr-vl-1.6" => OcrModel::PaddleOcrVl1_6,
-            "manga-ocr" => OcrModel::MangaOcr,
-            "baberu-ocr" => OcrModel::BaberuOcr,
-            "hayai-ocr" => OcrModel::HayaiOcr,
             model => {
                 return Err(serde::de::Error::custom(format!(
                     "unsupported OCR model {model}"
@@ -231,15 +225,6 @@ impl PipelineConfig {
     pub fn validate(&self) -> Result<()> {
         let _ = self.detection()?;
         let _ = self.inpainting()?;
-        if !matches!(
-            self.ocr,
-            OcrModel::PaddleOcrVl1_6
-                | OcrModel::MangaOcr
-                | OcrModel::BaberuOcr
-                | OcrModel::HayaiOcr
-        ) {
-            bail!("unsupported OCR model")
-        }
         Ok(())
     }
 }
@@ -267,12 +252,6 @@ pub enum DetectionModel {
 pub enum OcrModel {
     #[serde(rename = "paddleocr-vl-1.6")]
     PaddleOcrVl1_6,
-    #[serde(rename = "manga-ocr")]
-    MangaOcr,
-    #[serde(rename = "baberu-ocr")]
-    BaberuOcr,
-    #[serde(rename = "hayai-ocr")]
-    HayaiOcr,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Type)]
@@ -312,7 +291,7 @@ mod tests {
                 model = "koharu-layout-rfdetr-seg-2xl"
 
                 [ocr]
-                model = "baberu-ocr"
+                model = "paddleocr-vl-1.6"
 
                 [inpainting]
                 model = "rorem-mixed"
@@ -328,7 +307,7 @@ mod tests {
             config.detection,
             DetectionModel::KoharuLayoutRFDetrSeg2XL(_)
         ));
-        assert!(matches!(config.ocr, OcrModel::BaberuOcr));
+        assert!(matches!(config.ocr, OcrModel::PaddleOcrVl1_6));
         assert!(matches!(
             config.inpainting(),
             Ok(InpaintingModel::RoremMixed(config))

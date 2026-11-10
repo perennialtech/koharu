@@ -1,6 +1,5 @@
 [workspace]
 members = ["crates/*"]
-default-members = ["crates/koharu"]
 resolver = "3"
 
 [workspace.package]
@@ -19,7 +18,6 @@ keywords = ["manga", "ocr", "translation", "deep_learning", "computer_vision"]
 publish = false
 
 [workspace.dependencies]
-koharu-app = { path = "crates/koharu-app" }
 koharu-bindgen = { path = "crates/koharu-bindgen" }
 koharu-config = { path = "crates/koharu-config" }
 koharu-storage = { path = "crates/koharu-storage" }
@@ -31,20 +29,16 @@ koharu-llama-sys = { path = "crates/koharu-llama-sys" }
 koharu-runtime = { path = "crates/koharu-runtime" }
 koharu-torch = { path = "crates/koharu-torch" }
 koharu-torch-sys = { path = "crates/koharu-torch-sys" }
-koharu-agent = { path = "crates/koharu-agent" }
 koharu-ml = { path = "crates/koharu-ml" }
-koharu-pipeline = { path = "crates/koharu-pipeline" }
 koharu-translator = { path = "crates/koharu-translator" }
-koharu-psd = { path = "crates/koharu-psd" }
 koharu-renderer = { path = "crates/koharu-renderer" }
 koharu-rasterizer = { path = "crates/koharu-rasterizer", default-features = false }
-koharu-desktop = { path = "crates/koharu-desktop" }
-koharu-secrets = { path = "crates/koharu-secrets" }
+koharu-pipeline = { path = "crates/koharu-pipeline" }
 
 # external dependencies
-alphanumeric-sort = "1.5.8"
+axum = "0.8.8"
+sha2 = "0.11.0"
 arc-swap = "1.9.2"
-hayro = "0.9.0"
 image = "0.25.10"
 webp = { version = "0.3.1" }
 fast_image_resize = { version = "6.1.0", features = ["image", "rayon"] }
@@ -53,41 +47,31 @@ async-trait = "0.1.92"
 backon = { version = "1.6.0", default-features = false, features = ["std", "tokio-sleep"] }
 imageproc = "0.27.0"
 ab_glyph = "0.2.32"
-clap = { version = "4.6.7", features = ["derive"] }
+clap = { version = "4.6.7", features = ["derive", "env"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 specta = { version = "=2.0.0-rc.26", features = ["derive", "url", "uuid"] }
-specta-typescript = "=0.0.13"
 tokio = { version = "1.53.1", features = ["full"] }
 tokio-rayon = "2.1.0"
-log = "0.4.34"
 tracing = "0.1.44"
 tracing-core = "0.1.36"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt", "registry"] }
-console = "0.16.6"
-open = "5.4.4"
-rfd = "0.17.2"
 thiserror = "2.0.21"
 blake3 = "1.8.7"
 dunce = "1.0.5"
 rayon = "1.12.0"
 # disables `esaxx_fast` feature which is conflicting with `ort`
-tokenizers = { version = "0.23.2", features = ["onig"] }
 strum = { version = "0.28.0", features = ["derive"] }
 sysinfo = { version = "0.39.6", features = ["system"] }
-rars = "0.12.2"
 zip = { version = "9.0.2", features = ["deflate"] }
 dirs = "7.0.0"
 futures = "0.3.34"
-futures-channel = "0.3.34"
 hf-hub = { git = "https://github.com/huggingface/hf-hub", branch = "main" }
-eventsource-stream = "0.2.3"
 encoding_rs = "0.8.42"
 enumflags2 = "0.7.12"
 reqwest = { version = "0.13.5", features = ["stream", "json", "form", "blocking", "multipart"] }
 reqwest-middleware = "0.5.2"
 reqwest-retry = "0.9.1"
-secrecy = { version = "0.10.3", features = ["serde"] }
 toml = "1.1.6"
 url = { version = "2.5.8", features = ["serde"] }
 petgraph = "0.8.3"
@@ -119,20 +103,6 @@ jieba-rs = "0.11.0"
 fontique = "0.12.0"
 pollster = "1.0.1"
 vello = "0.11.0"
-tauri = { git = "https://github.com/tauri-apps/tauri", rev = "78f49ba3993fed5a1b921235c547731006ad2a74", default-features = false, features = [
-    "compression",
-    "dynamic-acl",
-    "specta",
-] }
-tauri-build = { git = "https://github.com/tauri-apps/tauri", rev = "78f49ba3993fed5a1b921235c547731006ad2a74" }
-tauri-runtime-cef = { git = "https://github.com/tauri-apps/tauri", rev = "78f49ba3993fed5a1b921235c547731006ad2a74" }
-tauri-plugin-log = { git = "https://github.com/tauri-apps/plugins-workspace", rev = "3d836244bcb97cb1620405e8d1887da285a793d4" }
-tauri-plugin-opener = { git = "https://github.com/tauri-apps/plugins-workspace", rev = "3d836244bcb97cb1620405e8d1887da285a793d4" }
-tauri-plugin-process = { git = "https://github.com/tauri-apps/plugins-workspace", rev = "3d836244bcb97cb1620405e8d1887da285a793d4" }
-tauri-plugin-single-instance = { git = "https://github.com/tauri-apps/plugins-workspace", rev = "3d836244bcb97cb1620405e8d1887da285a793d4" }
-tauri-plugin-updater = { git = "https://github.com/tauri-apps/plugins-workspace", rev = "3d836244bcb97cb1620405e8d1887da285a793d4" }
-tauri-plugin-window-state = { git = "https://github.com/tauri-apps/plugins-workspace", rev = "3d836244bcb97cb1620405e8d1887da285a793d4" }
-tauri-specta = { git = "https://github.com/tauri-apps/tauri-specta", rev = "6bcec0cdec0c92decf404c85ff01b4d8c3868599", features = ["derive", "typescript"] }
 schemars = { version = "1.2.2", features = ["chrono04", "indexmap2", "uuid1"] }
 uuid = { version = "1.26.1", features = ["v4", "v7", "serde"] }
 atomicwrites = "0.4.4"
@@ -143,25 +113,16 @@ walkdir = "2.5.0"
 base64 = "0.23.1"
 unicode-bidi = "0.3.18"
 criterion = { version = "0.8.2", features = ["html_reports"] }
-keyring = { version = "4.2.0", features = ["linux-keyutils-keyring-store"] }
-keyring-core = "1.0.0"
-linux-keyutils-keyring-store = "1.0.0"
 llguidance = "1.9.1"
-sentry = { version = "0.49.3", features = ["tracing"] }
 fast-glob = "1.1.2"
 tar = "0.4.46"
 toktrie = "1.9.1"
 bytes = "1.12.1"
 half = "2.7.1"
-js-sys = "0.3.106"
 lazy_static = "1.5.1"
 ndarray = "0.17.2"
 rand = "0.10.3"
 safetensors = "0.8.0"
-serde-wasm-bindgen = "0.6.5"
-wasm-bindgen = "0.2.129"
-wasm-bindgen-futures = "0.4.79"
-web-sys = "0.3.106"
 bindgen = { version = "0.73.2", default-features = false, features = ["logging", "runtime"] }
 prettyplease = "0.3.0"
 proc-macro2 = "1.0.107"
@@ -170,22 +131,10 @@ syn = { version = "3.0.6", features = ["full"] }
 libc = "0.2.189"
 memmap2 = "0.9.11"
 
-[patch.crates-io]
-tauri = { git = "https://github.com/tauri-apps/tauri", rev = "78f49ba3993fed5a1b921235c547731006ad2a74" }
-tauri-plugin = { git = "https://github.com/tauri-apps/tauri", rev = "78f49ba3993fed5a1b921235c547731006ad2a74" }
-tauri-utils = { git = "https://github.com/tauri-apps/tauri", rev = "78f49ba3993fed5a1b921235c547731006ad2a74" }
-
-[profile.release]
-# Keep debug information for Sentry's native stack traces and source context.
-debug = true
-
 [profile.dev]
 debug = 1
 
 [profile.dev.package.blake3]
-opt-level = 3
-
-[profile.dev.package.koharu-canvas]
 opt-level = 3
 
 [profile.dev.package.koharu-rasterizer]

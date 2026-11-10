@@ -98,6 +98,7 @@ impl<'model> LlamaContext<'model> {
     ///
     /// - the returned [`std::ffi::c_int`] from llama-cpp does not fit into a i32 (this should never happen on most systems)
     pub fn decode(&mut self, batch: &mut LlamaBatch) -> Result<(), DecodeError> {
+        crate::clear_allocation_failure();
         let result =
             unsafe { koharu_llama_sys::llama_decode(self.context.as_ptr(), batch.llama_batch) };
 
@@ -121,6 +122,7 @@ impl<'model> LlamaContext<'model> {
     ///
     /// - the returned [`std::ffi::c_int`] from llama-cpp does not fit into a i32 (this should never happen on most systems)
     pub fn encode(&mut self, batch: &mut LlamaBatch) -> Result<(), EncodeError> {
+        crate::clear_allocation_failure();
         let result =
             unsafe { koharu_llama_sys::llama_encode(self.context.as_ptr(), batch.llama_batch) };
 

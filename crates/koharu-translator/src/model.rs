@@ -75,36 +75,6 @@ impl Default for ModelSelection {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Type)]
-pub struct Quantization {
-    pub id: String,
-    pub name: String,
-    pub downloaded: bool,
-}
-
-#[derive(Clone, Debug, PartialEq, Serialize, Type)]
-pub struct Model {
-    pub provider: Provider,
-    pub model: Option<String>,
-    pub name: String,
-    pub quantizations: Vec<Quantization>,
-    pub vision: bool,
-    pub reasoning: bool,
-}
-
-impl Model {
-    pub(crate) fn service(provider: Provider, name: &str) -> Self {
-        Self {
-            provider,
-            model: None,
-            name: name.to_owned(),
-            quantizations: Vec::new(),
-            vision: false,
-            reasoning: false,
-        }
-    }
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct QuantizationDefinition {
     pub id: &'static str,
@@ -162,30 +132,13 @@ impl ModelGeneration {
     }
 }
 
-#[must_use]
-pub(crate) fn display_name(model: &str) -> String {
-    model
-        .rsplit_once('/')
-        .map_or(model, |(_, model)| model)
-        .split(['-', '_'])
-        .filter(|part| !part.is_empty())
-        .map(|part| {
-            let mut characters = part.chars();
-            characters.next().map_or_else(String::new, |first| {
-                first.to_uppercase().chain(characters).collect()
-            })
-        })
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn selection(vision: bool, reasoning: bool) -> ModelSelection {
         ModelSelection {
-            provider: Provider::LmStudio,
+            provider: Provider::OpenAiCompatible,
             model: Some("publisher/model".to_owned()),
             quantization: None,
             vision,
@@ -212,7 +165,7 @@ mod tests {
     #[test]
     fn model_selection_defaults_missing_capabilities() {
         let selection: ModelSelection = serde_json::from_value(serde_json::json!({
-            "provider": "lm-studio",
+            "provider": "openai-compatible",
             "model": "publisher/model",
             "quantization": null
         }))

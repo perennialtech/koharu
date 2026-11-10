@@ -6,6 +6,7 @@
 //! # Warning
 //! This API is experimental and subject to breaking changes.
 use std::ffi::{CStr, CString};
+use std::num::NonZeroI32;
 use std::ptr::NonNull;
 use std::slice;
 
@@ -758,6 +759,7 @@ impl MtmdInputChunks {
         logits_last: bool,
     ) -> Result<koharu_llama_sys::llama_pos, MtmdEvalError> {
         let mut new_n_past: koharu_llama_sys::llama_pos = 0;
+        crate::clear_allocation_failure();
 
         let result = unsafe {
             koharu_llama_sys::mtmd_helper_eval_chunks(
@@ -772,10 +774,9 @@ impl MtmdInputChunks {
             )
         };
 
-        if result == 0 {
-            Ok(new_n_past)
-        } else {
-            Err(MtmdEvalError::EvalFailure(result))
+        match NonZeroI32::new(result) {
+            None => Ok(new_n_past),
+            Some(error) => Err(MtmdEvalError::from(error)),
         }
     }
 }
@@ -996,7 +997,20 @@ pub enum MtmdEncodeError {
 /// Errors that can occur during evaluation
 #[derive(thiserror::Error, Debug)]
 pub enum MtmdEvalError {
+    /// Native allocation failed while evaluating multimodal inputs.
+    #[error("out of memory while evaluating llama.cpp multimodal input")]
+    OutOfMemory,
     /// Evaluation operation failed
     #[error("Eval failed with code: {0}")]
     EvalFailure(i32),
+}
+
+impl From<NonZeroI32> for MtmdEvalError {
+    fn from(value: NonZeroI32) -> Self {
+        if crate::take_allocation_failure() {
+            Self::OutOfMemory
+        } else {
+            Self::EvalFailure(value.get())
+        }
+    }
 }

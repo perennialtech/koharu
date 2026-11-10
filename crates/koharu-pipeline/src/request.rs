@@ -9,6 +9,7 @@ use specta::Type;
 
 use crate::{ProgressSink, Scope, Stage};
 use koharu_scene::EntityId;
+use koharu_translator::Language;
 
 #[derive(Clone, Debug)]
 pub struct InpaintingMask {
@@ -61,6 +62,13 @@ impl Operation {
     }
 }
 
+/// Translation choices scoped to one request without reloading the pipeline.
+#[derive(Clone, Debug)]
+pub struct RequestTranslation {
+    pub target_language: Language,
+    pub instructions: Option<String>,
+}
+
 #[derive(Clone)]
 pub struct Request {
     pub operation: Operation,
@@ -68,6 +76,7 @@ pub struct Request {
     pub stop: StopToken,
     pub progress: Option<ProgressSink>,
     pub inpainting_mask: Option<InpaintingMask>,
+    pub translation: Option<RequestTranslation>,
 }
 
 impl Default for Request {
@@ -78,6 +87,7 @@ impl Default for Request {
             stop: StopToken::default(),
             progress: None,
             inpainting_mask: None,
+            translation: None,
         }
     }
 }

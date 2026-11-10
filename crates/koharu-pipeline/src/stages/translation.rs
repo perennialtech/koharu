@@ -50,11 +50,23 @@ impl StageProcessor for Processor {
                 }
             }
         }
+        let target_language = input
+            .translation
+            .as_ref()
+            .map_or(self.config.target_language, |options| {
+                options.target_language
+            });
+        let instructions = input
+            .translation
+            .as_ref()
+            .map_or(self.config.instructions.as_deref(), |options| {
+                options.instructions.as_deref()
+            });
         let mut request = TranslationRequest::new(
             targets.iter().map(|(_, source)| source.clone()),
-            self.config.target_language,
+            target_language,
         );
-        if let Some(instructions) = self.config.instructions.as_deref() {
+        if let Some(instructions) = instructions {
             request = request.with_instructions(instructions);
         }
         if Translator::supports_vision(&self.config.model, &self.config.generation)
@@ -66,7 +78,7 @@ impl StageProcessor for Processor {
             .translator
             .translate(&self.config.model, self.config.generation, request)
             .await?;
-        let language = LanguageTag::new(self.config.target_language.tag())?;
+        let language = LanguageTag::new(target_language.tag())?;
         let generated = generation(PRODUCER, provider)?;
         let mut edit = input.scene.edit_as(generated.clone());
         for (entity, _) in &targets {

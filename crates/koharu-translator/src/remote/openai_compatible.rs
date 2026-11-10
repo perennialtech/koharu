@@ -1,16 +1,12 @@
 // https://developers.openai.com/api/reference/resources/chat/subresources/completions/methods/create
 
 use anyhow::Context;
-use koharu_secrets::ExposeSecret;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use url::Url;
 
 use super::send_json;
-use crate::{
-    GenerationConfig, Model, Provider, Result, TranslationRequest, backend::encode_image,
-    display_name, prompt,
-};
+use crate::{GenerationConfig, Result, TranslationRequest, backend::encode_image, prompt};
 
 const DEFAULT_BASE_URL: &str = "http://localhost:11434/v1";
 
@@ -37,7 +33,7 @@ pub(super) async fn translate(
     generation: &GenerationConfig,
     request: &TranslationRequest,
 ) -> Result<Vec<String>> {
-    let api_key = koharu_secrets::get("openai-compatible")?;
+    let api_key = std::env::var("OPENAI_COMPATIBLE_API_KEY").ok();
     let (system, user) = prompt::prompts(request)?;
     let user_content = match request.image.as_deref() {
         Some(image) => MessageContent::Parts(vec![
@@ -83,7 +79,7 @@ pub(super) async fn translate(
         .post(endpoint(config.base_url.as_ref(), "chat/completions"))
         .json(&body);
     let http = match api_key {
-        Some(api_key) => http.bearer_auth(api_key.expose_secret()),
+        Some(api_key) => http.bearer_auth(api_key),
         None => http,
     };
     let response: ChatResponse = send_json("openai-compatible", http).await?;
@@ -100,28 +96,6 @@ pub(super) async fn translate(
         &text,
         &request.segments,
     )?)
-}
-
-pub(super) async fn models(client: &Client, config: &OpenAiCompatibleConfig) -> Result<Vec<Model>> {
-    let api_key = koharu_secrets::get("openai-compatible")?;
-    let request = client.get(endpoint(config.base_url.as_ref(), "models"));
-    let request = match api_key {
-        Some(api_key) => request.bearer_auth(api_key.expose_secret()),
-        None => request,
-    };
-    let response: ModelsResponse = send_json("openai-compatible", request).await?;
-    Ok(response
-        .data
-        .into_iter()
-        .map(|model| Model {
-            provider: Provider::OpenAiCompatible,
-            name: display_name(&model.id),
-            model: Some(model.id),
-            quantizations: Vec::new(),
-            vision: true,
-            reasoning: true,
-        })
-        .collect())
 }
 
 fn endpoint(base_url: Option<&Url>, suffix: &str) -> String {
@@ -204,16 +178,6 @@ struct Choice {
 #[derive(Deserialize)]
 struct ResponseMessage {
     content: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct ModelsResponse {
-    data: Vec<ListedModel>,
-}
-
-#[derive(Deserialize)]
-struct ListedModel {
-    id: String,
 }
 
 #[cfg(test)]
