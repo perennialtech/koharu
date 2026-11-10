@@ -155,6 +155,9 @@ pub enum DecodeError {
     /// The number of tokens in the batch was 0.
     #[error("Decode Error -1: n_tokens == 0")]
     NTokensZero,
+    /// Native allocation failed while decoding.
+    #[error("out of memory while decoding llama.cpp batch")]
+    OutOfMemory,
     /// An unknown error occurred.
     #[error("Decode Error {0}: unknown")]
     Unknown(c_int),
@@ -169,6 +172,9 @@ pub enum EncodeError {
     /// The number of tokens in the batch was 0.
     #[error("Encode Error -1: n_tokens == 0")]
     NTokensZero,
+    /// Native allocation failed while encoding.
+    #[error("out of memory while encoding llama.cpp batch")]
+    OutOfMemory,
     /// An unknown error occurred.
     #[error("Encode Error {0}: unknown")]
     Unknown(c_int),
@@ -208,6 +214,9 @@ pub enum GrammarError {
 /// Decode a error from llama.cpp into a [`DecodeError`].
 impl From<NonZeroI32> for DecodeError {
     fn from(value: NonZeroI32) -> Self {
+        if take_allocation_failure() {
+            return Self::OutOfMemory;
+        }
         match value.get() {
             1 => DecodeError::NoKvCacheSlot,
             -1 => DecodeError::NTokensZero,
@@ -219,6 +228,9 @@ impl From<NonZeroI32> for DecodeError {
 /// Encode a error from llama.cpp into a [`EncodeError`].
 impl From<NonZeroI32> for EncodeError {
     fn from(value: NonZeroI32) -> Self {
+        if take_allocation_failure() {
+            return Self::OutOfMemory;
+        }
         match value.get() {
             1 => EncodeError::NoKvCacheSlot,
             -1 => EncodeError::NTokensZero,
@@ -633,5 +645,21 @@ mod allocation_failure_tests {
             (&state as *const log::State).cast_mut().cast(),
         );
         assert!(!take_allocation_failure());
+
+        let message = std::ffi::CString::new("failed to allocate CUDA0 buffer\n").unwrap();
+        for error_kind in ["decode", "encode", "multimodal"] {
+            clear_allocation_failure();
+            logs_to_trace(
+                koharu_llama_sys::GGML_LOG_LEVEL_ERROR,
+                message.as_ptr(),
+                (&state as *const log::State).cast_mut().cast(),
+            );
+            let error = match error_kind {
+                "decode" => DecodeError::from(NonZeroI32::new(-2).unwrap()).to_string(),
+                "encode" => EncodeError::from(NonZeroI32::new(-2).unwrap()).to_string(),
+                _ => mtmd::MtmdEvalError::from(NonZeroI32::new(-2).unwrap()).to_string(),
+            };
+            assert!(error.contains("out of memory"), "{error_kind}: {error}");
+        }
     }
 }
