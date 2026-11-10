@@ -1,0 +1,29 @@
+services:
+  koharu:
+    image: ghcr.io/perennialtech/koharu:latest
+    build:
+      context: .
+      dockerfile: Containerfile
+    gpus: all
+    ports:
+      - 127.0.0.1:8080:8080
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp:rw,nosuid,nodev
+    volumes:
+      - koharu-cache:/var/cache/koharu
+    environment:
+      - KOHARU_PROVIDER
+      - KOHARU_MODEL
+      - KOHARU_INPAINTING
+      - KOHARU_OPENAI_COMPATIBLE_BASE_URL
+      - OPENROUTER_API_KEY
+      - OPENAI_COMPATIBLE_API_KEY
+
+volumes:
+  koharu-cache:
+    name: koharu-cache
