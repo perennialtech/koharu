@@ -1,7 +1,6 @@
 // https://developers.openai.com/api/reference/resources/chat/subresources/completions/methods/create
 
 use anyhow::Context;
-use koharu_secrets::ExposeSecret;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use url::Url;
@@ -34,7 +33,7 @@ pub(super) async fn translate(
     generation: &GenerationConfig,
     request: &TranslationRequest,
 ) -> Result<Vec<String>> {
-    let api_key = koharu_secrets::get("openai-compatible")?;
+    let api_key = std::env::var("OPENAI_COMPATIBLE_API_KEY").ok();
     let (system, user) = prompt::prompts(request)?;
     let user_content = match request.image.as_deref() {
         Some(image) => MessageContent::Parts(vec![
@@ -80,7 +79,7 @@ pub(super) async fn translate(
         .post(endpoint(config.base_url.as_ref(), "chat/completions"))
         .json(&body);
     let http = match api_key {
-        Some(api_key) => http.bearer_auth(api_key.expose_secret()),
+        Some(api_key) => http.bearer_auth(api_key),
         None => http,
     };
     let response: ChatResponse = send_json("openai-compatible", http).await?;

@@ -11,7 +11,7 @@ Document only durable, repository-specific constraints here. Do not record curre
 - Make the smallest change that solves the problem. Do not edit unrelated configuration, documentation, generated files, or workflows in the same change. A feature does not land beside drive-by cleanup.
 - If the current owner has moved, rebase onto that owner. Do not port a patch onto a deleted tree.
 - When two changes implement the same workflow, keep one and extend the existing command or configuration. Do not land both.
-- Desktop API keys go through the OS credential store. Do not add a project environment-file fallback for the desktop app.
+- Hosted translator credentials come from `OPENROUTER_API_KEY` (required for OpenRouter) and `OPENAI_COMPATIBLE_API_KEY` (optional). Never persist credentials in the repository.
 - Once a subsystem is removed, delete its calls and dependency together. Do not leave a stub, alias, or disabled flag behind.
 
 ## Ownership

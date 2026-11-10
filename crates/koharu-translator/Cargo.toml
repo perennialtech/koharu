@@ -15,7 +15,6 @@ publish.workspace = true
 koharu-config = { workspace = true }
 koharu-ml = { workspace = true }
 koharu-runtime = { workspace = true }
-koharu-secrets = { workspace = true }
 anyhow = { workspace = true }
 base64 = { workspace = true }
 clap = { workspace = true }

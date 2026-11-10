@@ -5,7 +5,6 @@
 // https://openrouter.ai/docs/guides/routing/provider-selection
 
 use anyhow::Context;
-use koharu_secrets::ExposeSecret;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
@@ -25,8 +24,8 @@ pub(super) async fn translate(
     generation: &GenerationConfig,
     request: &TranslationRequest,
 ) -> Result<Vec<String>> {
-    let api_key =
-        koharu_secrets::get("openrouter")?.context("openrouter API key is not configured")?;
+    let api_key = std::env::var("OPENROUTER_API_KEY")
+        .context("OPENROUTER_API_KEY is required for OpenRouter")?;
     let (system, user) = prompt::prompts(request)?;
     let user_content = match request.image.as_deref() {
         Some(image) => MessageContent::Parts(vec![
@@ -73,10 +72,7 @@ pub(super) async fn translate(
     };
     let response: ChatResponse = send_json(
         "openrouter",
-        client
-            .post(CHAT_URL)
-            .bearer_auth(api_key.expose_secret())
-            .json(&body),
+        client.post(CHAT_URL).bearer_auth(api_key).json(&body),
     )
     .await?;
     let text = response

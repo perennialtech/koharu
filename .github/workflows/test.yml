@@ -21,9 +21,7 @@ jobs:
           sudo apt install --no-install-recommends \
             build-essential \
             libfontconfig-dev \
-            fonts-noto-cjk \
-            dbus-x11 \
-            gnome-keyring
+            fonts-noto-cjk
       - uses: actions/checkout@v7
       - uses: Swatinem/rust-cache@v2
       - name: Run headless Rust tests
