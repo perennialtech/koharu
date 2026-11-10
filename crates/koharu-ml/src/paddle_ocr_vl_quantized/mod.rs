@@ -3,12 +3,43 @@
 use anyhow::{Context, Result, ensure};
 use image::DynamicImage;
 use koharu_llama::mtmd::mtmd_default_marker;
+use serde::{Deserialize, Serialize};
 
 use crate::{
     Device,
     llm::{ChatMessage, GenerationOptions, Input, Llm, LoadOptions, MtmdOptions},
-    paddle_ocr_vl::{MAX_NEW_TOKENS, PaddleOCRVLResult, PaddleOCRVLTask, REPETITION_PENALTY},
 };
+
+const MAX_NEW_TOKENS: usize = 512;
+const REPETITION_PENALTY: f32 = 1.2;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PaddleOCRVLTask {
+    Ocr,
+    Table,
+    Formula,
+    Chart,
+    Spotting,
+    Seal,
+}
+
+impl PaddleOCRVLTask {
+    const fn prompt(self) -> &'static str {
+        match self {
+            Self::Ocr => "OCR:",
+            Self::Table => "Table Recognition:",
+            Self::Formula => "Formula Recognition:",
+            Self::Chart => "Chart Recognition:",
+            Self::Spotting => "Spotting:",
+            Self::Seal => "Seal Recognition:",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PaddleOCRVLResult {
+    pub text: String,
+}
 
 crate::model_repository!("PaddlePaddle/PaddleOCR-VL-1.6-GGUF" @ "511b09642bb324401f15f97cc23bc67e8f0a291d" {
     MODEL = "PaddleOCR-VL-1.6-GGUF.gguf",

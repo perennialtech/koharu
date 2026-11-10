@@ -69,12 +69,6 @@ enum DetectionChoice {
 enum OcrChoice {
     #[value(name = "paddleocr-vl-1.6")]
     PaddleOcrVl1_6,
-    #[value(name = "manga-ocr")]
-    MangaOcr,
-    #[value(name = "baberu-ocr")]
-    BaberuOcr,
-    #[value(name = "hayai-ocr")]
-    HayaiOcr,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -101,9 +95,6 @@ impl Arguments {
             },
             ocr: match self.ocr {
                 OcrChoice::PaddleOcrVl1_6 => OcrModel::PaddleOcrVl1_6,
-                OcrChoice::MangaOcr => OcrModel::MangaOcr,
-                OcrChoice::BaberuOcr => OcrModel::BaberuOcr,
-                OcrChoice::HayaiOcr => OcrModel::HayaiOcr,
             },
             translation: TranslationConfig {
                 model: ModelSelection {
@@ -267,14 +258,14 @@ mod tests {
             "--output",
             "output.png",
             "--ocr",
-            "manga-ocr",
+            "paddleocr-vl-1.6",
             "--inpainting",
             "flux2-klein",
         ])
         .unwrap();
         assert!(matches!(
             arguments.pipeline_config().ocr,
-            OcrModel::MangaOcr
+            OcrModel::PaddleOcrVl1_6
         ));
         assert!(matches!(
             arguments.pipeline_config().inpainting,
