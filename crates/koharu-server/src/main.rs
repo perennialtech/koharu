@@ -275,8 +275,27 @@ async fn serve() -> Result<()> {
     let app = api::router(jobs);
     let listener = tokio::net::TcpListener::bind(arguments.listen).await?;
     tracing::info!(address = %listener.local_addr()?, "Koharu HTTP server listening");
-    axum::serve(listener, app).await?;
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal())
+        .await?;
     Ok(())
+}
+
+#[cfg(unix)]
+async fn shutdown_signal() {
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .expect("failed to register SIGTERM handler");
+    tokio::select! {
+        result = tokio::signal::ctrl_c() => result.expect("failed to register SIGINT handler"),
+        _ = sigterm.recv() => {}
+    }
+}
+
+#[cfg(not(unix))]
+async fn shutdown_signal() {
+    tokio::signal::ctrl_c()
+        .await
+        .expect("failed to register SIGINT handler");
 }
 
 #[cfg(test)]
