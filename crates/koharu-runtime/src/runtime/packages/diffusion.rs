@@ -12,7 +12,7 @@ use crate::{
     source::extract,
 };
 
-const RELEASE: &str = "master-964-1d0a58a.1";
+const RELEASE: &str = "koharu-c72cfa8";
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, strum::Display, strum::EnumProperty)]
 pub(crate) enum Diffusion {
@@ -106,7 +106,7 @@ impl Package for Diffusion {
             move |stage| async move {
                 let asset = self.asset();
                 let url = format!(
-                    "https://github.com/koharu-rs/diffusion/releases/download/{RELEASE}/{asset}"
+                    "https://github.com/perennialtech/diffusion/releases/download/{RELEASE}/{asset}"
                 );
                 let archive = tempfile::Builder::new().suffix(".tar.gz").tempfile()?;
                 download::fetch(&url, archive.path()).await?;

@@ -92,13 +92,12 @@ impl Context {
     pub fn generate_image(&mut self, params: &ImageGenerationParams) -> Result<Vec<RgbImage>> {
         let native = params.to_native()?;
         let _call = NativeCall::enter();
-        let mut output = RawImages::default();
+        let mut output = RawImageResult::default();
         let succeeded = unsafe {
             sys::generate_image(
                 self.inner.pointer.as_ptr(),
                 &raw const native.raw,
                 &raw mut output.pointer,
-                &raw mut output.count,
             )
         };
         if !succeeded {
@@ -111,34 +110,18 @@ impl Context {
     pub fn generate_video(&mut self, params: &VideoGenerationParams) -> Result<Video> {
         let native = params.to_native()?;
         let _call = NativeCall::enter();
-        let mut frames = RawImages::default();
-        let mut audio = RawAudio::default();
-        let mut fps = 0;
+        let mut output = RawVideoResult::default();
         let succeeded = unsafe {
             sys::generate_video(
                 self.inner.pointer.as_ptr(),
                 &raw const native.raw,
-                &raw mut frames.pointer,
-                &raw mut frames.count,
-                &raw mut audio.pointer,
-                &raw mut fps,
+                &raw mut output.pointer,
             )
         };
         if !succeeded {
             return Err(Error::VideoGenerationFailed);
         }
-        let fps =
-            u32::try_from(fps)
-                .ok()
-                .filter(|fps| *fps > 0)
-                .ok_or(Error::InvalidNativeOutput {
-                    kind: "video frame rate",
-                })?;
-        Ok(Video {
-            frames: frames.copy("video frame")?,
-            audio: audio.copy()?,
-            fps,
-        })
+        output.copy()
     }
 
     /// Creates a thread-safe handle that can cancel generation from another thread.
@@ -177,51 +160,49 @@ impl CancelHandle {
 }
 
 #[derive(Debug)]
-pub(crate) struct RawImages {
-    pub(crate) pointer: *mut sys::sd_image_t,
-    pub(crate) count: i32,
+pub(crate) struct RawImageResult {
+    pub(crate) pointer: *mut sys::sd_image_generation_result_t,
 }
 
-impl Default for RawImages {
+impl Default for RawImageResult {
     fn default() -> Self {
         Self {
             pointer: ptr::null_mut(),
-            count: 0,
         }
     }
 }
 
-impl RawImages {
+impl RawImageResult {
     pub(crate) fn copy(&self, kind: &'static str) -> Result<Vec<RgbImage>> {
-        let count = usize::try_from(self.count).map_err(|_| Error::InvalidNativeOutput { kind })?;
-        if count == 0 || self.pointer.is_null() {
+        let result = NonNull::new(self.pointer).ok_or(Error::InvalidNativeOutput { kind })?;
+        let result = unsafe { result.as_ref() };
+        let count =
+            usize::try_from(result.count).map_err(|_| Error::InvalidNativeOutput { kind })?;
+        if count == 0 || result.items.is_null() {
             return Err(Error::InvalidNativeOutput { kind });
         }
-        if count > isize::MAX as usize / size_of::<sys::sd_image_t>() {
-            return Err(Error::InvalidNativeOutput { kind });
-        }
-        let raw_images = unsafe { slice::from_raw_parts(self.pointer, count) };
-        raw_images
+        let items = unsafe { slice::from_raw_parts(result.items, count) };
+        items
             .iter()
-            .map(|raw| unsafe { copy_rgb_from_raw(raw) })
+            .map(|item| unsafe { copy_rgb_from_raw(&item.image) })
             .collect()
     }
 }
 
-impl Drop for RawImages {
+impl Drop for RawImageResult {
     fn drop(&mut self) {
         if !self.pointer.is_null() {
-            unsafe { sys::free_sd_images(self.pointer, self.count.max(0)) };
+            unsafe { sys::free_sd_image_generation_result(self.pointer) };
         }
     }
 }
 
 #[derive(Debug)]
-struct RawAudio {
-    pointer: *mut sys::sd_audio_t,
+struct RawVideoResult {
+    pointer: *mut sys::sd_video_generation_result_t,
 }
 
-impl Default for RawAudio {
+impl Default for RawVideoResult {
     fn default() -> Self {
         Self {
             pointer: ptr::null_mut(),
@@ -229,19 +210,39 @@ impl Default for RawAudio {
     }
 }
 
-impl RawAudio {
-    fn copy(&self) -> Result<Option<Audio>> {
-        let Some(audio) = NonNull::new(self.pointer) else {
-            return Ok(None);
+impl RawVideoResult {
+    fn copy(&self) -> Result<Video> {
+        let result =
+            NonNull::new(self.pointer).ok_or(Error::InvalidNativeOutput { kind: "video" })?;
+        let result = unsafe { result.as_ref() };
+        let kind = "video frame";
+        let count =
+            usize::try_from(result.frame_count).map_err(|_| Error::InvalidNativeOutput { kind })?;
+        if count == 0 || result.frames.is_null() {
+            return Err(Error::InvalidNativeOutput { kind });
+        }
+        let frames = unsafe { slice::from_raw_parts(result.frames, count) }
+            .iter()
+            .map(|raw| unsafe { copy_rgb_from_raw(raw) })
+            .collect::<Result<Vec<_>>>()?;
+        let audio = match NonNull::new(result.audio) {
+            Some(audio) => Some(unsafe { Audio::copy_from_raw(audio.as_ref()) }?),
+            None => None,
         };
-        Ok(Some(unsafe { Audio::copy_from_raw(audio.as_ref()) }?))
+        let fps = u32::try_from(result.fps)
+            .ok()
+            .filter(|fps| *fps > 0)
+            .ok_or(Error::InvalidNativeOutput {
+                kind: "video frame rate",
+            })?;
+        Ok(Video { frames, audio, fps })
     }
 }
 
-impl Drop for RawAudio {
+impl Drop for RawVideoResult {
     fn drop(&mut self) {
         if !self.pointer.is_null() {
-            unsafe { sys::free_sd_audio(self.pointer) };
+            unsafe { sys::free_sd_video_generation_result(self.pointer) };
         }
     }
 }
