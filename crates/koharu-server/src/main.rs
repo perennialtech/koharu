@@ -3,7 +3,7 @@
 mod api;
 mod jobs;
 
-use std::{collections::BTreeMap, io, net::SocketAddr, sync::Arc};
+use std::{collections::BTreeMap, future::Future, io, net::SocketAddr, sync::Arc};
 
 use anyhow::{Context, Result, bail, ensure};
 use axum::body::Bytes;
@@ -257,9 +257,14 @@ async fn serve() -> Result<()> {
     if matches!(&pipeline_config.inpainting, InpaintingModel::Flux2Klein(_)) {
         features.push(koharu_ml::Feature::Diffusion);
     }
-    koharu_ml::init(&features)
-        .await
-        .context("cannot initialize model runtimes")?;
+    let mut shutdown = Box::pin(shutdown_signal()?);
+    tokio::select! {
+        biased;
+        _ = &mut shutdown => return Ok(()),
+        initialized = koharu_ml::init(&features) => {
+            initialized.context("cannot initialize model runtimes")?;
+        }
+    }
     let pipeline = Pipeline::from_config(
         Config::memory(pipeline_config),
         Config::memory(provider_config),
@@ -276,26 +281,32 @@ async fn serve() -> Result<()> {
     let listener = tokio::net::TcpListener::bind(arguments.listen).await?;
     tracing::info!(address = %listener.local_addr()?, "Koharu HTTP server listening");
     axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
+        .with_graceful_shutdown(shutdown)
         .await?;
     Ok(())
 }
 
 #[cfg(unix)]
-async fn shutdown_signal() {
+fn shutdown_signal() -> Result<impl Future<Output = ()>> {
+    let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
+        .context("failed to register SIGINT handler")?;
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-        .expect("failed to register SIGTERM handler");
-    tokio::select! {
-        result = tokio::signal::ctrl_c() => result.expect("failed to register SIGINT handler"),
-        _ = sigterm.recv() => {}
-    }
+        .context("failed to register SIGTERM handler")?;
+    Ok(async move {
+        tokio::select! {
+            _ = sigint.recv() => {}
+            _ = sigterm.recv() => {}
+        }
+    })
 }
 
 #[cfg(not(unix))]
-async fn shutdown_signal() {
-    tokio::signal::ctrl_c()
-        .await
-        .expect("failed to register SIGINT handler");
+fn shutdown_signal() -> Result<impl Future<Output = ()>> {
+    Ok(async {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("failed to register SIGINT handler");
+    })
 }
 
 #[cfg(test)]
@@ -334,5 +345,37 @@ mod tests {
             Arguments::try_parse_from(["koharu-server", "--provider", "openai-compatible"])
                 .unwrap();
         assert!(arguments.configs().is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn signal_handlers_are_installed_before_polling() {
+        const CHILD: &str = "KOHARU_EARLY_SIGNAL_TEST_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            let _shutdown = shutdown_signal();
+            assert!(
+                std::process::Command::new("kill")
+                    .arg("-TERM")
+                    .arg(std::process::id().to_string())
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+            return;
+        }
+
+        let result = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tests::signal_handlers_are_installed_before_polling",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "signal helper failed: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
     }
 }
