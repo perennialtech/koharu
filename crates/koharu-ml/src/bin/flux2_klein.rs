@@ -20,6 +20,8 @@ struct Cli {
     #[arg(short, long, value_name = "TEXT")]
     prompt: String,
 
+    /// Image the model is conditioned on. When inpainting it must have the
+    /// input's size and defaults to the input.
     #[arg(long, value_name = "FILE")]
     reference: Option<PathBuf>,
 

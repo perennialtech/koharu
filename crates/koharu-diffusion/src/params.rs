@@ -908,6 +908,7 @@ impl ImageGenerationParams {
                     "image preprocessing rules",
                 )?,
             },
+            control_type: sys::SD_CONTROL_TYPE_NONE,
         };
         Ok(NativeImageGenerationParams {
             raw,
@@ -1159,6 +1160,7 @@ impl VideoGenerationParams {
                     "image preprocessing rules",
                 )?,
             },
+            ref_image_args: ptr::null(),
         };
         Ok(NativeVideoGenerationParams {
             raw,

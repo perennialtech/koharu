@@ -2,7 +2,7 @@ use std::{cell::Cell, fmt, marker::PhantomData, path::PathBuf, ptr::NonNull};
 
 use crate::{
     Error, Result, RgbImage,
-    context::RawImages,
+    context::RawImageResult,
     ffi::{NativeCall, optional_cstring, path_cstring},
     image::raw_rgb_image,
     sys,
@@ -101,14 +101,13 @@ impl Upscaler {
         }
         let image = raw_rgb_image(image)?;
         let _call = NativeCall::enter();
-        let mut output = RawImages::default();
+        let mut output = RawImageResult::default();
         let succeeded = unsafe {
             sys::upscale(
                 self.pointer.as_ptr(),
                 image,
                 requested_factor,
                 &raw mut output.pointer,
-                &raw mut output.count,
             )
         };
         if !succeeded {

@@ -8,7 +8,7 @@ mod processor;
 
 use anyhow::{Context, Result, ensure};
 use fast_image_resize::{FilterType, ResizeAlg, ResizeOptions, Resizer};
-use image::{DynamicImage, RgbImage};
+use image::{DynamicImage, GenericImageView as _, RgbImage};
 use koharu_diffusion::{
     GuidanceParams, ImageGenerationParams, SampleMethod, SampleParams, Scheduler,
 };
@@ -175,24 +175,45 @@ impl Flux2KleinInpaint {
             "num_inference_steps must be greater than zero"
         );
 
-        let mut image = image.clone();
-        if u64::from(image.width()) * u64::from(image.height()) > 1024 * 1024 {
-            image = Flux2ImageProcessor::_resize_to_target_area(&image, 1024 * 1024);
+        if let Some(reference) = image_reference {
+            ensure!(
+                reference.dimensions() == image.dimensions(),
+                "image/reference dimensions differ: image={}x{}, reference={}x{}",
+                image.width(),
+                image.height(),
+                reference.width(),
+                reference.height()
+            );
         }
-        let width = (image.width() / 16) * 16;
-        let height = (image.height() / 16) * 16;
+
+        let (mut width, mut height) = image.dimensions();
+        if u64::from(width) * u64::from(height) > 1024 * 1024 {
+            let scale = (1024.0 * 1024.0 / (f64::from(width) * f64::from(height))).sqrt();
+            width = (f64::from(width) * scale) as u32;
+            height = (f64::from(height) * scale) as u32;
+        }
+        let width = (width / 16) * 16;
+        let height = (height / 16) * 16;
         ensure!(width > 0 && height > 0);
-        let source = image.to_rgb8();
-        let mut image = RgbImage::new(width, height);
-        Resizer::new()
-            .resize(
-                &source,
-                &mut image,
-                &ResizeOptions::new()
-                    .resize_alg(ResizeAlg::Convolution(FilterType::Lanczos3))
-                    .use_alpha(false),
-            )
-            .expect("source and destination images have the same pixel type");
+        let resize = |image: &DynamicImage| {
+            let mut image = image.clone();
+            if u64::from(image.width()) * u64::from(image.height()) > 1024 * 1024 {
+                image = Flux2ImageProcessor::_resize_to_target_area(&image, 1024 * 1024);
+            }
+            let source = image.to_rgb8();
+            let mut resized = RgbImage::new(width, height);
+            Resizer::new()
+                .resize(
+                    &source,
+                    &mut resized,
+                    &ResizeOptions::new()
+                        .resize_alg(ResizeAlg::Convolution(FilterType::Lanczos3))
+                        .use_alpha(false),
+                )
+                .expect("source and destination images have the same pixel type");
+            resized
+        };
+        let image = resize(image);
         let source_mask = mask_image.to_luma8();
         let mut mask_image = image::GrayImage::new(width, height);
         Resizer::new()
@@ -208,43 +229,34 @@ impl Flux2KleinInpaint {
         let crop_coords = options.padding_mask_crop.and_then(|padding| {
             Flux2ImageProcessor::get_crop_region(&mask_image, width, height, padding)
         });
-        let (init_image, mut native_mask) = if let Some((x1, y1, x2, y2)) = crop_coords {
-            let image_crop = DynamicImage::ImageRgb8(
-                image::imageops::crop_imm(&image, x1, y1, x2 - x1, y2 - y1).to_image(),
-            );
-            let mask_crop = DynamicImage::ImageLuma8(
-                image::imageops::crop_imm(&mask_image, x1, y1, x2 - x1, y2 - y1).to_image(),
-            );
-            (
-                Flux2ImageProcessor::_resize_and_fill(&image_crop, width, height).to_rgb8(),
-                Flux2ImageProcessor::_resize_and_fill(&mask_crop, width, height).to_luma8(),
+        let crop = |image: &RgbImage| match crop_coords {
+            Some((x1, y1, x2, y2)) => Flux2ImageProcessor::_resize_and_fill(
+                &DynamicImage::ImageRgb8(
+                    image::imageops::crop_imm(image, x1, y1, x2 - x1, y2 - y1).to_image(),
+                ),
+                width,
+                height,
             )
-        } else {
-            (image.clone(), mask_image.clone())
+            .to_rgb8(),
+            None => image.clone(),
+        };
+        let init_image = crop(&image);
+        let mut native_mask = match crop_coords {
+            Some((x1, y1, x2, y2)) => Flux2ImageProcessor::_resize_and_fill(
+                &DynamicImage::ImageLuma8(
+                    image::imageops::crop_imm(&mask_image, x1, y1, x2 - x1, y2 - y1).to_image(),
+                ),
+                width,
+                height,
+            )
+            .to_luma8(),
+            None => mask_image.clone(),
         };
         Flux2ImageProcessor::binarize(&mut native_mask);
-
-        let mut reference_images = vec![init_image.clone()];
-        if let Some(image_reference) = image_reference {
-            let mut image_reference = image_reference.clone();
-            if u64::from(image_reference.width()) * u64::from(image_reference.height())
-                > 1024 * 1024
-            {
-                image_reference =
-                    Flux2ImageProcessor::_resize_to_target_area(&image_reference, 1024 * 1024);
-            }
-            let reference_width = (image_reference.width() / 16) * 16;
-            let reference_height = (image_reference.height() / 16) * 16;
-            ensure!(reference_width > 0 && reference_height > 0);
-            reference_images.push(
-                Flux2ImageProcessor::_resize_and_crop(
-                    &image_reference,
-                    reference_width,
-                    reference_height,
-                )?
-                .to_rgb8(),
-            );
-        }
+        let reference_images = vec![match image_reference {
+            Some(reference) => crop(&resize(reference)),
+            None => init_image.clone(),
+        }];
 
         let strength = if options.strength >= 1.0 {
             1.0
