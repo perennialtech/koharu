@@ -3,7 +3,7 @@
 mod api;
 mod jobs;
 
-use std::{collections::BTreeMap, future::Future, io, net::SocketAddr, sync::Arc};
+use std::{collections::BTreeMap, future::Future, io, net::SocketAddr, sync::Arc, time::Duration};
 
 use anyhow::{Context, Result, bail, ensure};
 use axum::body::Bytes;
@@ -293,12 +293,42 @@ async fn serve() -> Result<()> {
         },
         started = &mut startup => started.context("server startup task failed")??,
     };
-    axum::serve(listener, app)
-        .with_graceful_shutdown(async move {
-            shutdown.await;
-            shutdown_jobs.shutdown();
-        })
-        .await?;
+    // Docker waits 10 seconds before SIGKILL by default.
+    serve_http(
+        listener,
+        app,
+        shutdown_jobs,
+        shutdown,
+        Duration::from_secs(8),
+    )
+    .await
+}
+
+async fn serve_http(
+    listener: tokio::net::TcpListener,
+    app: axum::Router,
+    shutdown_jobs: Jobs,
+    shutdown: impl Future<Output = ()> + Send + 'static,
+    grace: Duration,
+) -> Result<()> {
+    let (draining, drained) = tokio::sync::oneshot::channel();
+    let server = async move {
+        axum::serve(listener, app)
+            .with_graceful_shutdown(async move {
+                shutdown.await;
+                shutdown_jobs.shutdown();
+                let _ = draining.send(());
+            })
+            .await
+    };
+    tokio::pin!(server);
+    tokio::select! {
+        result = &mut server => result?,
+        _ = drained => match tokio::time::timeout(grace, &mut server).await {
+            Ok(result) => result?,
+            Err(_) => tracing::warn!("HTTP connections did not drain before shutdown deadline"),
+        },
+    }
     Ok(())
 }
 
@@ -328,6 +358,51 @@ fn shutdown_signal() -> Result<impl Future<Output = ()>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn shutdown_finishes_with_an_incomplete_multipart_upload() {
+        use tokio::io::AsyncWriteExt;
+
+        let (jobs, _queue) = Jobs::new();
+        let (started_tx, mut started_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+        let app = api::router(jobs.clone()).layer(axum::middleware::from_fn(
+            move |request: axum::extract::Request, next: axum::middleware::Next| {
+                let started_tx = started_tx.clone();
+                async move {
+                    let _ = started_tx.send(());
+                    next.run(request).await
+                }
+            },
+        ));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+        let server = tokio::spawn(serve_http(
+            listener,
+            app,
+            jobs,
+            async move {
+                let _ = stop_rx.await;
+            },
+            Duration::from_millis(100),
+        ));
+
+        let mut client = tokio::net::TcpStream::connect(address).await.unwrap();
+        client
+            .write_all(b"POST /translations HTTP/1.1\r\nHost: localhost\r\nContent-Type: multipart/form-data; boundary=page\r\nContent-Length: 4096\r\n\r\n--page\r\nContent-Disposition: form-data; name=\"image\"; filename=\"page.png\"\r\n\r\n")
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), started_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        stop_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), server)
+            .await
+            .expect("server did not finish draining the stalled upload")
+            .unwrap()
+            .unwrap();
+    }
 
     #[test]
     fn cli_keeps_local_only_and_selected_inpainters() {
