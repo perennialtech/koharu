@@ -34,7 +34,7 @@ docker run --rm --name koharu --gpus all \
 ### Docker Compose
 
 The included [`compose.yaml`](compose.yaml) runs the same image and mounts the
-same persistent cache with the same hardening settings:
+same model and runtime cache with the same hardening settings:
 
 ```sh
 docker compose up -d
@@ -66,18 +66,20 @@ are also available. Do not commit credentials or put them in command-line
 values. Run `docker run --rm ghcr.io/perennialtech/koharu:latest --help` for
 the complete configuration reference.
 
-Send a page as the raw request body:
+## HTTP API
 
-```sh
-curl --fail --data-binary @page.webp \
-  'http://127.0.0.1:8080/translate?target_language=en' \
-  --output page.en.png
-```
+Open [Swagger UI](http://127.0.0.1:8080/docs/) to try the API, or use the
+[OpenAPI JSON](http://127.0.0.1:8080/openapi.json) to build a client.
 
-`POST /translate` returns `image/png`. The `target_language` query parameter
-defaults to English; the optional `instructions` parameter accepts URL-encoded
-translation guidance. Identical requests are served from a disk cache in the
-same volume. The service processes requests one at a time.
+Submit a page as multipart form data to `POST /translations`. The response
+includes a job ID and a `Location` header. Poll that URL or subscribe to its
+`/events` endpoint for live progress. When the job completes, download the PNG
+from the `result_url` in the response. Use the job's `/cancel` endpoint to
+request cancellation.
+
+Koharu runs one job at a time. Jobs continue after clients disconnect. Jobs
+and their results live in memory and expire after an hour in a terminal
+state or immediately on server restart. Each submission runs independently.
 
 ## Bare-metal build
 
@@ -91,14 +93,14 @@ LIBCLANG_PATH=/usr/lib/llvm-18/lib cargo build --locked -p koharu-server
 ```
 
 On other systems, set `LIBCLANG_PATH` to the directory containing the
-installed `libclang` library as needed. The same `/translate` endpoint is
-available without a container.
+installed `libclang` library as needed. The same HTTP API is available
+without a container.
 
 ## Configuration and privacy
 
 Run `koharu-server --help` (or `./target/debug/koharu-server --help`) for the
 supported flags, defaults and environment-variable fallbacks. You can choose
-the translator, model, inpainting model, listener address, cache directory and
+the translator, model, inpainting model, listener address, and
 OpenAI-compatible base URL there.
 
 Local Gemma translation is the default and does not send images or text to a

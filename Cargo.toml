@@ -37,7 +37,6 @@ koharu-pipeline = { path = "crates/koharu-pipeline" }
 
 # external dependencies
 axum = "0.8.8"
-sha2 = "0.11.0"
 arc-swap = "1.9.2"
 image = "0.25.10"
 webp = { version = "0.3.1" }
