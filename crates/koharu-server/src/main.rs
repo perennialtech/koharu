@@ -239,10 +239,12 @@ fn main() -> Result<()> {
         // SAFETY: no other thread exists yet.
         unsafe { std::env::set_var("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True") };
     }
-    tokio::runtime::Builder::new_multi_thread()
+    let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
-        .build()?
-        .block_on(serve())
+        .build()?;
+    let result = runtime.block_on(serve());
+    runtime.shutdown_background();
+    result
 }
 
 async fn serve() -> Result<()> {
@@ -253,34 +255,44 @@ async fn serve() -> Result<()> {
         .init();
     let arguments = Arguments::parse();
     let (pipeline_config, provider_config) = arguments.configs()?;
-    let mut features = vec![koharu_ml::Feature::Torch, koharu_ml::Feature::Llama];
-    if matches!(&pipeline_config.inpainting, InpaintingModel::Flux2Klein(_)) {
-        features.push(koharu_ml::Feature::Diffusion);
-    }
     let mut shutdown = Box::pin(shutdown_signal()?);
-    tokio::select! {
+    let handle = tokio::runtime::Handle::current();
+    let mut startup = tokio::task::spawn_blocking(move || {
+        handle.block_on(async move {
+            let mut features = vec![koharu_ml::Feature::Torch, koharu_ml::Feature::Llama];
+            if matches!(&pipeline_config.inpainting, InpaintingModel::Flux2Klein(_)) {
+                features.push(koharu_ml::Feature::Diffusion);
+            }
+            koharu_ml::init(&features)
+                .await
+                .context("cannot initialize model runtimes")?;
+            let pipeline = Pipeline::from_config(
+                Config::memory(pipeline_config),
+                Config::memory(provider_config),
+                koharu_ml::device(false),
+            )?;
+            let worker = Worker {
+                pipeline,
+                renderer: Renderer::new()?,
+                rasterizer: Arc::new(Rasterizer::new()?),
+            };
+            let (jobs, queue) = Jobs::new();
+            tokio::spawn(worker.run(queue));
+            let shutdown_jobs = jobs.clone();
+            let app = api::router(jobs);
+            let listener = tokio::net::TcpListener::bind(arguments.listen).await?;
+            tracing::info!(address = %listener.local_addr()?, "Koharu HTTP server listening");
+            Ok::<_, anyhow::Error>((listener, app, shutdown_jobs))
+        })
+    });
+    let (listener, app, shutdown_jobs) = tokio::select! {
         biased;
-        _ = &mut shutdown => return Ok(()),
-        initialized = koharu_ml::init(&features) => {
-            initialized.context("cannot initialize model runtimes")?;
-        }
-    }
-    let pipeline = Pipeline::from_config(
-        Config::memory(pipeline_config),
-        Config::memory(provider_config),
-        koharu_ml::device(false),
-    )?;
-    let worker = Worker {
-        pipeline,
-        renderer: Renderer::new()?,
-        rasterizer: Arc::new(Rasterizer::new()?),
+        _ = &mut shutdown => {
+            startup.abort();
+            return Ok(());
+        },
+        started = &mut startup => started.context("server startup task failed")??,
     };
-    let (jobs, queue) = Jobs::new();
-    tokio::spawn(worker.run(queue));
-    let shutdown_jobs = jobs.clone();
-    let app = api::router(jobs);
-    let listener = tokio::net::TcpListener::bind(arguments.listen).await?;
-    tracing::info!(address = %listener.local_addr()?, "Koharu HTTP server listening");
     axum::serve(listener, app)
         .with_graceful_shutdown(async move {
             shutdown.await;
