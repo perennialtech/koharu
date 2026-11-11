@@ -28,6 +28,10 @@ pub struct ComicTextBubbleDetector {
 }
 
 impl ComicTextBubbleDetector {
+    /// Bubble recall on the hard-page set is flat between 0.2 and 0.6; 0.5
+    /// keeps the fewest false positives at that recall.
+    pub const RECOMMENDED_BUBBLE_THRESHOLD: f32 = 0.5;
+
     pub async fn load(device: crate::Device) -> Result<Self> {
         let device: Device = device.try_into_device()?;
         let weights_path = WEIGHTS
