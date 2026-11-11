@@ -3,7 +3,7 @@
 mod api;
 mod jobs;
 
-use std::{collections::BTreeMap, io, net::SocketAddr, sync::Arc};
+use std::{collections::BTreeMap, future::Future, io, net::SocketAddr, sync::Arc, time::Duration};
 
 use anyhow::{Context, Result, bail, ensure};
 use axum::body::Bytes;
@@ -239,10 +239,12 @@ fn main() -> Result<()> {
         // SAFETY: no other thread exists yet.
         unsafe { std::env::set_var("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True") };
     }
-    tokio::runtime::Builder::new_multi_thread()
+    let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
-        .build()?
-        .block_on(serve())
+        .build()?;
+    let result = runtime.block_on(serve());
+    runtime.shutdown_background();
+    result
 }
 
 async fn serve() -> Result<()> {
@@ -253,35 +255,154 @@ async fn serve() -> Result<()> {
         .init();
     let arguments = Arguments::parse();
     let (pipeline_config, provider_config) = arguments.configs()?;
-    let mut features = vec![koharu_ml::Feature::Torch, koharu_ml::Feature::Llama];
-    if matches!(&pipeline_config.inpainting, InpaintingModel::Flux2Klein(_)) {
-        features.push(koharu_ml::Feature::Diffusion);
-    }
-    koharu_ml::init(&features)
-        .await
-        .context("cannot initialize model runtimes")?;
-    let pipeline = Pipeline::from_config(
-        Config::memory(pipeline_config),
-        Config::memory(provider_config),
-        koharu_ml::device(false),
-    )?;
-    let worker = Worker {
-        pipeline,
-        renderer: Renderer::new()?,
-        rasterizer: Arc::new(Rasterizer::new()?),
+    let mut shutdown = Box::pin(shutdown_signal()?);
+    let handle = tokio::runtime::Handle::current();
+    let mut startup = tokio::task::spawn_blocking(move || {
+        handle.block_on(async move {
+            let mut features = vec![koharu_ml::Feature::Torch, koharu_ml::Feature::Llama];
+            if matches!(&pipeline_config.inpainting, InpaintingModel::Flux2Klein(_)) {
+                features.push(koharu_ml::Feature::Diffusion);
+            }
+            koharu_ml::init(&features)
+                .await
+                .context("cannot initialize model runtimes")?;
+            let pipeline = Pipeline::from_config(
+                Config::memory(pipeline_config),
+                Config::memory(provider_config),
+                koharu_ml::device(false),
+            )?;
+            let worker = Worker {
+                pipeline,
+                renderer: Renderer::new()?,
+                rasterizer: Arc::new(Rasterizer::new()?),
+            };
+            let (jobs, queue) = Jobs::new();
+            tokio::spawn(worker.run(queue));
+            let shutdown_jobs = jobs.clone();
+            let app = api::router(jobs);
+            let listener = tokio::net::TcpListener::bind(arguments.listen).await?;
+            tracing::info!(address = %listener.local_addr()?, "Koharu HTTP server listening");
+            Ok::<_, anyhow::Error>((listener, app, shutdown_jobs))
+        })
+    });
+    let (listener, app, shutdown_jobs) = tokio::select! {
+        biased;
+        _ = &mut shutdown => {
+            startup.abort();
+            return Ok(());
+        },
+        started = &mut startup => started.context("server startup task failed")??,
     };
-    let (jobs, queue) = Jobs::new();
-    tokio::spawn(worker.run(queue));
-    let app = api::router(jobs);
-    let listener = tokio::net::TcpListener::bind(arguments.listen).await?;
-    tracing::info!(address = %listener.local_addr()?, "Koharu HTTP server listening");
-    axum::serve(listener, app).await?;
+    // Docker waits 10 seconds before SIGKILL by default.
+    serve_http(
+        listener,
+        app,
+        shutdown_jobs,
+        shutdown,
+        Duration::from_secs(8),
+    )
+    .await
+}
+
+async fn serve_http(
+    listener: tokio::net::TcpListener,
+    app: axum::Router,
+    shutdown_jobs: Jobs,
+    shutdown: impl Future<Output = ()> + Send + 'static,
+    grace: Duration,
+) -> Result<()> {
+    let (draining, drained) = tokio::sync::oneshot::channel();
+    let server = async move {
+        axum::serve(listener, app)
+            .with_graceful_shutdown(async move {
+                shutdown.await;
+                shutdown_jobs.shutdown();
+                let _ = draining.send(());
+            })
+            .await
+    };
+    tokio::pin!(server);
+    tokio::select! {
+        result = &mut server => result?,
+        _ = drained => match tokio::time::timeout(grace, &mut server).await {
+            Ok(result) => result?,
+            Err(_) => tracing::warn!("HTTP connections did not drain before shutdown deadline"),
+        },
+    }
     Ok(())
+}
+
+#[cfg(unix)]
+fn shutdown_signal() -> Result<impl Future<Output = ()>> {
+    let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
+        .context("failed to register SIGINT handler")?;
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .context("failed to register SIGTERM handler")?;
+    Ok(async move {
+        tokio::select! {
+            _ = sigint.recv() => {}
+            _ = sigterm.recv() => {}
+        }
+    })
+}
+
+#[cfg(not(unix))]
+fn shutdown_signal() -> Result<impl Future<Output = ()>> {
+    Ok(async {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("failed to register SIGINT handler");
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn shutdown_finishes_with_an_incomplete_multipart_upload() {
+        use tokio::io::AsyncWriteExt;
+
+        let (jobs, _queue) = Jobs::new();
+        let (started_tx, mut started_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+        let app = api::router(jobs.clone()).layer(axum::middleware::from_fn(
+            move |request: axum::extract::Request, next: axum::middleware::Next| {
+                let started_tx = started_tx.clone();
+                async move {
+                    let _ = started_tx.send(());
+                    next.run(request).await
+                }
+            },
+        ));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+        let server = tokio::spawn(serve_http(
+            listener,
+            app,
+            jobs,
+            async move {
+                let _ = stop_rx.await;
+            },
+            Duration::from_millis(100),
+        ));
+
+        let mut client = tokio::net::TcpStream::connect(address).await.unwrap();
+        client
+            .write_all(b"POST /translations HTTP/1.1\r\nHost: localhost\r\nContent-Type: multipart/form-data; boundary=page\r\nContent-Length: 4096\r\n\r\n--page\r\nContent-Disposition: form-data; name=\"image\"; filename=\"page.png\"\r\n\r\n")
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), started_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        stop_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), server)
+            .await
+            .expect("server did not finish draining the stalled upload")
+            .unwrap()
+            .unwrap();
+    }
 
     #[test]
     fn cli_keeps_local_only_and_selected_inpainters() {
@@ -315,5 +436,37 @@ mod tests {
             Arguments::try_parse_from(["koharu-server", "--provider", "openai-compatible"])
                 .unwrap();
         assert!(arguments.configs().is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn signal_handlers_are_installed_before_polling() {
+        const CHILD: &str = "KOHARU_EARLY_SIGNAL_TEST_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            let _shutdown = shutdown_signal();
+            assert!(
+                std::process::Command::new("kill")
+                    .arg("-TERM")
+                    .arg(std::process::id().to_string())
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+            return;
+        }
+
+        let result = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tests::signal_handlers_are_installed_before_polling",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "signal helper failed: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
     }
 }

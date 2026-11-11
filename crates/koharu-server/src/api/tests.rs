@@ -161,6 +161,51 @@ async fn progress_and_result_are_available_across_connections() {
 }
 
 #[tokio::test]
+async fn shutdown_cancels_jobs_and_closes_active_events() {
+    let (jobs, mut queue) = Jobs::new();
+    let app = router(jobs.clone());
+    let png = png();
+    let running = submit_page(&app, &png).await;
+    let queued = submit_page(&app, &png).await;
+
+    let mut events = request(&app, Method::GET, &format!("{running}/events"))
+        .await
+        .into_body()
+        .into_data_stream();
+    assert!(
+        events
+            .next()
+            .await
+            .unwrap()
+            .unwrap()
+            .starts_with(b"event: snapshot\n")
+    );
+
+    let first = queue.recv().await.unwrap();
+    assert!(first.start().is_some());
+    let second = queue.recv().await.unwrap();
+    jobs.shutdown();
+
+    assert!(first.stop_token().stopped());
+    assert_eq!(first.snapshot().status, crate::jobs::Status::Cancelling);
+    assert_eq!(second.snapshot().status, crate::jobs::Status::Cancelled);
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_secs(1), events.next())
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        upload(&app, &png).await.status(),
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+    assert_eq!(
+        json(request(&app, Method::GET, &queued).await).await["status"],
+        "cancelled"
+    );
+}
+
+#[tokio::test]
 async fn cancels_queued_and_running_jobs_independently() {
     let (jobs, mut queue) = Jobs::new();
     let app = router(jobs);
