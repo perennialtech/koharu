@@ -118,9 +118,72 @@ impl StageProcessor for Processor {
 enum Model {
     LaMa(Arc<Mutex<LaMa>>),
     Flux {
+        lama: Arc<Mutex<LaMa>>,
         model: Arc<Mutex<Flux2KleinInpaint>>,
         config: Flux2KleinConfig,
     },
+}
+
+// FLUX.2 refines a LaMa fill instead of generating the masked region from
+// noise. From full noise it often paints blobs into white balloons and needs
+// all four steps. Starting partway down the schedule from the LaMa fill takes
+// fewer steps and repairs LaMa's smears. The reference image keeps the
+// original crop so the model still sees what it is removing.
+//
+// Cheaper variants measured on the hard-page set and rejected for quality:
+// one step leaves smears and drops detail; a half-scale reference saves a
+// quarter of the time but leaves text remnants and invents details; no
+// reference, or text conditioning without its 512-token padding, paints
+// unrelated photos into balloons.
+//
+// LaMa's fill stays plausible near known pixels and turns to blur deeper
+// inside large masks, such as big free text over artwork. On the hard-page set
+// every balloon and small-text tile reaches at most 63 px from known pixels and
+// refines cleanly in two steps, while the large free-text tiles reach 105 px
+// or more and need a third step to redraw detail.
+const FLUX_DEEP_MASK: u8 = 80;
+
+// A uniform LaMa fill, such as a plain balloon the flat fill missed, is
+// already exact. Fills with any visible variation still go to FLUX.2, which
+// removes the faint remnants LaMa leaves.
+const UNIFORM_FILL_MAX_DEVIATION: f64 = 2.0;
+
+fn is_uniform_fill(filled: &RgbImage, mask: &GrayImage) -> bool {
+    let mut channels = [Vec::new(), Vec::new(), Vec::new()];
+    for (pixel, mask) in filled.pixels().zip(mask.pixels()) {
+        if mask[0] >= 127 {
+            for channel in 0..3 {
+                channels[channel].push(pixel[channel]);
+            }
+        }
+    }
+    !channels[0].is_empty()
+        && channels.iter().all(|values| {
+            let mean =
+                values.iter().map(|&value| f64::from(value)).sum::<f64>() / values.len() as f64;
+            standard_deviation(values, mean) < UNIFORM_FILL_MAX_DEVIATION
+        })
+}
+
+fn flux_refine_options(mask: &GrayImage) -> Flux2KleinInpaintOptions {
+    let known = GrayImage::from_fn(mask.width(), mask.height(), |x, y| {
+        Luma([u8::from(mask.get_pixel(x, y)[0] < 127) * u8::MAX])
+    });
+    let depth = imageproc::distance_transform::distance_transform(
+        &known,
+        imageproc::distance_transform::Norm::L1,
+    );
+    let deep = depth
+        .as_raw()
+        .iter()
+        .any(|&distance| distance > FLUX_DEEP_MASK);
+    Flux2KleinInpaintOptions {
+        padding_mask_crop: None,
+        // Four-step schedule: 0.5 runs its last two steps, 0.75 its last three.
+        strength: if deep { 0.75 } else { 0.5 },
+        num_inference_steps: 4,
+        seed: 42,
+    }
 }
 
 impl Model {
@@ -129,10 +192,15 @@ impl Model {
             InpaintingModel::LaMa {} => {
                 Ok(Self::LaMa(Arc::new(Mutex::new(LaMa::load(device).await?))))
             }
-            InpaintingModel::Flux2Klein(config) => Ok(Self::Flux {
-                model: Arc::new(Mutex::new(Flux2KleinInpaint::load(device).await?)),
-                config: config.clone(),
-            }),
+            InpaintingModel::Flux2Klein(config) => {
+                let (lama, model) =
+                    tokio::try_join!(LaMa::load(device.clone()), Flux2KleinInpaint::load(device))?;
+                Ok(Self::Flux {
+                    lama: Arc::new(Mutex::new(lama)),
+                    model: Arc::new(Mutex::new(model)),
+                    config: config.clone(),
+                })
+            }
         }
     }
 
@@ -159,6 +227,7 @@ impl Model {
                             &prepared.mask,
                             &prepared.text_mask,
                             &prepared.flat_fill_regions,
+                            LAMA_TILE_CONTEXT,
                             |image, mask| {
                                 Ok(DynamicImage::ImageRgb8(model.inference(
                                     image,
@@ -171,12 +240,20 @@ impl Model {
                     .await?,
                 )
             }
-            Self::Flux { model, config } => {
+            Self::Flux {
+                lama,
+                model,
+                config,
+            } => {
+                let lama = lama.clone();
                 let model = model.clone();
                 let config = config.clone();
                 (
                     "flux2-klein",
                     tokio_rayon::spawn(move || -> Result<DynamicImage> {
+                        let lama = lama
+                            .lock()
+                            .map_err(|_| anyhow!("LaMa model lock is poisoned"))?;
                         let model = model
                             .lock()
                             .map_err(|_| anyhow!("FLUX model lock is poisoned"))?;
@@ -185,13 +262,20 @@ impl Model {
                             &prepared.mask,
                             &prepared.text_mask,
                             &prepared.flat_fill_regions,
+                            FLUX_TILE_CONTEXT,
                             |image, mask| {
+                                let filled =
+                                    lama.inference(image, mask, &InpaintRequest::default())?;
+                                if is_uniform_fill(&filled, mask) {
+                                    return Ok(DynamicImage::ImageRgb8(filled));
+                                }
+                                let filled = DynamicImage::ImageRgb8(filled);
                                 model.inference(
                                     &config.prompt,
-                                    image,
-                                    None,
+                                    &filled,
+                                    Some(image),
                                     &DynamicImage::ImageLuma8(mask.clone()),
-                                    &Flux2KleinInpaintOptions::default(),
+                                    &flux_refine_options(mask),
                                 )
                             },
                         )
@@ -430,7 +514,13 @@ async fn prepare(input: &StageInput) -> Result<InpaintInput> {
 }
 
 const TILE_SIZE: u32 = 512;
-const TILE_CONTEXT: u32 = 128;
+// Known pixels kept around each model crop. LaMa uses wide context to continue
+// texture into the mask. FLUX.2's time grows with crop area, and with less
+// context its refinement stays closer to the LaMa fill. At 128 px it sometimes
+// painted unrelated objects into large free-text masks, and at 64 px it left
+// LaMa's smears in place.
+const LAMA_TILE_CONTEXT: u32 = 128;
+const FLUX_TILE_CONTEXT: u32 = 96;
 const UNIFORM_BACKGROUND_MIN_PIXELS: usize = 16;
 const FLAT_FILL_EDGE_MARGIN: f32 = 3.0;
 
@@ -458,6 +548,7 @@ fn inpaint_tiled(
     mask: &GrayImage,
     text_mask: &GrayImage,
     flat_fill_regions: &[FlatFillRegion],
+    context: u32,
     mut inference: impl FnMut(&DynamicImage, &GrayImage) -> Result<DynamicImage>,
 ) -> Result<DynamicImage> {
     ensure!(
@@ -471,7 +562,7 @@ fn inpaint_tiled(
     let mut output = image.to_rgb8();
     let mut pending_mask = mask.clone();
     fill_uniform_regions(&mut output, &mut pending_mask, text_mask, flat_fill_regions);
-    let (component_labels, tiles) = inpaint_tiles(&pending_mask);
+    let (component_labels, tiles) = inpaint_tiles(&pending_mask, context);
     for tile in &tiles {
         let [left, top, right, bottom] = tile.crop;
         let crop_width = right - left;
@@ -531,7 +622,10 @@ fn fill_uniform_regions(
     }
 }
 
-fn inpaint_tiles(mask: &GrayImage) -> (ImageBuffer<Luma<u32>, Vec<u32>>, Vec<InpaintTile>) {
+fn inpaint_tiles(
+    mask: &GrayImage,
+    context: u32,
+) -> (ImageBuffer<Luma<u32>, Vec<u32>>, Vec<InpaintTile>) {
     let (labels, components) = mask_components(mask);
     let mut bounded_tiles: Vec<InpaintTile> = Vec::new();
     let mut split_tiles = Vec::new();
@@ -552,12 +646,12 @@ fn inpaint_tiles(mask: &GrayImage) -> (ImageBuffer<Luma<u32>, Vec<u32>>, Vec<Inp
                 let tile = &mut bounded_tiles[index];
                 tile.components.push(component.label);
                 tile.core = bounds;
-                tile.crop = expand_bounds(bounds, mask.width(), mask.height());
+                tile.crop = expand_bounds(bounds, context, mask.width(), mask.height());
             } else {
                 bounded_tiles.push(InpaintTile {
                     components: vec![component.label],
                     core: component.bounds,
-                    crop: expand_bounds(component.bounds, mask.width(), mask.height()),
+                    crop: expand_bounds(component.bounds, context, mask.width(), mask.height()),
                 });
             }
             continue;
@@ -574,7 +668,7 @@ fn inpaint_tiles(mask: &GrayImage) -> (ImageBuffer<Luma<u32>, Vec<u32>>, Vec<Inp
                     split_tiles.push(InpaintTile {
                         components: vec![component.label],
                         core,
-                        crop: expand_bounds(owned_bounds, mask.width(), mask.height()),
+                        crop: expand_bounds(owned_bounds, context, mask.width(), mask.height()),
                     });
                 }
                 core_left = core_right;
@@ -638,12 +732,17 @@ fn bounds_area([left, top, right, bottom]: [u32; 4]) -> u64 {
     u64::from(right - left) * u64::from(bottom - top)
 }
 
-fn expand_bounds([left, top, right, bottom]: [u32; 4], width: u32, height: u32) -> [u32; 4] {
+fn expand_bounds(
+    [left, top, right, bottom]: [u32; 4],
+    context: u32,
+    width: u32,
+    height: u32,
+) -> [u32; 4] {
     [
-        left.saturating_sub(TILE_CONTEXT),
-        top.saturating_sub(TILE_CONTEXT),
-        right.saturating_add(TILE_CONTEXT).min(width),
-        bottom.saturating_add(TILE_CONTEXT).min(height),
+        left.saturating_sub(context),
+        top.saturating_sub(context),
+        right.saturating_add(context).min(width),
+        bottom.saturating_add(context).min(height),
     ]
 }
 
@@ -858,6 +957,34 @@ fn composite_generated(
 mod tests {
     use super::*;
 
+    #[test]
+    fn flux_refines_deep_masks_for_an_extra_step() {
+        let stroke = GrayImage::from_fn(400, 400, |x, _| {
+            Luma([u8::from((190..210).contains(&x)) * 255])
+        });
+        assert_eq!(flux_refine_options(&stroke).strength, 0.5);
+        let block = GrayImage::from_fn(400, 400, |x, y| {
+            Luma([u8::from((20..380).contains(&x) && (20..380).contains(&y)) * 255])
+        });
+        assert_eq!(flux_refine_options(&block).strength, 0.75);
+    }
+
+    #[test]
+    fn only_uniform_masked_fills_skip_flux() {
+        let mask = GrayImage::from_fn(64, 64, |x, _| Luma([u8::from(x < 32) * 255]));
+        let flat = RgbImage::from_fn(64, 64, |x, _| {
+            if x < 32 {
+                Rgb([250, 250, 250])
+            } else {
+                Rgb([0, 0, 0])
+            }
+        });
+        assert!(is_uniform_fill(&flat, &mask));
+        let gradient = RgbImage::from_fn(64, 64, |x, _| Rgb([100 + x as u8, 200, 200]));
+        assert!(!is_uniform_fill(&gradient, &mask));
+        assert!(!is_uniform_fill(&flat, &GrayImage::new(64, 64)));
+    }
+
     #[tokio::test]
     async fn transient_inpainting_mask_replaces_persistent_page_masks() {
         let mut session = koharu_scene::Session::memory().await.unwrap();
@@ -1010,6 +1137,7 @@ mod tests {
             &mask,
             &mask,
             &[rectangle_region([0, 0, 96, 96])],
+            LAMA_TILE_CONTEXT,
             |_, _| {
                 calls += 1;
                 Ok(DynamicImage::new_rgb8(1, 1))
@@ -1061,6 +1189,7 @@ mod tests {
                 rectangle_region([10, 10, 90, 90]),
                 rectangle_region([110, 10, 190, 90]),
             ],
+            LAMA_TILE_CONTEXT,
             |_, _| {
                 calls += 1;
                 Ok(DynamicImage::new_rgb8(1, 1))
@@ -1090,6 +1219,7 @@ mod tests {
             &mask,
             &mask,
             &[],
+            LAMA_TILE_CONTEXT,
             |tile, tile_mask| {
                 calls += 1;
                 assert_eq!(
@@ -1121,12 +1251,12 @@ mod tests {
             }
         }
 
-        let (labels, tiles) = inpaint_tiles(&mask);
+        let (labels, tiles) = inpaint_tiles(&mask, LAMA_TILE_CONTEXT);
 
         assert_eq!(tiles.len(), 2);
         for tile in &tiles {
-            assert!(tile.crop[2] - tile.crop[0] <= TILE_SIZE + TILE_CONTEXT * 2);
-            assert!(tile.crop[3] - tile.crop[1] <= TILE_SIZE + TILE_CONTEXT * 2);
+            assert!(tile.crop[2] - tile.crop[0] <= TILE_SIZE + LAMA_TILE_CONTEXT * 2);
+            assert!(tile.crop[3] - tile.crop[1] <= TILE_SIZE + LAMA_TILE_CONTEXT * 2);
             let label = tile.components[0];
             let [left, top, right, bottom] = tile.core;
             let mut owned = 0;
@@ -1166,10 +1296,11 @@ mod tests {
             &mask,
             &mask,
             &[],
+            LAMA_TILE_CONTEXT,
             |tile, _| {
                 calls += 1;
-                assert!(tile.width() <= TILE_CONTEXT * 2 + 1);
-                assert!(tile.height() <= TILE_CONTEXT * 2 + 1);
+                assert!(tile.width() <= LAMA_TILE_CONTEXT * 2 + 1);
+                assert!(tile.height() <= LAMA_TILE_CONTEXT * 2 + 1);
                 Ok(DynamicImage::ImageRgb8(RgbImage::from_pixel(
                     tile.width(),
                     tile.height(),
