@@ -16,7 +16,7 @@ async fn main() -> Result<()> {
     let image = image::open(&image_path)?;
     let mask = image::open(&mask_path)?.to_luma8();
 
-    koharu_ml::init().await?;
+    koharu_ml::init(&[koharu_ml::Feature::Torch]).await?;
     let model = LaMa::load(koharu_ml::Device::default()).await?;
     let config = InpaintRequest::default();
 

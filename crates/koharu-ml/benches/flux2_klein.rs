@@ -14,8 +14,8 @@ async fn main() -> Result<()> {
     let mask = image::open(fixtures.join("mask_4k.png"))?;
     let options = Flux2KleinInpaintOptions::default();
 
-    koharu_ml::init().await?;
-    let model = Flux2KleinInpaint::load(koharu_ml::Device::default()).await?;
+    koharu_ml::init(&[koharu_ml::Feature::Diffusion]).await?;
+    let model = Flux2KleinInpaint::load(koharu_ml::device(false)).await?;
 
     let output = model.inference("Remove the masked content.", &image, None, &mask, &options)?;
     let scale = (1_048_576.0 / (f64::from(image.width()) * f64::from(image.height()))).sqrt();
