@@ -17,9 +17,7 @@ koharu-ml = { workspace = true }
 koharu-runtime = { workspace = true }
 anyhow = { workspace = true }
 base64 = { workspace = true }
-clap = { workspace = true }
 fast_image_resize = { workspace = true }
-futures = { workspace = true }
 image = { workspace = true }
 indoc = { workspace = true }
 reqwest = { workspace = true }

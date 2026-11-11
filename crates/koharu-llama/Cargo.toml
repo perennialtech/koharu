@@ -24,7 +24,6 @@ toktrie = { workspace = true, optional = true }
 
 [features]
 default = []
-sampler = []
 llguidance = ["dep:llguidance", "dep:toktrie"]
 
 [dev-dependencies]
