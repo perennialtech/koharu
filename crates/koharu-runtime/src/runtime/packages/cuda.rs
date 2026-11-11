@@ -7,53 +7,39 @@ use walkdir::WalkDir;
 use crate::{
     Hardware, Store, download,
     runtime::{Package, RuntimePackage, graph::Component, loader, sealed},
-    source::{Platform, extract, wheel},
+    source::{extract, wheel},
 };
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, strum::Display, strum::EnumProperty)]
 pub(crate) enum Cuda {
     #[strum(
         serialize = "runtime-13",
-        props(
-            project = "nvidia-cuda-runtime/13.3.29",
-            windows = "cudart64_13.dll",
-            linux = "libcudart.so.13"
-        )
+        props(project = "nvidia-cuda-runtime/13.3.29", libraries = "libcudart.so.13")
     )]
     Runtime13,
     #[strum(
         serialize = "cublas-13",
         props(
             project = "nvidia-cublas/13.6.0.2",
-            windows = "cublasLt64_13.dll,cublas64_13.dll",
-            linux = "libcublasLt.so.13,libcublas.so.13"
+            libraries = "libcublasLt.so.13,libcublas.so.13"
         )
     )]
     Blas13,
     #[strum(
         serialize = "cufft-12",
-        props(
-            project = "nvidia-cufft/12.3.0.29",
-            windows = "cufft64_12.dll",
-            linux = "libcufft.so.12"
-        )
+        props(project = "nvidia-cufft/12.3.0.29", libraries = "libcufft.so.12")
     )]
     Fft12,
     #[strum(
         serialize = "curand-10",
-        props(
-            project = "nvidia-curand/10.4.3.29",
-            windows = "curand64_10.dll",
-            linux = "libcurand.so.10"
-        )
+        props(project = "nvidia-curand/10.4.3.29", libraries = "libcurand.so.10")
     )]
     Rand10,
     #[strum(
         serialize = "cudnn-9.25",
         props(
             project = "nvidia-cudnn-cu13/9.25.1.1",
-            windows = "cudnn64_9.dll,cudnn_adv64_9.dll,cudnn_cnn64_9.dll,cudnn_engines_precompiled64_9.dll,cudnn_engines_runtime_compiled64_9.dll,cudnn_engines_tensor_ir64_9.dll,cudnn_ext64_9.dll,cudnn_graph64_9.dll,cudnn_heuristic64_9.dll,cudnn_ops64_9.dll",
-            linux = "libcudnn.so.9,libcudnn_adv.so.9,libcudnn_cnn.so.9,libcudnn_engines_precompiled.so.9,libcudnn_engines_runtime_compiled.so.9,libcudnn_engines_tensor_ir.so.9,libcudnn_ext.so.9,libcudnn_graph.so.9,libcudnn_heuristic.so.9,libcudnn_ops.so.9"
+            libraries = "libcudnn.so.9,libcudnn_adv.so.9,libcudnn_cnn.so.9,libcudnn_engines_precompiled.so.9,libcudnn_engines_runtime_compiled.so.9,libcudnn_engines_tensor_ir.so.9,libcudnn_ext.so.9,libcudnn_graph.so.9,libcudnn_heuristic.so.9,libcudnn_ops.so.9"
         )
     )]
     Dnn925,
@@ -61,57 +47,39 @@ pub(crate) enum Cuda {
         serialize = "nvrtc-13",
         props(
             project = "nvidia-cuda-nvrtc/13.3.33",
-            windows = "nvrtc-builtins64_133.dll,nvrtc64_130_0.dll",
-            linux = "libnvrtc-builtins.so.13.3,libnvrtc.so.13"
+            libraries = "libnvrtc-builtins.so.13.3,libnvrtc.so.13"
         )
     )]
     Rtc13,
     #[strum(
         serialize = "nvjitlink-13",
-        props(
-            project = "nvidia-nvjitlink/13.3.33",
-            windows = "nvJitLink_130_0.dll",
-            linux = "libnvJitLink.so.13"
-        )
+        props(project = "nvidia-nvjitlink/13.3.33", libraries = "libnvJitLink.so.13")
     )]
     JitLink13,
     #[strum(
         serialize = "cusparse-12",
-        props(
-            project = "nvidia-cusparse/12.8.2.51",
-            windows = "cusparse64_12.dll",
-            linux = "libcusparse.so.12"
-        )
+        props(project = "nvidia-cusparse/12.8.2.51", libraries = "libcusparse.so.12")
     )]
     Sparse12,
     #[strum(
         serialize = "cusolver-12",
         props(
             project = "nvidia-cusolver/12.2.6.9",
-            windows = "cusolver64_12.dll,cusolverMg64_12.dll",
-            linux = "libcusolver.so.12,libcusolverMg.so.12"
+            libraries = "libcusolver.so.12,libcusolverMg.so.12"
         )
     )]
     Solver12,
 }
 
 impl Cuda {
-    fn libraries(self) -> Result<impl Iterator<Item = &'static str>> {
-        let platform = if cfg!(target_os = "windows") {
-            "windows"
-        } else if cfg!(target_os = "linux") {
-            "linux"
-        } else {
-            anyhow::bail!("CUDA packages do not support this operating system")
-        };
-        Ok(self
-            .get_str(platform)
-            .context("CUDA package has no libraries for this platform")?
-            .split(','))
+    fn libraries(self) -> impl Iterator<Item = &'static str> {
+        self.get_str("libraries")
+            .expect("CUDA package has libraries")
+            .split(',')
     }
 
     fn library_paths(self, root: &Path) -> Result<Vec<PathBuf>> {
-        let names = self.libraries()?.collect::<Vec<_>>();
+        let names = self.libraries().collect::<Vec<_>>();
         let mut paths = vec![None; names.len()];
         for entry in WalkDir::new(root) {
             let entry = entry?;
@@ -143,14 +111,10 @@ impl Package for Cuda {
             target,
             move |path| self.library_paths(path).is_ok(),
             move |stage| async move {
-                let url = wheel(project, Platform::host()?).await?;
+                let url = wheel(project).await?;
                 let archive = tempfile::Builder::new().suffix(".whl").tempfile()?;
                 download::fetch(&url, archive.path()).await?;
-                extract(
-                    archive.path(),
-                    &stage,
-                    &["**/*.dll", "**/*.so", "**/*.so.*"],
-                )
+                extract(archive.path(), &stage, &["**/*.so", "**/*.so.*"])
             },
         )
         .await
