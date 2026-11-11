@@ -10,14 +10,13 @@ use crate::{
     Device, Hardware,
     runtime::{
         DiscoverablePackage, RuntimePackage,
-        packages::{Cuda, Diffusion, Llama, Rocm, Torch},
+        packages::{Cuda, Diffusion, Llama, Torch},
     },
 };
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(crate) enum Component {
     Cuda(Cuda),
-    Rocm(Rocm),
     Torch(Torch),
     Llama(Llama),
     Diffusion(Diffusion),
@@ -27,7 +26,6 @@ impl Component {
     fn dependencies(self, hardware: &Hardware) -> Result<Vec<Self>> {
         match self {
             Self::Cuda(package) => package.dependencies(hardware),
-            Self::Rocm(package) => package.dependencies(hardware),
             Self::Torch(package) => package.dependencies(hardware),
             Self::Llama(package) => package.dependencies(hardware),
             Self::Diffusion(package) => package.dependencies(hardware),
@@ -37,7 +35,6 @@ impl Component {
     async fn activate(self) -> Result<()> {
         match self {
             Self::Cuda(package) => activate(package).await,
-            Self::Rocm(package) => activate(package).await,
             Self::Torch(package) => activate(package).await,
             Self::Llama(package) => activate(package).await,
             Self::Diffusion(package) => activate(package).await,
@@ -47,7 +44,6 @@ impl Component {
     fn label(self) -> String {
         match self {
             Self::Cuda(package) => package.label(),
-            Self::Rocm(package) => package.label(),
             Self::Torch(package) => package.label(),
             Self::Llama(package) => package.label(),
             Self::Diffusion(package) => package.label(),
@@ -65,12 +61,6 @@ async fn activate<P: RuntimePackage>(package: P) -> Result<()> {
 impl From<Cuda> for Component {
     fn from(value: Cuda) -> Self {
         Self::Cuda(value)
-    }
-}
-
-impl From<Rocm> for Component {
-    fn from(value: Rocm) -> Self {
-        Self::Rocm(value)
     }
 }
 
@@ -135,7 +125,7 @@ impl Plan {
         self.graph.update_edge(before, after, ());
     }
 
-    pub(crate) async fn initialize(&self, mut device: Device) -> Result<Device> {
+    pub(crate) async fn initialize(&self, device: Device) -> Result<Device> {
         let order = toposort(&self.graph, None).map_err(|cycle| {
             anyhow!(
                 "runtime dependency cycle contains {}",
@@ -145,10 +135,6 @@ impl Plan {
         for node in order {
             let component = self.graph[node];
             component.activate().await?;
-            if let Component::Rocm(rocm) = component {
-                device.index = rocm.probe().await?;
-                device.name = format!("ROCm{}", device.index);
-            }
         }
         Ok(device)
     }
@@ -169,14 +155,13 @@ mod tests {
                 device_type: crate::DeviceType::Gpu,
                 memory_total: 0,
                 memory_free: 0,
-                compute_capability: 80,
-                target: None,
+                compute_capability: 86,
             }],
             candidates: vec![0],
             selected: Some(0),
         };
         let mut plan = Plan::default();
-        let llama = plan.insert(Llama::WindowsCuda.into(), &hardware).unwrap();
+        let llama = plan.insert(Llama::LinuxCuda.into(), &hardware).unwrap();
         let diffusion = plan.insert(Diffusion::LinuxCuda.into(), &hardware).unwrap();
         plan.sequence(llama, diffusion);
 
@@ -200,6 +185,6 @@ mod tests {
                 .unwrap()
         };
         assert!(position(Cuda::Rtc13.into()) < position(Cuda::Blas13.into()));
-        assert!(position(Cuda::Blas13.into()) < position(Llama::WindowsCuda.into()));
+        assert!(position(Cuda::Blas13.into()) < position(Llama::LinuxCuda.into()));
     }
 }

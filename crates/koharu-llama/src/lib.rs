@@ -14,10 +14,6 @@
 //! - [simple](https://github.com/utilityai/llama-cpp-rs/tree/main/examples/simple)
 //! - [tools](https://github.com/utilityai/llama-cpp-rs/tree/main/examples/tools)
 //!
-//! # Feature Flags
-//!
-//! - `cuda` enables CUDA gpu support.
-//! - `sampler` adds the [`context::sample::sampler`] struct for a more rusty way of sampling.
 use std::ffi::{NulError, c_char};
 use std::fmt::Debug;
 use std::num::NonZeroI32;

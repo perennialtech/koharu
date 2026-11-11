@@ -2696,7 +2696,6 @@ dependencies = [
  "anyhow",
  "arc-swap",
  "async-trait",
- "clap",
  "futures",
  "image",
  "imageproc",
@@ -2717,7 +2716,6 @@ dependencies = [
  "toml",
  "tracing",
  "tracing-subscriber",
- "windows",
 ]
 
 [[package]]
@@ -2785,7 +2783,6 @@ dependencies = [
  "futures",
  "hf-hub",
  "koharu-config",
- "libc",
  "libloading 0.9.0",
  "petgraph",
  "reqwest",
@@ -2876,12 +2873,10 @@ name = "koharu-torch"
 version = "0.83.5"
 dependencies = [
  "half",
- "image",
  "koharu-torch-sys",
  "lazy_static",
  "libc",
  "ndarray",
- "rand 0.10.3",
  "safetensors",
  "thiserror 2.0.21",
  "zip",
@@ -2903,9 +2898,7 @@ version = "0.83.5"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
- "clap",
  "fast_image_resize",
- "futures",
  "image",
  "indoc",
  "koharu-config",

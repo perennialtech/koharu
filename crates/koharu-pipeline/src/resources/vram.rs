@@ -2,17 +2,8 @@ use koharu_ml::{Backend, Device, DeviceType};
 
 use crate::DeviceResources;
 
-#[cfg(target_os = "linux")]
 #[path = "linux.rs"]
-mod linux;
-#[cfg(target_os = "windows")]
-#[path = "windows.rs"]
-mod windows;
-
-#[cfg(target_os = "linux")]
-use linux as platform;
-#[cfg(target_os = "windows")]
-use windows as platform;
+mod platform;
 
 #[allow(unused)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -42,7 +33,6 @@ pub(super) struct SystemMemory {
 
 pub(super) struct Monitor {
     target: Device,
-    #[cfg(any(target_os = "linux", target_os = "windows"))]
     provider: Option<platform::Monitor>,
 }
 
@@ -50,49 +40,25 @@ impl Monitor {
     pub(super) fn new(target: Device) -> Self {
         Self {
             target,
-            #[cfg(any(target_os = "linux", target_os = "windows"))]
             provider: platform::Monitor::new().ok(),
         }
     }
 
     pub(super) fn sample(&mut self, _system: SystemMemory) -> Result<Vec<DeviceResources>, String> {
         let target = &self.target;
-        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
         let _ = (_system.total_bytes, _system.used_bytes);
         if target.device_type == DeviceType::Cpu || target.backend == Backend::Cpu {
             return Ok(Vec::new());
         }
-
-        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-        if target.backend == Backend::Metal {
-            return Ok(map_samples(
-                target,
-                vec![Sample {
-                    id: target.index,
-                    name: target.description.clone(),
-                    vendor: Vendor::Apple,
-                    budget_bytes: _system.total_bytes,
-                    used_bytes: _system.used_bytes,
-                    utilization_percent: None,
-                }],
-            ));
+        if self.provider.is_none() {
+            self.provider = platform::Monitor::new().ok();
         }
-
-        #[cfg(any(target_os = "linux", target_os = "windows"))]
-        {
-            if self.provider.is_none() {
-                self.provider = platform::Monitor::new().ok();
-            }
-            let samples = self
-                .provider
-                .as_mut()
-                .ok_or_else(|| "accelerator memory provider is unavailable".to_owned())?
-                .sample()?;
-            Ok(map_samples(target, samples))
-        }
-
-        #[cfg(not(any(target_os = "linux", target_os = "windows")))]
-        Err("accelerator memory telemetry is unavailable on this platform".to_owned())
+        let samples = self
+            .provider
+            .as_mut()
+            .ok_or_else(|| "accelerator memory provider is unavailable".to_owned())?
+            .sample()?;
+        Ok(map_samples(target, samples))
     }
 }
 
@@ -165,9 +131,6 @@ fn names_match(left: &str, right: &str) -> bool {
 fn vendor_matches_backend(vendor: Vendor, backend: &Backend) -> bool {
     match backend {
         Backend::Cuda => vendor == Vendor::Nvidia,
-        Backend::Rocm => vendor == Vendor::Amd,
-        Backend::Metal => vendor == Vendor::Apple,
-        Backend::Vulkan | Backend::Other(_) => true,
         Backend::Cpu => false,
     }
 }
@@ -205,7 +168,7 @@ mod tests {
 
     #[test]
     fn unknown_metrics_remain_unknown() {
-        let devices = unavailable(&Device::vulkan(0));
+        let devices = unavailable(&Device::cuda(0));
         assert!(devices[0].selected);
         assert_eq!(devices[0].memory_budget_bytes, None);
     }

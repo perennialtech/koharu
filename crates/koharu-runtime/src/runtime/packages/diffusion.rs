@@ -50,8 +50,12 @@ impl Package for Diffusion {
 
 impl DiscoverablePackage for Diffusion {
     fn discover(hardware: &Hardware) -> Option<Self> {
-        (cfg!(all(target_os = "linux", target_arch = "x86_64")) && hardware.supports_cuda())
-            .then_some(Self::LinuxCuda)
+        // The packaged binary contains SM86 native kernels and no PTX fallback.
+        // CUDA 8.x devices with capability 8.6 or newer can run those kernels.
+        hardware.device().and_then(|device| {
+            (hardware.supports_cuda() && (86..90).contains(&device.compute_capability()))
+                .then_some(Self::LinuxCuda)
+        })
     }
 }
 
@@ -68,5 +72,34 @@ impl RuntimePackage for Diffusion {
     async fn activate(self) -> Result<()> {
         let root = self.install().await?;
         loader::load(root.join(LIBRARY), false)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn supports_only_cuda_devices_compatible_with_the_sm86_package() {
+        for (capability, supported) in [
+            (75, false),
+            (80, false),
+            (86, true),
+            (89, true),
+            (90, false),
+        ] {
+            let mut device = crate::Device::cuda(0);
+            device.compute_capability = capability;
+            let hardware = Hardware {
+                devices: vec![device],
+                candidates: vec![0],
+                selected: Some(0),
+            };
+            assert_eq!(
+                Diffusion::discover(&hardware).is_some(),
+                supported,
+                "SM{capability}"
+            );
+        }
     }
 }

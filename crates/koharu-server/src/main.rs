@@ -369,7 +369,11 @@ async fn serve() -> Result<()> {
                 arguments.cache_dir.display()
             )
         })?;
-    koharu_ml::init()
+    let mut features = vec![koharu_ml::Feature::Torch, koharu_ml::Feature::Llama];
+    if matches!(&pipeline_config.inpainting, InpaintingModel::Flux2Klein(_)) {
+        features.push(koharu_ml::Feature::Diffusion);
+    }
+    koharu_ml::init(&features)
         .await
         .context("cannot initialize model runtimes")?;
     let pipeline = Pipeline::from_config(

@@ -8,8 +8,8 @@ use std::{
 };
 
 use crate::{
-    Audio, CancelMode, ContextParams, Error, ImageGenerationParams, Result, RgbImage, SampleMethod,
-    Scheduler, Video, VideoGenerationParams, ffi::NativeCall, image::copy_rgb_from_raw, sys,
+    CancelMode, ContextParams, Error, ImageGenerationParams, Result, RgbImage, SampleMethod,
+    Scheduler, ffi::NativeCall, image::copy_rgb_from_raw, sys,
 };
 
 struct ContextInner {
@@ -66,12 +66,6 @@ impl Context {
         unsafe { sys::sd_ctx_supports_image_generation(self.inner.pointer.as_ptr()) }
     }
 
-    #[must_use]
-    pub fn supports_video_generation(&self) -> bool {
-        let _call = NativeCall::enter();
-        unsafe { sys::sd_ctx_supports_video_generation(self.inner.pointer.as_ptr()) }
-    }
-
     /// Returns the native model-specific default sampling method.
     pub fn default_sample_method(&self) -> Result<SampleMethod> {
         let _call = NativeCall::enter();
@@ -104,24 +98,6 @@ impl Context {
             return Err(Error::ImageGenerationFailed);
         }
         output.copy("image")
-    }
-
-    /// Generates owned video frames and optional audio.
-    pub fn generate_video(&mut self, params: &VideoGenerationParams) -> Result<Video> {
-        let native = params.to_native()?;
-        let _call = NativeCall::enter();
-        let mut output = RawVideoResult::default();
-        let succeeded = unsafe {
-            sys::generate_video(
-                self.inner.pointer.as_ptr(),
-                &raw const native.raw,
-                &raw mut output.pointer,
-            )
-        };
-        if !succeeded {
-            return Err(Error::VideoGenerationFailed);
-        }
-        output.copy()
     }
 
     /// Creates a thread-safe handle that can cancel generation from another thread.
@@ -193,56 +169,6 @@ impl Drop for RawImageResult {
     fn drop(&mut self) {
         if !self.pointer.is_null() {
             unsafe { sys::free_sd_image_generation_result(self.pointer) };
-        }
-    }
-}
-
-#[derive(Debug)]
-struct RawVideoResult {
-    pointer: *mut sys::sd_video_generation_result_t,
-}
-
-impl Default for RawVideoResult {
-    fn default() -> Self {
-        Self {
-            pointer: ptr::null_mut(),
-        }
-    }
-}
-
-impl RawVideoResult {
-    fn copy(&self) -> Result<Video> {
-        let result =
-            NonNull::new(self.pointer).ok_or(Error::InvalidNativeOutput { kind: "video" })?;
-        let result = unsafe { result.as_ref() };
-        let kind = "video frame";
-        let count =
-            usize::try_from(result.frame_count).map_err(|_| Error::InvalidNativeOutput { kind })?;
-        if count == 0 || result.frames.is_null() {
-            return Err(Error::InvalidNativeOutput { kind });
-        }
-        let frames = unsafe { slice::from_raw_parts(result.frames, count) }
-            .iter()
-            .map(|raw| unsafe { copy_rgb_from_raw(raw) })
-            .collect::<Result<Vec<_>>>()?;
-        let audio = match NonNull::new(result.audio) {
-            Some(audio) => Some(unsafe { Audio::copy_from_raw(audio.as_ref()) }?),
-            None => None,
-        };
-        let fps = u32::try_from(result.fps)
-            .ok()
-            .filter(|fps| *fps > 0)
-            .ok_or(Error::InvalidNativeOutput {
-                kind: "video frame rate",
-            })?;
-        Ok(Video { frames, audio, fps })
-    }
-}
-
-impl Drop for RawVideoResult {
-    fn drop(&mut self) {
-        if !self.pointer.is_null() {
-            unsafe { sys::free_sd_video_generation_result(self.pointer) };
         }
     }
 }

@@ -1,5 +1,5 @@
 //! Basic module traits defining the forward pass.
-use crate::{data::Iter2, Device, Tensor};
+use crate::Tensor;
 
 /// The simplest module trait, defining a forward function.
 pub trait Module: std::fmt::Debug + Send {
@@ -12,27 +12,6 @@ pub trait Module: std::fmt::Debug + Send {
 /// and evaluation, e.g. when using dropout or batch-normalization.
 pub trait ModuleT: std::fmt::Debug + Send {
     fn forward_t(&self, xs: &Tensor, train: bool) -> Tensor;
-
-    fn batch_accuracy_for_logits(
-        &self,
-        xs: &Tensor,
-        ys: &Tensor,
-        d: Device,
-        batch_size: i64,
-    ) -> f64 {
-        let _no_grad = crate::no_grad_guard();
-        let mut sum_accuracy = 0f64;
-        let mut sample_count = 0f64;
-        for (xs, ys) in Iter2::new(xs, ys, batch_size).return_smaller_last_batch() {
-            let acc = self
-                .forward_t(&xs.to_device(d), false)
-                .accuracy_for_logits(&ys.to_device(d));
-            let size = xs.size()[0] as f64;
-            sum_accuracy += f64::try_from(&acc).unwrap() * size;
-            sample_count += size;
-        }
-        sum_accuracy / sample_count
-    }
 }
 
 impl<T> ModuleT for T

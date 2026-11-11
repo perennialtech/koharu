@@ -99,7 +99,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "downloads the checkpoint and requires CUDA"]
     async fn checkpoint_matches_rfdetr_upstream_structured_output() -> Result<()> {
-        crate::init().await?;
+        crate::init(&[crate::Feature::Torch]).await?;
         let image = image::open(
             PathBuf::from(env!("CARGO_MANIFEST_DIR"))
                 .join("benches/fixtures/object_detection/1.jpg"),

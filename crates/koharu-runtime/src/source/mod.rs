@@ -5,4 +5,4 @@ mod pypi;
 pub use hugging_face::HuggingFaceFile;
 
 pub(crate) use archive::extract;
-pub(crate) use pypi::{Platform, wheel};
+pub(crate) use pypi::wheel;

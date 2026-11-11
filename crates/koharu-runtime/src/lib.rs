@@ -1,3 +1,6 @@
+#[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+compile_error!("koharu-runtime requires Linux x86_64 with CUDA");
+
 mod device;
 mod hardware;
 mod network;

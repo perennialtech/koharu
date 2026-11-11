@@ -49,7 +49,7 @@ async fn main() -> Result<()> {
     let mask = cli.mask.as_ref().map(image::open).transpose()?;
     let reference = cli.reference.as_ref().map(image::open).transpose()?;
 
-    koharu_ml::init().await?;
+    koharu_ml::init(&[koharu_ml::Feature::Diffusion]).await?;
 
     let output = if let Some(mask) = mask.as_ref() {
         let input = input
