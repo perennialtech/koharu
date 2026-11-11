@@ -91,26 +91,12 @@ pub(crate) fn cstring(value: &str, field: &'static str) -> Result<CString> {
     CString::new(value).map_err(|source| Error::InteriorNul { field, source })
 }
 
-pub(crate) fn optional_cstring(
-    value: Option<&str>,
-    field: &'static str,
-) -> Result<Option<CString>> {
-    value.map(|value| cstring(value, field)).transpose()
-}
-
 pub(crate) fn path_cstring(path: &Path, field: &'static str) -> Result<CString> {
     let value = path.to_str().ok_or_else(|| Error::NonUnicodePath {
         field,
         path: path.to_owned(),
     })?;
     cstring(value, field)
-}
-
-pub(crate) fn optional_path_cstring(
-    path: Option<&Path>,
-    field: &'static str,
-) -> Result<Option<CString>> {
-    path.map(|path| path_cstring(path, field)).transpose()
 }
 
 pub(crate) fn c_int_len(len: usize, field: &'static str) -> Result<i32> {
