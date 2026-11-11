@@ -177,9 +177,7 @@ mod tests {
         };
         let mut plan = Plan::default();
         let llama = plan.insert(Llama::WindowsCuda.into(), &hardware).unwrap();
-        let diffusion = plan
-            .insert(Diffusion::WindowsCuda.into(), &hardware)
-            .unwrap();
+        let diffusion = plan.insert(Diffusion::LinuxCuda.into(), &hardware).unwrap();
         plan.sequence(llama, diffusion);
 
         for package in [Cuda::Runtime13, Cuda::Rtc13, Cuda::Blas13] {
