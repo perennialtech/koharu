@@ -12,10 +12,8 @@ use image::{
 };
 use imageproc::region_labelling::{Connectivity, connected_components};
 use koharu_ml::{
-    aot_inpainting::AotInpainting,
     flux2_klein::{Flux2KleinInpaint, Flux2KleinInpaintOptions},
     lama::{InpaintRequest, LaMa},
-    rorem_mixed::{DEFAULT_NEGATIVE_PROMPT, DEFAULT_PROMPT, RoremMixed, RoremMixedOptions},
 };
 use koharu_scene::{
     AssetInput, AssetMetadata, AssetRole, At, BubbleRegion, EntityOrigin, Geometry, Origin,
@@ -43,22 +41,6 @@ impl Default for Flux2KleinConfig {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Type)]
-#[serde(default)]
-pub struct RoremMixedConfig {
-    pub prompt: String,
-    pub negative_prompt: String,
-}
-
-impl Default for RoremMixedConfig {
-    fn default() -> Self {
-        Self {
-            prompt: DEFAULT_PROMPT.to_owned(),
-            negative_prompt: DEFAULT_NEGATIVE_PROMPT.to_owned(),
-        }
-    }
-}
-
 pub(super) struct Processor {
     config: InpaintingModel,
     device: koharu_ml::Device,
@@ -68,17 +50,11 @@ pub(super) struct Processor {
 impl Processor {
     pub(super) fn new(config: InpaintingModel, device: koharu_ml::Device) -> Result<Self> {
         match &config {
-            InpaintingModel::LaMa {} | InpaintingModel::AotInpainting {} => {}
+            InpaintingModel::LaMa {} => {}
             InpaintingModel::Flux2Klein(settings) => {
                 ensure!(
                     !settings.prompt.contains('\0'),
                     "FLUX.2 prompt contains NUL"
-                );
-            }
-            InpaintingModel::RoremMixed(settings) => {
-                ensure!(
-                    !settings.prompt.contains('\0') && !settings.negative_prompt.contains('\0'),
-                    "RORem prompt contains NUL"
                 );
             }
         }
@@ -96,9 +72,7 @@ impl StageProcessor for Processor {
     fn model(&self) -> &'static str {
         match self.config {
             InpaintingModel::LaMa {} => "lama",
-            InpaintingModel::AotInpainting {} => "aot-inpainting",
             InpaintingModel::Flux2Klein(_) => "flux2-klein",
-            InpaintingModel::RoremMixed(_) => "rorem-mixed",
         }
     }
 
@@ -143,14 +117,9 @@ impl StageProcessor for Processor {
 
 enum Model {
     LaMa(Arc<Mutex<LaMa>>),
-    Aot(Arc<Mutex<AotInpainting>>),
     Flux {
         model: Arc<Mutex<Flux2KleinInpaint>>,
         config: Flux2KleinConfig,
-    },
-    Rorem {
-        model: Arc<Mutex<RoremMixed>>,
-        config: RoremMixedConfig,
     },
 }
 
@@ -160,15 +129,8 @@ impl Model {
             InpaintingModel::LaMa {} => {
                 Ok(Self::LaMa(Arc::new(Mutex::new(LaMa::load(device).await?))))
             }
-            InpaintingModel::AotInpainting {} => Ok(Self::Aot(Arc::new(Mutex::new(
-                AotInpainting::load(device).await?,
-            )))),
             InpaintingModel::Flux2Klein(config) => Ok(Self::Flux {
                 model: Arc::new(Mutex::new(Flux2KleinInpaint::load(device).await?)),
-                config: config.clone(),
-            }),
-            InpaintingModel::RoremMixed(config) => Ok(Self::Rorem {
-                model: Arc::new(Mutex::new(RoremMixed::load(device).await?)),
                 config: config.clone(),
             }),
         }
@@ -209,27 +171,6 @@ impl Model {
                     .await?,
                 )
             }
-            Self::Aot(model) => {
-                let model = model.clone();
-                (
-                    "aot-inpainting",
-                    tokio_rayon::spawn(move || -> Result<DynamicImage> {
-                        let model = model
-                            .lock()
-                            .map_err(|_| anyhow!("AOT model lock is poisoned"))?;
-                        inpaint_tiled(
-                            &prepared.image,
-                            &prepared.mask,
-                            &prepared.text_mask,
-                            &prepared.flat_fill_regions,
-                            |image, mask| {
-                                Ok(DynamicImage::ImageRgb8(model.inference(image, mask)?))
-                            },
-                        )
-                    })
-                    .await?,
-                )
-            }
             Self::Flux { model, config } => {
                 let model = model.clone();
                 let config = config.clone();
@@ -252,34 +193,6 @@ impl Model {
                                     &DynamicImage::ImageLuma8(mask.clone()),
                                     &Flux2KleinInpaintOptions::default(),
                                 )
-                            },
-                        )
-                    })
-                    .await?,
-                )
-            }
-            Self::Rorem { model, config } => {
-                let model = model.clone();
-                let config = config.clone();
-                (
-                    "rorem-mixed",
-                    tokio_rayon::spawn(move || -> Result<DynamicImage> {
-                        let model = model
-                            .lock()
-                            .map_err(|_| anyhow!("RORem model lock is poisoned"))?;
-                        inpaint_tiled(
-                            &prepared.image,
-                            &prepared.mask,
-                            &prepared.text_mask,
-                            &prepared.flat_fill_regions,
-                            |image, mask| {
-                                Ok(DynamicImage::ImageRgb8(model.inference(
-                                    image,
-                                    mask,
-                                    &config.prompt,
-                                    &config.negative_prompt,
-                                    &RoremMixedOptions::default(),
-                                )?))
                             },
                         )
                     })

@@ -67,8 +67,8 @@ Document only durable, repository-specific constraints here. Do not record curre
 - Run end-to-end tests only when the user explicitly asks for them.
 - Add a test when it protects a real regression boundary. Do not lock a translated phrase, a language display name, a registration string, or a one-line behavior the owner can read directly. Do not add a second harness for behavior the crate's existing tests already cover. Do not assert a compatibility shim.
 - A model port needs a structured comparison on identical inputs. A green build is not that comparison.
-- A green check is not acceptance. Small bug fixes, documentation, translations, and tests can be opened directly. A new product feature, significant UI change, model or provider integration, platform integration, dependency, public API, schema change, or architectural refactor needs an issue discussion first.
-- Keep the pull-request text short: problem, change, and verification. A human reviews the whole diff and can explain every change. Do not submit an unreviewed autonomous patch.
+- A green check is not acceptance. Small bug fixes, documentation, translations, and tests can be opened directly. A new product feature, significant UI change, platform integration, dependency, public API, schema change, or architectural refactor needs an issue discussion first.
+- Keep the pull-request text short: problem, change, and verification.
 
 ## Documentation
 

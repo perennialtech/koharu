@@ -39,10 +39,6 @@ criterion = { workspace = true }
 tempfile = { workspace = true }
 
 [[bench]]
-name = "aot_inpainting"
-harness = false
-
-[[bench]]
 name = "lama"
 harness = false
 

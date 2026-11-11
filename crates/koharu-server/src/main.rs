@@ -15,7 +15,7 @@ use clap::{Parser, ValueEnum};
 use koharu_config::Config;
 use koharu_pipeline::{
     Committer, Flux2KleinConfig, InpaintingModel, Operation, Pipeline, PipelineConfig, Progress,
-    Request, RequestTranslation, RoremMixedConfig, Scope, StageOutput,
+    Request, RequestTranslation, Scope, StageOutput,
 };
 use koharu_rasterizer::{RasterOptions, Rasterizer};
 use koharu_renderer::Renderer;
@@ -41,9 +41,7 @@ enum ProviderChoice {
 #[derive(Clone, Copy, Debug, ValueEnum)]
 enum InpaintingChoice {
     Lama,
-    AotInpainting,
     Flux2Klein,
-    RoremMixed,
 }
 
 #[derive(Debug, Parser)]
@@ -130,12 +128,8 @@ impl Arguments {
         }
         pipeline.inpainting = match self.inpainting {
             InpaintingChoice::Lama => InpaintingModel::LaMa {},
-            InpaintingChoice::AotInpainting => InpaintingModel::AotInpainting {},
             InpaintingChoice::Flux2Klein => {
                 InpaintingModel::Flux2Klein(Flux2KleinConfig::default())
-            }
-            InpaintingChoice::RoremMixed => {
-                InpaintingModel::RoremMixed(RoremMixedConfig::default())
             }
         };
         Ok((pipeline, providers))
@@ -431,20 +425,20 @@ mod tests {
         );
         assert_ne!(
             base,
-            cache_key(b"local,aot", b"image", Language::English, None)
+            cache_key(b"local,flux2-klein", b"image", Language::English, None)
         );
     }
 
     #[test]
     fn cli_keeps_local_only_and_selected_inpainters() {
         let arguments =
-            Arguments::try_parse_from(["koharu-server", "--inpainting", "rorem-mixed"]).unwrap();
+            Arguments::try_parse_from(["koharu-server", "--inpainting", "flux2-klein"]).unwrap();
         let (config, _) = arguments.configs().unwrap();
         assert_eq!(
             config.translation.model.model.as_deref(),
             Some("gemma4-e4b-it")
         );
-        assert!(matches!(config.inpainting, InpaintingModel::RoremMixed(_)));
+        assert!(matches!(config.inpainting, InpaintingModel::Flux2Klein(_)));
     }
 
     #[test]

@@ -5,13 +5,12 @@ use tokio::sync::OnceCell;
 
 mod backend;
 
-pub mod aot_inpainting;
+pub mod comic_text_bubble_detector;
 pub mod flux2_klein;
 pub mod koharu_layout_rfdetr_seg_2xl;
 pub mod lama;
 pub mod llm;
 pub mod paddle_ocr_vl_quantized;
-pub mod rorem_mixed;
 
 pub use koharu_diffusion as diffusion;
 pub use koharu_llama as llama;

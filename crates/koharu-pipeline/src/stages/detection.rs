@@ -17,9 +17,14 @@ use imageproc::{
     geometry::{approximate_polygon_dp, arc_length, contour_area},
     morphology::{close, dilate},
 };
-use koharu_ml::koharu_layout_rfdetr_seg_2xl::{
-    KoharuLayoutDetection, KoharuLayoutDetections, KoharuLayoutMask, KoharuLayoutRFDetrSeg2XL,
-    KoharuLayoutThresholds,
+use koharu_ml::{
+    comic_text_bubble_detector::{
+        ComicTextBubbleDetection, ComicTextBubbleDetector, ComicTextBubbleLabel,
+    },
+    koharu_layout_rfdetr_seg_2xl::{
+        KoharuLayoutDetection, KoharuLayoutDetections, KoharuLayoutMask, KoharuLayoutRFDetrSeg2XL,
+        KoharuLayoutThresholds,
+    },
 };
 use koharu_scene::{
     AssetInput, AssetMetadata, AssetRole, At, BubbleRegion, DetectionAnalysis, DetectionLabel,
@@ -34,7 +39,8 @@ use specta::Type;
 use super::{StageInput, StageProcessor, finish, generation};
 use crate::{DetectionModel, ModelCell};
 
-const MODEL_ID: &str = "mayocream/koharu-layout-rfdetr-seg-2xl-1152";
+const MODEL_ID: &str =
+    "mayocream/koharu-layout-rfdetr-seg-2xl-1152+ogkalu/comic-text-and-bubble-detector";
 const MODEL_NAME: &str = "koharu-layout-rfdetr-seg-2xl";
 const PRODUCER: &str = "dev.koharu.pipeline.detection";
 const ANGLE_SNAP_DEGREES: f32 = 3.0;
@@ -48,11 +54,17 @@ const COLOR_CLUSTER_COUNT: usize = 4;
 const MIN_EXTREME_COLOR_PIXELS: u32 = 4;
 const MIN_MEASURED_STROKE_WIDTH: u8 = 2;
 const DIALOGUE_MASK_CONTAINMENT_THRESHOLD: f32 = 0.9;
+// RF-DETR proposals far below its own bubble threshold still carry usable
+// masks for bubbles that the box-only bubble detector finds.
+const BUBBLE_MASK_CANDIDATE_THRESHOLD: f32 = 0.05;
+const BUBBLE_MASK_MIN_IOU: f32 = 0.5;
+const RFDETR_BUBBLE_LABEL_ID: usize = 2;
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, Type)]
 #[serde(default)]
 pub struct KoharuLayoutRFDetrSeg2XLConfig {
     pub text_threshold: Option<f32>,
+    /// Applies to the comic bubble detector, which supplies every bubble box.
     pub bubble_threshold: Option<f32>,
     pub panel_threshold: Option<f32>,
 }
@@ -134,22 +146,31 @@ impl StageProcessor for Processor {
     }
 }
 
+/// RF-DETR supplies text, panels and masks. Bubble boxes come from the comic
+/// bubble detector, which finds translucent balloons RF-DETR misses.
 struct Model {
     network: Arc<Mutex<KoharuLayoutRFDetrSeg2XL>>,
+    bubbles: Arc<Mutex<ComicTextBubbleDetector>>,
     thresholds: KoharuLayoutThresholds,
+    bubble_threshold: f32,
 }
 
 impl Model {
     async fn load(device: koharu_ml::Device, config: &DetectionModel) -> Result<Self> {
         let DetectionModel::KoharuLayoutRFDetrSeg2XL(config) = config;
-        let network = KoharuLayoutRFDetrSeg2XL::load(device).await?;
+        let network = KoharuLayoutRFDetrSeg2XL::load(device.clone()).await?;
+        let bubbles = ComicTextBubbleDetector::load(device).await?;
         let mut thresholds = network.recommended_thresholds();
         thresholds.text = config.text_threshold.unwrap_or(thresholds.text);
-        thresholds.bubble = config.bubble_threshold.unwrap_or(thresholds.bubble);
+        thresholds.bubble = BUBBLE_MASK_CANDIDATE_THRESHOLD;
         thresholds.panel = config.panel_threshold.unwrap_or(thresholds.panel);
         Ok(Self {
             network: Arc::new(Mutex::new(network)),
+            bubbles: Arc::new(Mutex::new(bubbles)),
             thresholds,
+            bubble_threshold: config
+                .bubble_threshold
+                .unwrap_or(ComicTextBubbleDetector::RECOMMENDED_BUBBLE_THRESHOLD),
         })
     }
 
@@ -166,14 +187,143 @@ impl Model {
 
     async fn detect(&self, image: Arc<DynamicImage>) -> Result<KoharuLayoutDetections> {
         let network = self.network.clone();
+        let bubbles = self.bubbles.clone();
         let thresholds = self.thresholds;
+        let bubble_threshold = self.bubble_threshold;
         tokio_rayon::spawn(move || {
-            let network = network
+            let layout = network
                 .lock()
-                .map_err(|_| anyhow!("layout model lock is poisoned"))?;
-            network.inference_with_thresholds(&image, thresholds)
+                .map_err(|_| anyhow!("layout model lock is poisoned"))?
+                .inference_with_thresholds(&image, thresholds)?;
+            let bubbles = bubbles
+                .lock()
+                .map_err(|_| anyhow!("bubble model lock is poisoned"))?
+                .inference(&image, bubble_threshold)?;
+            Ok(with_detected_bubbles(layout, &bubbles))
         })
         .await
+    }
+}
+
+/// Replaces RF-DETR bubbles with the bubble detector's boxes. Each box takes
+/// the mask of the best-overlapping RF-DETR bubble proposal, clipped to the
+/// box so a proposal spanning both lobes of a joined balloon cannot hand one
+/// lobe the other's area; otherwise its
+/// mask is the inscribed ellipse plus the text it contains, so containment
+/// still links that text to the bubble.
+fn with_detected_bubbles(
+    layout: KoharuLayoutDetections,
+    bubbles: &[ComicTextBubbleDetection],
+) -> KoharuLayoutDetections {
+    let KoharuLayoutDetections {
+        image_width,
+        image_height,
+        detections,
+    } = layout;
+    let (proposals, mut detections): (Vec<_>, Vec<_>) = detections
+        .into_iter()
+        .partition(|detection| detection.label == "bubble");
+    let page = [0.0, 0.0, image_width as f32, image_height as f32];
+    let mut bubble_detections = Vec::new();
+    for bubble in bubbles
+        .iter()
+        .filter(|bubble| bubble.label == ComicTextBubbleLabel::Bubble)
+    {
+        let bbox = clip_bounds(bubble.bbox, page);
+        if area(bbox) < 1.0 {
+            continue;
+        }
+        let mask = proposals
+            .iter()
+            .filter(|proposal| proposal.area > 0 && valid_mask(&proposal.mask))
+            .map(|proposal| (intersection_over_union(proposal.bbox, bbox), proposal))
+            .filter(|(iou, _)| *iou >= BUBBLE_MASK_MIN_IOU)
+            .max_by(|left, right| left.0.total_cmp(&right.0))
+            .map_or_else(
+                || ellipse_mask(bbox, &detections),
+                |(_, proposal)| clip_mask(&proposal.mask, bbox),
+            );
+        bubble_detections.push(KoharuLayoutDetection {
+            label_id: RFDETR_BUBBLE_LABEL_ID,
+            label: "bubble".to_owned(),
+            score: bubble.score,
+            bbox,
+            area: mask.pixels.iter().filter(|value| **value != 0).count() as u32,
+            mask,
+        });
+    }
+    detections.extend(bubble_detections);
+    KoharuLayoutDetections {
+        image_width,
+        image_height,
+        detections,
+    }
+}
+
+fn clip_bounds(bounds: [f32; 4], page: [f32; 4]) -> [f32; 4] {
+    [
+        bounds[0].clamp(page[0], page[2]),
+        bounds[1].clamp(page[1], page[3]),
+        bounds[2].clamp(page[0], page[2]),
+        bounds[3].clamp(page[1], page[3]),
+    ]
+}
+
+fn clip_mask(mask: &KoharuLayoutMask, bbox: [f32; 4]) -> KoharuLayoutMask {
+    let left = (bbox[0].floor() as u32).max(mask.x);
+    let top = (bbox[1].floor() as u32).max(mask.y);
+    let right = (bbox[2].ceil() as u32).min(mask.x + mask.width);
+    let bottom = (bbox[3].ceil() as u32).min(mask.y + mask.height);
+    if left >= right || top >= bottom {
+        return KoharuLayoutMask {
+            x: left,
+            y: top,
+            width: 0,
+            height: 0,
+            pixels: Vec::new(),
+        };
+    }
+    let pixels = (top..bottom)
+        .flat_map(|y| {
+            let row = ((y - mask.y) * mask.width) as usize;
+            mask.pixels[row + (left - mask.x) as usize..row + (right - mask.x) as usize]
+                .iter()
+                .copied()
+        })
+        .collect();
+    KoharuLayoutMask {
+        x: left,
+        y: top,
+        width: right - left,
+        height: bottom - top,
+        pixels,
+    }
+}
+
+fn ellipse_mask(bbox: [f32; 4], detections: &[KoharuLayoutDetection]) -> KoharuLayoutMask {
+    let x = bbox[0].floor() as u32;
+    let y = bbox[1].floor() as u32;
+    let width = (bbox[2].ceil() as u32).saturating_sub(x).max(1);
+    let height = (bbox[3].ceil() as u32).saturating_sub(y).max(1);
+    let (radius_x, radius_y) = ((bbox[2] - bbox[0]) / 2.0, (bbox[3] - bbox[1]) / 2.0);
+    let (center_x, center_y) = (bbox[0] + radius_x, bbox[1] + radius_y);
+    let mut mask = GrayImage::from_fn(width, height, |local_x, local_y| {
+        let dx = (x as f32 + local_x as f32 + 0.5 - center_x) / radius_x;
+        let dy = (y as f32 + local_y as f32 + 0.5 - center_y) / radius_y;
+        Luma([if dx * dx + dy * dy <= 1.0 { u8::MAX } else { 0 }])
+    });
+    for text in detections.iter().filter(|detection| {
+        detection.label == "text"
+            && containment(bbox, detection.bbox) >= DIALOGUE_MASK_CONTAINMENT_THRESHOLD
+    }) {
+        stamp_mask(&mut mask, &text.mask, x, y);
+    }
+    KoharuLayoutMask {
+        x,
+        y,
+        width,
+        height,
+        pixels: mask.into_raw(),
     }
 }
 
@@ -1857,7 +2007,11 @@ mod tests {
         ImageSize, KoharuLayoutRFDetrSeg2XLConfig, MaskPixel, PageRegions, Processor, RegionOutput,
         StageInput, StageProcessor, closed_mask_for, color_palette, generation, infer_typography,
         layout_order, link_dialogue_regions, mask_containment, mask_for, mask_geometry,
-        non_maximum_suppression, normalize_text_color, write_region,
+        non_maximum_suppression, normalize_text_color, with_detected_bubbles, write_region,
+    };
+    use koharu_ml::{
+        comic_text_bubble_detector::{ComicTextBubbleDetection, ComicTextBubbleLabel},
+        koharu_layout_rfdetr_seg_2xl::KoharuLayoutDetections,
     };
 
     #[test]
@@ -2015,6 +2169,95 @@ mod tests {
                 pixels: vec![0],
             },
         }
+    }
+
+    fn full_mask(x: u32, y: u32, width: u32, height: u32) -> KoharuLayoutMask {
+        KoharuLayoutMask {
+            x,
+            y,
+            width,
+            height,
+            pixels: vec![u8::MAX; (width * height) as usize],
+        }
+    }
+
+    fn comic(label: ComicTextBubbleLabel, bbox: [f32; 4]) -> ComicTextBubbleDetection {
+        ComicTextBubbleDetection {
+            label,
+            score: 0.9,
+            bbox,
+        }
+    }
+
+    #[test]
+    fn detected_bubbles_replace_layout_bubbles_and_reuse_overlapping_masks() {
+        // The proposal spans a second lobe to the right of the detected box.
+        let mut proposal = detection("bubble", 0.1, [10.0, 10.0, 70.0, 90.0]);
+        proposal.mask = full_mask(12, 12, 56, 76);
+        proposal.area = 56 * 76;
+        let unmatched = detection("bubble", 0.9, [100.0, 0.0, 120.0, 20.0]);
+        let layout = KoharuLayoutDetections {
+            image_width: 200,
+            image_height: 100,
+            detections: vec![
+                proposal,
+                unmatched,
+                detection("panel", 0.9, [0.0, 0.0, 200.0, 100.0]),
+            ],
+        };
+
+        let output = with_detected_bubbles(
+            layout,
+            &[
+                comic(ComicTextBubbleLabel::Bubble, [8.0, 8.0, 52.0, 92.0]),
+                comic(ComicTextBubbleLabel::TextFree, [150.0, 10.0, 160.0, 60.0]),
+            ],
+        );
+
+        let bubbles = output
+            .detections
+            .iter()
+            .filter(|detection| detection.label == "bubble")
+            .collect::<Vec<_>>();
+        assert_eq!(bubbles.len(), 1);
+        assert_eq!(bubbles[0].bbox, [8.0, 8.0, 52.0, 92.0]);
+        assert_eq!((bubbles[0].mask.x, bubbles[0].mask.width), (12, 40));
+        assert_eq!(bubbles[0].area, 40 * 76);
+        assert_eq!(output.detections.len(), 2);
+    }
+
+    #[test]
+    fn unmatched_detected_bubbles_use_an_ellipse_that_contains_their_text() {
+        // A tall text column whose corners fall outside the inscribed ellipse.
+        let mut text = detection("text", 0.9, [20.0, 5.0, 40.0, 95.0]);
+        text.mask = full_mask(20, 5, 20, 90);
+        let layout = KoharuLayoutDetections {
+            image_width: 100,
+            image_height: 100,
+            detections: vec![text],
+        };
+
+        let output = with_detected_bubbles(
+            layout,
+            &[comic(
+                ComicTextBubbleLabel::Bubble,
+                [10.0, 0.0, 50.0, 100.0],
+            )],
+        );
+
+        let bubble = output
+            .detections
+            .iter()
+            .find(|detection| detection.label == "bubble")
+            .unwrap();
+        let text = output
+            .detections
+            .iter()
+            .find(|detection| detection.label == "text")
+            .unwrap();
+        assert!(bubble.mask.contains(30, 50));
+        assert!(!bubble.mask.contains(11, 2));
+        assert_eq!(mask_containment(&bubble.mask, &text.mask, text.bbox), 1.0);
     }
 
     #[test]
