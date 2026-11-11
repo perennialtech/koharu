@@ -331,11 +331,13 @@ impl Job {
 pub(crate) struct Jobs {
     entries: Arc<Mutex<HashMap<Uuid, Arc<Job>>>>,
     queue: mpsc::UnboundedSender<Arc<Job>>,
+    shutdown: watch::Sender<bool>,
 }
 
 impl Jobs {
     pub(crate) fn new() -> (Self, mpsc::UnboundedReceiver<Arc<Job>>) {
         let (queue, receiver) = mpsc::unbounded_channel();
+        let (shutdown, _) = watch::channel(false);
         let entries = Arc::new(Mutex::new(HashMap::<Uuid, Arc<Job>>::new()));
         let cleanup_entries = Arc::downgrade(&entries);
         tokio::spawn(async move {
@@ -351,7 +353,25 @@ impl Jobs {
                     .retain(|_, job| !job.state.borrow().expired());
             }
         });
-        (Self { entries, queue }, receiver)
+        (
+            Self {
+                entries,
+                queue,
+                shutdown,
+            },
+            receiver,
+        )
+    }
+
+    pub(crate) fn subscribe_shutdown(&self) -> watch::Receiver<bool> {
+        self.shutdown.subscribe()
+    }
+
+    pub(crate) fn shutdown(&self) {
+        self.shutdown.send_replace(true);
+        for job in self.entries.lock().unwrap().values() {
+            job.cancel();
+        }
     }
 
     pub(crate) fn submit(&self, input: Input) -> Option<Translation> {
@@ -359,6 +379,9 @@ impl Jobs {
         let job = Arc::new(Job::new(id, input));
         let snapshot = job.snapshot();
         let mut entries = self.entries.lock().unwrap();
+        if *self.shutdown.borrow() {
+            return None;
+        }
         entries.insert(id, job.clone());
         if self.queue.send(job).is_err() {
             entries.remove(&id);

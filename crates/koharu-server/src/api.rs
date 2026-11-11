@@ -229,10 +229,20 @@ async fn events(
     Path(id): Path<String>,
 ) -> Result<Sse<impl Stream<Item = Result<Event, axum::Error>>>, ApiError> {
     let updates = find(&jobs, &id)?.subscribe();
-    let stream = stream::unfold(Some((updates, true)), |next| async move {
-        let (mut updates, first) = next?;
+    let shutdown = jobs.subscribe_shutdown();
+    let stream = stream::unfold(Some((updates, shutdown, true)), |next| async move {
+        let (mut updates, mut shutdown, first) = next?;
+        if *shutdown.borrow() {
+            return None;
+        }
         if !first {
-            updates.changed().await.ok()?;
+            tokio::select! {
+                change = updates.changed() => change.ok()?,
+                _ = shutdown.changed() => return None,
+            }
+            if *shutdown.borrow() {
+                return None;
+            }
         }
         let snapshot = updates.borrow_and_update().snapshot();
         let terminal = snapshot.status.terminal_event();
@@ -242,7 +252,10 @@ async fn events(
             terminal.unwrap_or("progress")
         };
         let event = Event::default().event(name).json_data(snapshot);
-        Some((event, terminal.is_none().then_some((updates, false))))
+        Some((
+            event,
+            terminal.is_none().then_some((updates, shutdown, false)),
+        ))
     });
     Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
 }

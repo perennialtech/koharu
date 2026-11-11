@@ -277,11 +277,15 @@ async fn serve() -> Result<()> {
     };
     let (jobs, queue) = Jobs::new();
     tokio::spawn(worker.run(queue));
+    let shutdown_jobs = jobs.clone();
     let app = api::router(jobs);
     let listener = tokio::net::TcpListener::bind(arguments.listen).await?;
     tracing::info!(address = %listener.local_addr()?, "Koharu HTTP server listening");
     axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown)
+        .with_graceful_shutdown(async move {
+            shutdown.await;
+            shutdown_jobs.shutdown();
+        })
         .await?;
     Ok(())
 }
