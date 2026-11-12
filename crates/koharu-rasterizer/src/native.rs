@@ -3,7 +3,10 @@
 use std::sync::mpsc;
 
 use anyhow::{Context, Result as AnyResult, anyhow, bail};
-use fast_image_resize::{FilterType, ResizeAlg, ResizeOptions, Resizer};
+use fast_image_resize::{
+    FilterType, IntoImageView as _, IntoImageViewMut as _, ResizeAlg, ResizeOptions, Resizer,
+    pixels::U8x4,
+};
 use image::RgbaImage;
 use parking_lot::Mutex;
 use vello::{
@@ -553,9 +556,19 @@ fn finish_raster(
     let resize_options = ResizeOptions::new()
         .resize_alg(options.downsample_filter.into())
         .use_alpha(true);
-    Resizer::new()
-        .resize(&image, &mut downsampled, &resize_options)
-        .context("failed to downsample WGPU render")?;
+    // `resize_typed` instantiates the resampler for one pixel type; the untyped
+    // `resize` monomorphizes all of them into this crate at opt-level 3.
+    {
+        let (Some(source), Some(mut destination)) = (
+            image.image_view::<U8x4>(),
+            downsampled.image_view_mut::<U8x4>(),
+        ) else {
+            bail!("WGPU render is not 8-bit RGBA");
+        };
+        Resizer::new()
+            .resize_typed(&source, &mut destination, &resize_options)
+            .context("failed to downsample WGPU render")?;
+    }
     Ok(downsampled)
 }
 

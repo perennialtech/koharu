@@ -7,7 +7,10 @@ mod model;
 mod processor;
 
 use anyhow::{Context, Result, ensure};
-use fast_image_resize::{FilterType, ResizeAlg, ResizeOptions, Resizer};
+use fast_image_resize::{
+    FilterType, ResizeAlg, ResizeOptions,
+    pixels::{U8, U8x3},
+};
 use image::{DynamicImage, GenericImageView as _, RgbImage};
 use koharu_diffusion::{
     GuidanceParams, ImageGenerationParams, SampleMethod, SampleParams, Scheduler,
@@ -202,29 +205,27 @@ impl Flux2KleinInpaint {
             }
             let source = image.to_rgb8();
             let mut resized = RgbImage::new(width, height);
-            Resizer::new()
-                .resize(
-                    &source,
-                    &mut resized,
-                    &ResizeOptions::new()
-                        .resize_alg(ResizeAlg::Convolution(FilterType::Lanczos3))
-                        .use_alpha(false),
-                )
-                .expect("source and destination images have the same pixel type");
+            crate::resize_image::<U8x3>(
+                &source,
+                &mut resized,
+                &ResizeOptions::new()
+                    .resize_alg(ResizeAlg::Convolution(FilterType::Lanczos3))
+                    .use_alpha(false),
+            )
+            .expect("source and destination images have the same pixel type");
             resized
         };
         let image = resize(image);
         let source_mask = mask_image.to_luma8();
         let mut mask_image = image::GrayImage::new(width, height);
-        Resizer::new()
-            .resize(
-                &source_mask,
-                &mut mask_image,
-                &ResizeOptions::new()
-                    .resize_alg(ResizeAlg::Convolution(FilterType::Lanczos3))
-                    .use_alpha(false),
-            )
-            .expect("source and destination masks have the same pixel type");
+        crate::resize_image::<U8>(
+            &source_mask,
+            &mut mask_image,
+            &ResizeOptions::new()
+                .resize_alg(ResizeAlg::Convolution(FilterType::Lanczos3))
+                .use_alpha(false),
+        )
+        .expect("source and destination masks have the same pixel type");
 
         let crop_coords = options.padding_mask_crop.and_then(|padding| {
             Flux2ImageProcessor::get_crop_region(&mask_image, width, height, padding)
