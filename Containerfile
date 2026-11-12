@@ -3,14 +3,12 @@ FROM scratch AS cargo-cache
 FROM rust:1.99-bookworm AS builder
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    clang libclang-dev libfontconfig-dev cmake pkg-config \
+    clang libclang-dev \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /src
 COPY . .
 ENV LIBCLANG_PATH=/usr/lib/llvm-14/lib \
-    CARGO_BUILD_JOBS=4 \
-    CMAKE_BUILD_PARALLEL_LEVEL=4 \
     CARGO_PROFILE_RELEASE_DEBUG=0 \
     CARGO_PROFILE_RELEASE_STRIP=symbols \
     CARGO_HOME=/cache/cargo \

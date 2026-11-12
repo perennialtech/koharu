@@ -16,6 +16,9 @@ pub enum Error {
     Invalid(String),
     #[error("rasterizer backend failed: {0}")]
     Backend(String),
+    #[cfg(feature = "native")]
+    #[error("failed to encode PNG")]
+    Png(#[source] image::ImageError),
 }
 
 impl Error {

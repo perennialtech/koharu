@@ -59,6 +59,9 @@ Document only durable, repository-specific constraints here. Do not record curre
 - Account for asynchronous accelerator execution when timing work.
 - Load assets and warm models outside measured regions.
 - Report the device, input size, baseline, result, and correctness difference.
+- For manga bubble detection and inpainting, consult the
+  [hard-page evaluation repository](https://github.com/perennialtech/koharu-hard-page-eval)
+  for difficult test pages, model comparisons, and reproduction steps.
 
 ## Verification
 

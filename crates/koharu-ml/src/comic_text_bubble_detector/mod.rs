@@ -11,7 +11,7 @@ use anyhow::{Context, Result};
 use image::DynamicImage;
 use koharu_torch::Device;
 
-use crate::backend::TryIntoDevice;
+use crate::backend::{TryIntoDevice, recover_torch_oom};
 
 pub use self::processor::{ComicTextBubbleDetection, ComicTextBubbleLabel};
 
@@ -38,10 +38,12 @@ impl ComicTextBubbleDetector {
             .resolve()
             .await
             .context("failed to resolve comic text and bubble detector weights")?;
-        let mut model = Model::new(device);
-        model
-            .load(&weights_path)
-            .with_context(|| format!("failed to load {}", weights_path.display()))?;
+        let model = recover_torch_oom(|| {
+            let mut model = Model::new(device);
+            model.load(&weights_path)?;
+            Ok(model)
+        })
+        .with_context(|| format!("failed to load {}", weights_path.display()))?;
         Ok(Self { device, model })
     }
 
@@ -51,10 +53,12 @@ impl ComicTextBubbleDetector {
         image: &DynamicImage,
         threshold: f32,
     ) -> Result<Vec<ComicTextBubbleDetection>> {
-        koharu_torch::no_grad(|| {
-            let pixel_values = processor::preprocess(image, self.device)?;
-            let output = self.model.forward(&pixel_values);
-            processor::postprocess(&output, image.width(), image.height(), threshold)
+        recover_torch_oom(|| {
+            koharu_torch::no_grad(|| {
+                let pixel_values = processor::preprocess(image, self.device)?;
+                let output = self.model.forward(&pixel_values);
+                processor::postprocess(&output, image.width(), image.height(), threshold)
+            })
         })
     }
 }
