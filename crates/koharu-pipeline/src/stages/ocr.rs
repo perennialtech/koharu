@@ -206,31 +206,47 @@ async fn infer_text<M: Send + 'static>(
     .await
 }
 
-// Manga OCR can emit replacement-box glyphs for an isolated Japanese ellipsis.
-// Normalize only an all-placeholder sequence so ordinary OCR output is preserved.
+// PaddleOCR-VL reads a column of dots, as in a silent reaction balloon, as
+// boxes, circles or emoji. Normalize only text made entirely of such symbols so
+// ordinary OCR output, and hearts and notes used as lettering, are preserved.
 fn normalize_ocr_text(text: String) -> String {
     let visible = text
         .chars()
-        .filter(|character| !character.is_whitespace())
+        .filter(|character| !character.is_whitespace() && *character != '\u{FE0F}')
         .collect::<Vec<_>>();
-    if visible.len() >= 2
-        && visible
-            .iter()
-            .all(|character| matches!(character, '☐' | '□' | '▢' | '▣' | '�'))
-    {
+    if visible.len() >= 2 && visible.iter().copied().all(misread_dot) {
         "…".to_owned()
     } else {
         text
     }
 }
 
+fn misread_dot(character: char) -> bool {
+    matches!(
+        character,
+        '\u{25A0}'..='\u{27BF}' | '\u{1F300}'..='\u{1FAFF}' | '∗' | '•' | '�'
+    ) && !matches!(character, '♡' | '♥' | '❤' | '♩' | '♪' | '♫' | '♬')
+}
+
+// Detected text boxes hug the ink, and PaddleOCR-VL drops or misreads glyphs
+// that touch the crop edge. A margin of a fraction of the line thickness, the
+// box's shorter side, restores them without reaching neighbouring lines.
+const CROP_MARGIN: f64 = 0.15;
+
 fn crop(source: &DynamicImage, geometry: &Geometry) -> Result<DynamicImage> {
     let (min_x, min_y, max_x, max_y) =
         geometry_extents(geometry).ok_or_else(|| anyhow!("geometry is empty"))?;
-    let x = min_x.floor().max(0.0) as u32;
-    let y = min_y.floor().max(0.0) as u32;
-    let right = max_x.ceil().max(0.0).min(f64::from(source.width())) as u32;
-    let bottom = max_y.ceil().max(0.0).min(f64::from(source.height())) as u32;
+    let margin = (max_x - min_x).min(max_y - min_y).max(0.0) * CROP_MARGIN;
+    let x = (min_x - margin).floor().max(0.0) as u32;
+    let y = (min_y - margin).floor().max(0.0) as u32;
+    let right = (max_x + margin)
+        .ceil()
+        .max(0.0)
+        .min(f64::from(source.width())) as u32;
+    let bottom = (max_y + margin)
+        .ceil()
+        .max(0.0)
+        .min(f64::from(source.height())) as u32;
     if right <= x || bottom <= y {
         bail!("geometry does not overlap the image");
     }
@@ -239,17 +255,40 @@ fn crop(source: &DynamicImage, geometry: &Geometry) -> Result<DynamicImage> {
 
 #[cfg(test)]
 mod tests {
-    use super::normalize_ocr_text;
+    use image::DynamicImage;
+    use koharu_scene::Geometry;
+
+    use super::{crop, normalize_ocr_text};
 
     #[test]
-    fn repeated_placeholder_glyphs_are_an_ellipsis() {
-        assert_eq!(normalize_ocr_text("☐ ☐ ☐".to_owned()), "…");
-        assert_eq!(normalize_ocr_text("□\n□".to_owned()), "…");
+    fn crops_keep_a_margin_around_the_text_within_the_page() {
+        let source = DynamicImage::new_luma8(200, 100);
+
+        let column = crop(&source, &Geometry::rectangle(50.0, 20.0, 20.0, 60.0)).unwrap();
+        let edge = crop(&source, &Geometry::rectangle(0.0, 0.0, 40.0, 100.0)).unwrap();
+
+        assert_eq!((column.width(), column.height()), (26, 66));
+        assert_eq!((edge.width(), edge.height()), (46, 100));
     }
 
     #[test]
-    fn ordinary_text_and_single_boxes_are_unchanged() {
-        assert_eq!(normalize_ocr_text("待って…".to_owned()), "待って…");
-        assert_eq!(normalize_ocr_text("☐".to_owned()), "☐");
+    fn symbols_read_from_a_column_of_dots_are_an_ellipsis() {
+        for text in [
+            "☐ ☐ ☐",
+            "□\n□",
+            "○●●",
+            "☑ ☐ ☒ ☐ ☐",
+            "● ● ● ● ●",
+            "☀️ 🌞 ☁️ ☉ ⚪️ ☛️",
+        ] {
+            assert_eq!(normalize_ocr_text(text.to_owned()), "…", "{text}");
+        }
+    }
+
+    #[test]
+    fn ordinary_text_lettering_symbols_and_single_boxes_are_unchanged() {
+        for text in ["待って…", "・・・", "!!", "♡♡", "♪♪", "☐"] {
+            assert_eq!(normalize_ocr_text(text.to_owned()), text);
+        }
     }
 }

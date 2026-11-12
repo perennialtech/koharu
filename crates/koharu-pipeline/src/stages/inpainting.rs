@@ -583,7 +583,13 @@ fn inpaint_tiled(
                 )
                 .to_rgb8()
         };
-        composite_generated(&mut output, &component_labels, tile, &generated);
+        composite_generated(
+            &mut output,
+            &mut pending_mask,
+            &component_labels,
+            tile,
+            &generated,
+        );
     }
     Ok(DynamicImage::ImageRgb8(output))
 }
@@ -932,8 +938,12 @@ fn standard_deviation(values: &[u8], center: f64) -> f64 {
         .sqrt()
 }
 
+/// Writes a tile's fill for the mask it owns and unmasks those pixels, so the
+/// tiles that continue the same component see the fill as context instead of
+/// generating their overlap again and meeting it at a seam.
 fn composite_generated(
     output: &mut RgbImage,
+    pending_mask: &mut GrayImage,
     labels: &ImageBuffer<Luma<u32>, Vec<u32>>,
     tile: &InpaintTile,
     generated: &RgbImage,
@@ -948,6 +958,7 @@ fn composite_generated(
                 .is_ok()
             {
                 output.put_pixel(x, y, *generated.get_pixel(x - left, y - top));
+                pending_mask.put_pixel(x, y, Luma([0]));
             }
         }
     }
@@ -1273,6 +1284,45 @@ mod tests {
                 .count();
             assert!(masked > owned);
         }
+    }
+
+    #[test]
+    fn continuation_tiles_use_earlier_fills_as_context() {
+        let image = RgbImage::from_pixel(1000, 300, Rgb([20, 40, 60]));
+        let mut mask = GrayImage::new(1000, 300);
+        for y in 100..120 {
+            for x in 50..850 {
+                mask.put_pixel(x, y, Luma([u8::MAX]));
+            }
+        }
+        let mut calls = Vec::new();
+
+        inpaint_tiled(
+            &DynamicImage::ImageRgb8(image),
+            &mask,
+            &mask,
+            &[],
+            LAMA_TILE_CONTEXT,
+            |tile, tile_mask| {
+                calls.push((
+                    tile.to_rgb8(),
+                    tile_mask.pixels().filter(|pixel| pixel[0] >= 127).count(),
+                ));
+                Ok(DynamicImage::ImageRgb8(RgbImage::from_pixel(
+                    tile.width(),
+                    tile.height(),
+                    Rgb([calls.len() as u8, 0, 0]),
+                )))
+            },
+        )
+        .unwrap();
+
+        // The second tile owns x 562..850 and its crop starts 128 px earlier,
+        // at the top of the page, over pixels the first tile already filled.
+        assert_eq!(calls.len(), 2);
+        let (second, masked) = &calls[1];
+        assert_eq!(*masked, (850 - 562) * 20);
+        assert_eq!(second.get_pixel(0, 100), &Rgb([1, 0, 0]));
     }
 
     #[test]
