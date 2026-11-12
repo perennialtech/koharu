@@ -62,7 +62,17 @@ const SPLIT_BUBBLE_MIN_SHARE: f32 = 0.2;
 // masks for bubbles that the box-only bubble detector finds.
 const BUBBLE_MASK_CANDIDATE_THRESHOLD: f32 = 0.05;
 const BUBBLE_MASK_MIN_IOU: f32 = 0.5;
+const RFDETR_TEXT_LABEL_ID: usize = 0;
 const RFDETR_BUBBLE_LABEL_ID: usize = 2;
+// RF-DETR labels handwritten asides `onomatopoeia`, like sound effects. The
+// comic detector boxes the asides as text even at low confidence and never
+// boxes sound effects, so its agreement separates the two.
+const COMIC_TEXT_AGREEMENT_THRESHOLD: f32 = 0.3;
+const COMIC_TEXT_AGREEMENT_CONTAINMENT: f32 = 0.5;
+// Text the comic detector finds alone, such as short exclamations in narrow
+// balloons, needs a confident box.
+const COMIC_TEXT_THRESHOLD: f32 = 0.5;
+const COMIC_TEXT_MAX_COVERAGE: f32 = 0.3;
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, Type)]
 #[serde(default)]
@@ -199,25 +209,34 @@ impl Model {
                 .lock()
                 .map_err(|_| anyhow!("layout model lock is poisoned"))?
                 .inference_with_thresholds(&image, thresholds)?;
-            let bubbles = bubbles
+            let comic = bubbles
                 .lock()
                 .map_err(|_| anyhow!("bubble model lock is poisoned"))?
-                .inference(&image, bubble_threshold)?;
-            Ok(with_detected_bubbles(layout, &bubbles))
+                .inference(&image, bubble_threshold.min(COMIC_TEXT_AGREEMENT_THRESHOLD))?;
+            Ok(with_comic_detections(layout, &comic, bubble_threshold))
         })
         .await
     }
 }
 
-/// Replaces RF-DETR bubbles with the bubble detector's boxes. Each box takes
+/// Combines RF-DETR with the comic detector, which finds text and balloons
+/// RF-DETR misses.
+///
+/// Text and onomatopoeia boxes first grow to their masks within the comic
+/// detector's text boxes. Onomatopoeia the comic detector also boxes as text
+/// becomes text, and confident comic text boxes that no RF-DETR box covers
+/// become text with a box mask.
+///
+/// RF-DETR bubbles are replaced with the comic detector's boxes. Each box takes
 /// the mask of the best-overlapping RF-DETR bubble proposal, clipped to the
 /// box so a proposal spanning both lobes of a joined balloon cannot hand one
 /// lobe the other's area; otherwise its
 /// mask is the inscribed ellipse plus the text it contains, so containment
 /// still links that text to the bubble.
-fn with_detected_bubbles(
+fn with_comic_detections(
     layout: KoharuLayoutDetections,
-    bubbles: &[ComicTextBubbleDetection],
+    comic: &[ComicTextBubbleDetection],
+    bubble_threshold: f32,
 ) -> KoharuLayoutDetections {
     let KoharuLayoutDetections {
         image_width,
@@ -228,11 +247,56 @@ fn with_detected_bubbles(
         .into_iter()
         .partition(|detection| detection.label == "bubble");
     let page = [0.0, 0.0, image_width as f32, image_height as f32];
-    let mut bubble_detections = Vec::new();
-    for bubble in bubbles
+    let comic_text = comic
         .iter()
-        .filter(|bubble| bubble.label == ComicTextBubbleLabel::Bubble)
+        .filter(|detection| {
+            detection.label != ComicTextBubbleLabel::Bubble
+                && detection.score > COMIC_TEXT_AGREEMENT_THRESHOLD
+        })
+        .collect::<Vec<_>>();
+    for detection in &mut detections {
+        if detection.label != "text" && detection.label != "onomatopoeia" {
+            continue;
+        }
+        fit_to_mask(detection, &comic_text);
+        if detection.label == "onomatopoeia"
+            && comic_text.iter().any(|text| {
+                containment(text.bbox, detection.bbox) >= COMIC_TEXT_AGREEMENT_CONTAINMENT
+            })
+        {
+            detection.label = "text".to_owned();
+            detection.label_id = RFDETR_TEXT_LABEL_ID;
+        }
+    }
+    let mut added_text = Vec::new();
+    for text in comic_text
+        .iter()
+        .filter(|text| text.score > COMIC_TEXT_THRESHOLD)
     {
+        let bbox = clip_bounds(text.bbox, page);
+        let covered = detections
+            .iter()
+            .filter(|detection| detection.label == "text" || detection.label == "onomatopoeia")
+            .map(|detection| intersection_area(detection.bbox, bbox))
+            .sum::<f32>();
+        if area(bbox) < 1.0 || covered >= area(bbox) * COMIC_TEXT_MAX_COVERAGE {
+            continue;
+        }
+        let mask = box_mask(bbox);
+        added_text.push(KoharuLayoutDetection {
+            label_id: RFDETR_TEXT_LABEL_ID,
+            label: "text".to_owned(),
+            score: text.score,
+            bbox,
+            area: mask.width * mask.height,
+            mask,
+        });
+    }
+    detections.extend(added_text);
+    let mut bubble_detections = Vec::new();
+    for bubble in comic.iter().filter(|bubble| {
+        bubble.label == ComicTextBubbleLabel::Bubble && bubble.score > bubble_threshold
+    }) {
         let bbox = clip_bounds(bubble.bbox, page);
         if area(bbox) < 1.0 {
             continue;
@@ -273,6 +337,96 @@ fn with_detected_bubbles(
         image_width,
         image_height,
         detections,
+    }
+}
+
+/// RF-DETR predicts a box and a mask per query, and the box can end a glyph or
+/// more short of the column its mask covers, which cuts that glyph from OCR.
+/// Masks also run on into neighbouring columns and asides, which the box
+/// must not take in. The comic detector boxes whole text blocks, so the box
+/// grows to its mask only within the comic text boxes it overlaps, and mask
+/// pixels outside them are dropped. Without such a box the box is kept.
+fn fit_to_mask(detection: &mut KoharuLayoutDetection, comic_text: &[&ComicTextBubbleDetection]) {
+    let Some(window) = comic_text
+        .iter()
+        .filter(|text| intersection_area(text.bbox, detection.bbox) > 0.0)
+        .map(|text| text.bbox)
+        .reduce(|left, right| {
+            [
+                left[0].min(right[0]),
+                left[1].min(right[1]),
+                left[2].max(right[2]),
+                left[3].max(right[3]),
+            ]
+        })
+    else {
+        return;
+    };
+    if !valid_mask(&detection.mask) {
+        return;
+    }
+    let [left, top, right, bottom] = detection.bbox;
+    let mask = clip_mask(
+        &detection.mask,
+        [
+            window[0].min(left),
+            window[1].min(top),
+            window[2].max(right),
+            window[3].max(bottom),
+        ],
+    );
+    let Some([x, y, mask_right, mask_bottom]) = mask_extents(&mask) else {
+        return;
+    };
+    detection.mask = clip_mask(
+        &mask,
+        [x as f32, y as f32, mask_right as f32, mask_bottom as f32],
+    );
+    detection.area = detection
+        .mask
+        .pixels
+        .iter()
+        .filter(|value| **value != 0)
+        .count() as u32;
+    detection.bbox = [
+        left.min(x as f32),
+        top.min(y as f32),
+        right.max(mask_right as f32),
+        bottom.max(mask_bottom as f32),
+    ];
+}
+
+fn mask_extents(mask: &KoharuLayoutMask) -> Option<[u32; 4]> {
+    if !valid_mask(mask) || mask.width == 0 {
+        return None;
+    }
+    let mut extents: Option<[u32; 4]> = None;
+    for (index, _) in mask
+        .pixels
+        .iter()
+        .enumerate()
+        .filter(|(_, value)| **value != 0)
+    {
+        let x = mask.x + (index % mask.width as usize) as u32;
+        let y = mask.y + (index / mask.width as usize) as u32;
+        extents = Some(extents.map_or([x, y, x + 1, y + 1], |bounds| {
+            union_bounds(bounds, [x, y, x + 1, y + 1])
+        }));
+    }
+    extents
+}
+
+fn box_mask(bbox: [f32; 4]) -> KoharuLayoutMask {
+    let x = bbox[0].floor() as u32;
+    let y = bbox[1].floor() as u32;
+    let width = (bbox[2].ceil() as u32).saturating_sub(x).max(1);
+    let height = (bbox[3].ceil() as u32).saturating_sub(y).max(1);
+    KoharuLayoutMask {
+        x,
+        y,
+        width,
+        height,
+        pixels: vec![u8::MAX; (width * height) as usize],
     }
 }
 
@@ -2211,7 +2365,7 @@ mod tests {
         ImageSize, KoharuLayoutRFDetrSeg2XLConfig, MaskPixel, PageRegions, Processor, RegionOutput,
         StageInput, StageProcessor, closed_mask_for, color_palette, generation, infer_typography,
         layout_order, link_dialogue_regions, mask_containment, mask_for, mask_geometry,
-        non_maximum_suppression, normalize_text_color, with_detected_bubbles, write_region,
+        non_maximum_suppression, normalize_text_color, with_comic_detections, write_region,
     };
     use koharu_ml::{
         comic_text_bubble_detector::{ComicTextBubbleDetection, ComicTextBubbleLabel},
@@ -2410,12 +2564,13 @@ mod tests {
             ],
         };
 
-        let output = with_detected_bubbles(
+        let output = with_comic_detections(
             layout,
             &[
                 comic(ComicTextBubbleLabel::Bubble, [8.0, 8.0, 52.0, 92.0]),
                 comic(ComicTextBubbleLabel::TextFree, [150.0, 10.0, 160.0, 60.0]),
             ],
+            0.5,
         );
 
         let bubbles = output
@@ -2438,7 +2593,8 @@ mod tests {
                 .filter(|value| **value != 0)
                 .count()
         );
-        assert_eq!(output.detections.len(), 2);
+        // The panel, the bubble, and text from the uncovered text box.
+        assert_eq!(output.detections.len(), 3);
     }
 
     #[test]
@@ -2452,12 +2608,13 @@ mod tests {
             detections: vec![text],
         };
 
-        let output = with_detected_bubbles(
+        let output = with_comic_detections(
             layout,
             &[comic(
                 ComicTextBubbleLabel::Bubble,
                 [10.0, 0.0, 50.0, 100.0],
             )],
+            0.5,
         );
 
         let bubble = output
@@ -2473,6 +2630,99 @@ mod tests {
         assert!(bubble.mask.contains(30, 50));
         assert!(!bubble.mask.contains(11, 2));
         assert_eq!(mask_containment(&bubble.mask, &text.mask, text.bbox), 1.0);
+    }
+
+    #[test]
+    fn text_boxes_grow_to_their_masks_within_comic_text_boxes() {
+        // The box starts one glyph below the column's mask, and the mask runs
+        // on below the column into an aside.
+        let column = || {
+            let mut text = detection("text", 0.9, [10.0, 30.0, 30.0, 100.0]);
+            let mut mask = full_mask(10, 10, 20, 300);
+            mask.pixels.fill(0);
+            for y in (0..90).chain(200..300) {
+                mask.pixels[y * 20..y * 20 + 20].fill(u8::MAX);
+            }
+            text.mask = mask;
+            KoharuLayoutDetections {
+                image_width: 100,
+                image_height: 400,
+                detections: vec![text],
+            }
+        };
+
+        let grown = with_comic_detections(
+            column(),
+            &[comic(
+                ComicTextBubbleLabel::TextBubble,
+                [8.0, 5.0, 32.0, 105.0],
+            )],
+            0.5,
+        );
+        let kept = with_comic_detections(column(), &[], 0.5);
+
+        let text = &grown.detections[0];
+        assert_eq!(text.bbox, [10.0, 10.0, 30.0, 100.0]);
+        assert!(text.mask.contains(10, 10) && !text.mask.contains(10, 250));
+        assert_eq!(text.area, 20 * 90);
+        assert_eq!(kept.detections[0].bbox, [10.0, 30.0, 30.0, 100.0]);
+    }
+
+    #[test]
+    fn onomatopoeia_that_the_comic_detector_boxes_as_text_becomes_text() {
+        let mut aside = detection("onomatopoeia", 0.5, [10.0, 10.0, 30.0, 60.0]);
+        aside.mask = full_mask(10, 10, 20, 50);
+        let mut effect = detection("onomatopoeia", 0.5, [100.0, 10.0, 160.0, 60.0]);
+        effect.mask = full_mask(100, 10, 60, 50);
+        let layout = KoharuLayoutDetections {
+            image_width: 200,
+            image_height: 100,
+            detections: vec![aside, effect],
+        };
+        let mut agreement = comic(ComicTextBubbleLabel::TextFree, [8.0, 8.0, 32.0, 62.0]);
+        agreement.score = 0.35;
+
+        let output = with_comic_detections(layout, &[agreement], 0.5);
+
+        let labels = output
+            .detections
+            .iter()
+            .map(|detection| (detection.bbox[0], detection.label.as_str()))
+            .collect::<Vec<_>>();
+        assert_eq!(labels, [(10.0, "text"), (100.0, "onomatopoeia")]);
+    }
+
+    #[test]
+    fn confident_comic_text_that_layout_missed_becomes_text() {
+        let mut column = detection("text", 0.9, [10.0, 10.0, 30.0, 90.0]);
+        column.mask = full_mask(10, 10, 20, 80);
+        let layout = KoharuLayoutDetections {
+            image_width: 200,
+            image_height: 100,
+            detections: vec![column],
+        };
+        let mut faint = comic(ComicTextBubbleLabel::TextBubble, [150.0, 10.0, 170.0, 50.0]);
+        faint.score = 0.4;
+
+        let output = with_comic_detections(
+            layout,
+            &[
+                comic(ComicTextBubbleLabel::TextBubble, [8.0, 8.0, 32.0, 92.0]),
+                comic(ComicTextBubbleLabel::TextBubble, [100.0, 10.0, 120.0, 50.0]),
+                faint,
+            ],
+            0.5,
+        );
+
+        let texts = output
+            .detections
+            .iter()
+            .filter(|detection| detection.label == "text")
+            .collect::<Vec<_>>();
+        assert_eq!(texts.len(), 2);
+        assert_eq!(texts[1].bbox, [100.0, 10.0, 120.0, 50.0]);
+        assert!(texts[1].mask.contains(100, 10) && texts[1].mask.contains(119, 49));
+        assert_eq!(texts[1].area, 20 * 40);
     }
 
     #[test]
