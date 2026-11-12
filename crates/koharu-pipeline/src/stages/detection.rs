@@ -54,6 +54,10 @@ const COLOR_CLUSTER_COUNT: usize = 4;
 const MIN_EXTREME_COLOR_PIXELS: u32 = 4;
 const MIN_MEASURED_STROKE_WIDTH: u8 = 2;
 const DIALOGUE_MASK_CONTAINMENT_THRESHOLD: f32 = 0.9;
+/// Largest gap, in line thicknesses, between lines of one text block.
+const TEXT_BLOCK_GAP: f32 = 0.6;
+// RF-DETR proposals far below its own bubble threshold still carry usable
+// masks for bubbles that the box-only bubble detector finds.
 const BUBBLE_MASK_CANDIDATE_THRESHOLD: f32 = 0.05;
 const BUBBLE_MASK_MIN_IOU: f32 = 0.5;
 const RFDETR_BUBBLE_LABEL_ID: usize = 2;
@@ -424,6 +428,7 @@ async fn write_page(
         detections.retain(|detection| intersects(detection.bbox, region));
     }
     non_maximum_suppression(&mut detections, 0.5);
+    merge_text_blocks(&mut detections);
     sort_by_layout(&mut detections);
 
     let image = image.to_rgb8();
@@ -1809,6 +1814,136 @@ fn non_maximum_suppression(detections: &mut Vec<KoharuLayoutDetection>, threshol
     *detections = kept;
 }
 
+/// RF-DETR proposes a text box per column or line and, separately, boxes
+/// spanning several of them, and NMS keeps both when one only half covers the
+/// other. Each detection becomes one translated segment, so a paragraph split
+/// this way is translated as unrelated fragments, some of them twice. Boxes
+/// that mostly overlap, and neighbouring lines of one paragraph (separated by
+/// less than a line's thickness and running mostly side by side), become one
+/// block. Neighbouring lines in different bubbles stay apart.
+fn merge_text_blocks(detections: &mut Vec<KoharuLayoutDetection>) {
+    let texts = indices_with_label(detections, "text");
+    let bubbles = indices_with_label(detections, "bubble");
+    let container = texts
+        .iter()
+        .map(|&text| {
+            bubbles
+                .iter()
+                .copied()
+                .filter(|&bubble| {
+                    containment(detections[bubble].bbox, detections[text].bbox)
+                        >= DIALOGUE_MASK_CONTAINMENT_THRESHOLD
+                })
+                .min_by(|&left, &right| {
+                    area(detections[left].bbox).total_cmp(&area(detections[right].bbox))
+                })
+        })
+        .collect::<Vec<_>>();
+    let mut parent = (0..texts.len()).collect::<Vec<_>>();
+    fn root(parent: &mut [usize], mut index: usize) -> usize {
+        while parent[index] != index {
+            parent[index] = parent[parent[index]];
+            index = parent[index];
+        }
+        index
+    }
+    for first in 0..texts.len() {
+        for second in first + 1..texts.len() {
+            let (first_bounds, second_bounds) = (
+                detections[texts[first]].bbox,
+                detections[texts[second]].bbox,
+            );
+            if same_text(first_bounds, second_bounds)
+                || (container[first] == container[second]
+                    && neighbouring_lines(first_bounds, second_bounds))
+            {
+                let (first, second) = (root(&mut parent, first), root(&mut parent, second));
+                parent[second] = first;
+            }
+        }
+    }
+    let mut groups = BTreeMap::<usize, Vec<usize>>::new();
+    for (index, &text) in texts.iter().enumerate() {
+        groups
+            .entry(root(&mut parent, index))
+            .or_default()
+            .push(text);
+    }
+    let mut merged = Vec::new();
+    let mut absorbed = vec![false; detections.len()];
+    for group in groups.into_values().filter(|group| group.len() > 1) {
+        let bbox = group
+            .iter()
+            .fold(detections[group[0]].bbox, |bounds, &index| {
+                let value = detections[index].bbox;
+                [
+                    bounds[0].min(value[0]),
+                    bounds[1].min(value[1]),
+                    bounds[2].max(value[2]),
+                    bounds[3].max(value[3]),
+                ]
+            });
+        let x = bbox[0].floor().max(0.0) as u32;
+        let y = bbox[1].floor().max(0.0) as u32;
+        let width = (bbox[2].ceil() as u32).saturating_sub(x).max(1);
+        let height = (bbox[3].ceil() as u32).saturating_sub(y).max(1);
+        let mut mask = GrayImage::new(width, height);
+        for &index in &group {
+            stamp_mask(&mut mask, &detections[index].mask, x, y);
+            absorbed[index] = true;
+        }
+        let pixels = mask.into_raw();
+        merged.push(KoharuLayoutDetection {
+            label_id: detections[group[0]].label_id,
+            label: "text".to_owned(),
+            score: group
+                .iter()
+                .map(|&index| detections[index].score)
+                .fold(0.0, f32::max),
+            bbox,
+            area: pixels.iter().filter(|value| **value != 0).count() as u32,
+            mask: KoharuLayoutMask {
+                x,
+                y,
+                width,
+                height,
+                pixels,
+            },
+        });
+    }
+    let mut index = 0;
+    detections.retain(|_| {
+        index += 1;
+        !absorbed[index - 1]
+    });
+    detections.extend(merged);
+}
+
+/// Mostly overlapping boxes cover the same text, even when the bubble
+/// detector splits their balloon in two.
+fn same_text(first: [f32; 4], second: [f32; 4]) -> bool {
+    intersection_area(first, second) >= area(first).min(area(second)) * 0.5
+}
+
+fn neighbouring_lines(first: [f32; 4], second: [f32; 4]) -> bool {
+    let width = |bounds: [f32; 4]| bounds[2] - bounds[0];
+    let height = |bounds: [f32; 4]| bounds[3] - bounds[1];
+    let vertical = |bounds: [f32; 4]| height(bounds) > width(bounds);
+    // `across` measures line thickness and the gap between lines; `along`
+    // measures where each line runs. The thinner box is a single line, so its
+    // thickness is the glyph size.
+    let (across, along) = match (vertical(first), vertical(second)) {
+        (true, true) => (0, 1),
+        (false, false) => (1, 0),
+        _ => return false,
+    };
+    let line = (first[across + 2] - first[across]).min(second[across + 2] - second[across]);
+    let gap = first[across].max(second[across]) - first[across + 2].min(second[across + 2]);
+    let shared = first[along + 2].min(second[along + 2]) - first[along].max(second[along]);
+    let shorter = (first[along + 2] - first[along]).min(second[along + 2] - second[along]);
+    gap <= line * TEXT_BLOCK_GAP && shared >= shorter * 0.5
+}
+
 fn sort_by_layout(detections: &mut Vec<KoharuLayoutDetection>) {
     let order = layout_order(detections);
     let mut values = std::mem::take(detections)
@@ -2515,6 +2650,62 @@ mod tests {
         assert_eq!(typography.color, Some([0, 0, 0, 255]));
         assert_eq!(typography.stroke_color, Some([255, 255, 255, 255]));
         assert_eq!(typography.stroke_width, Some(3.0));
+    }
+
+    #[test]
+    fn columns_of_one_paragraph_merge_into_a_block() {
+        // Boxes from 4961x7016 pages: a column, a box spanning it and its
+        // neighbour, and that neighbour; a paragraph of three columns with a
+        // staggered start; a column far to the left; one inside a bubble; and
+        // a column box nested in a two-column box, each assigned its own
+        // overlapping bubble.
+        let column = |bbox: [f32; 4]| {
+            let [left, top, right, bottom] = bbox.map(|value| value as u32);
+            KoharuLayoutDetection {
+                mask: full_mask(left, top, right - left, bottom - top),
+                ..detection("text", 0.9, bbox)
+            }
+        };
+        let mut detections = vec![
+            column([2713.0, 369.0, 2906.0, 1479.0]),
+            column([2480.0, 376.0, 2906.0, 1706.0]),
+            column([2499.0, 393.0, 2654.0, 1726.0]),
+            column([3837.0, 822.0, 4030.0, 2069.0]),
+            column([4050.0, 839.0, 4243.0, 2000.0]),
+            column([4321.0, 640.0, 4476.0, 1486.0]),
+            column([448.0, 411.0, 617.0, 1644.0]),
+            column([4520.0, 830.0, 4640.0, 1400.0]),
+            detection("bubble", 0.9, [4500.0, 800.0, 4700.0, 1500.0]),
+            column([474.0, 3435.0, 1094.0, 4740.0]),
+            column([939.0, 3452.0, 1094.0, 4754.0]),
+            detection("bubble", 0.9, [367.0, 3271.0, 1259.0, 4924.0]),
+            detection("bubble", 0.9, [860.0, 3281.0, 1289.0, 4894.0]),
+        ];
+
+        super::merge_text_blocks(&mut detections);
+
+        let mut texts = detections
+            .iter()
+            .filter(|detection| detection.label == "text")
+            .map(|detection| detection.bbox)
+            .collect::<Vec<_>>();
+        texts.sort_by(|left, right| left[0].total_cmp(&right[0]));
+        assert_eq!(
+            texts,
+            [
+                [448.0, 411.0, 617.0, 1644.0],
+                [474.0, 3435.0, 1094.0, 4754.0],
+                [2480.0, 369.0, 2906.0, 1726.0],
+                [3837.0, 640.0, 4476.0, 2069.0],
+                [4520.0, 830.0, 4640.0, 1400.0],
+            ]
+        );
+        let block = detections
+            .iter()
+            .find(|detection| detection.bbox[0] == 3837.0)
+            .unwrap();
+        assert!(block.mask.contains(3900, 1000) && block.mask.contains(4400, 1000));
+        assert!(!block.mask.contains(4280, 1000));
     }
 
     #[test]
