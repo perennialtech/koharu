@@ -45,8 +45,11 @@ pub(super) struct Model {
 
 impl Model {
     pub fn new(device: Device) -> Self {
-        let mut var_store = nn::VarStore::new(device);
-        crate::backend::set_precision(&mut var_store);
+        // Unlike most models this one stays FP32 on CUDA. Under BF16 a column
+        // box on 144304368_p1 loses a third of its width, so the column is
+        // never read, and a panel on the port fixture scores 0.61 instead of
+        // 0.95.
+        let var_store = nn::VarStore::new(device);
         let root = var_store.root();
         // Joiner is nn.Sequential(backbone, position_embedding), hence the `0`.
         let backbone = Backbone::new(&(&root / "backbone" / 0));
@@ -86,7 +89,6 @@ impl Model {
     pub fn load(&mut self, path: impl AsRef<Path>) -> Result<()> {
         // The complete RF-DETR tree is registered before this strict VarStore load.
         self.var_store.load(path)?;
-        crate::backend::set_precision(&mut self.var_store);
         Ok(())
     }
 

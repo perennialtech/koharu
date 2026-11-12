@@ -108,8 +108,7 @@ mod tests {
         let result = model.inference(&image)?;
 
         // rfdetr 1.7.0, CPU FP32, shape=(1920, 1920), the checkpoint loaded strictly.
-        // Both sides run FP32 on CPU: under CUDA BF16 the lower panel scores 0.61
-        // instead of 0.95. Kernels still vary across LibTorch releases, so compare
+        // Both sides run FP32 on CPU. Kernels still vary across LibTorch releases, so compare
         // structured geometry and mask area with bounded confidence differences.
         let best = &result.detections[0];
         assert_eq!(best.label, "bubble");
