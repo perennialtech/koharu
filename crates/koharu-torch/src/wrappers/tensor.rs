@@ -814,10 +814,8 @@ pub fn no_grad<T, F>(f: F) -> T
 where
     F: FnOnce() -> T,
 {
-    let prev = grad_set_enabled(false);
-    let result = f();
-    let _false = grad_set_enabled(prev);
-    result
+    let _guard = no_grad_guard();
+    f()
 }
 
 /// Runs a closure explicitly keeping track of gradients, this could be

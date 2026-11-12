@@ -22,16 +22,18 @@ impl Processor {
 
 #[async_trait]
 impl StageProcessor for Processor {
+    // Which engine answers is only known per page, so the stage reports the
+    // engine it used in the generation it records.
     fn model(&self) -> &'static str {
-        Translator::model(&self.config.model)
+        "translator"
     }
 
     fn unload(&self) -> bool {
-        self.translator.unload()
+        false
     }
 
     async fn load(&self) -> Result<()> {
-        self.translator.load_model(&self.config.model).await
+        Ok(())
     }
 
     async fn process(&self, input: StageInput) -> Result<koharu_scene::Patch> {
@@ -50,18 +52,16 @@ impl StageProcessor for Processor {
                 }
             }
         }
-        let target_language = input
-            .translation
-            .as_ref()
-            .map_or(self.config.target_language, |options| {
-                options.target_language
-            });
-        let instructions = input
-            .translation
-            .as_ref()
-            .map_or(self.config.instructions.as_deref(), |options| {
-                options.instructions.as_deref()
-            });
+        let options = input.translation.as_ref();
+        let target_language = options.map_or(self.config.target_language, |options| {
+            options.target_language
+        });
+        let instructions = options.map_or(self.config.instructions.as_deref(), |options| {
+            options.instructions.as_deref()
+        });
+        let engines = options
+            .and_then(|options| options.engines.as_deref())
+            .unwrap_or(&self.config.engines);
         let mut request = TranslationRequest::new(
             targets.iter().map(|(_, source)| source.clone()),
             target_language,
@@ -69,17 +69,17 @@ impl StageProcessor for Processor {
         if let Some(instructions) = instructions {
             request = request.with_instructions(instructions);
         }
-        if Translator::supports_vision(&self.config.model, &self.config.generation)
+        if Translator::uses_image(engines, &self.config.generation)
             && let Some(image) = input.images.get(&input.scene, input.page, "source").await?
         {
             request = request.with_image(image);
         }
-        let (provider, translated) = self
+        let (engine, translated) = self
             .translator
-            .translate(&self.config.model, self.config.generation, request)
+            .translate(engines, self.config.generation, request)
             .await?;
         let language = LanguageTag::new(target_language.tag())?;
-        let generated = generation(PRODUCER, provider)?;
+        let generated = generation(PRODUCER, engine.into())?;
         let mut edit = input.scene.edit_as(generated.clone());
         for (entity, _) in &targets {
             edit.observe::<SourceText>(*entity)?;
