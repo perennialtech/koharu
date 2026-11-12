@@ -82,11 +82,11 @@ state or immediately on server restart. Each submission runs independently.
 
 ## Bare-metal build
 
-On Linux, install Rust 1.99 or later, Clang and libclang, CMake, and the
-Fontconfig development headers. For Ubuntu 24.04:
+On Linux, install Rust 1.99 or later, Clang and libclang. Fontconfig is loaded
+at runtime. For Ubuntu 24.04:
 
 ```sh
-sudo apt-get install clang libclang-dev cmake libfontconfig-dev
+sudo apt-get install clang libclang-dev libfontconfig1
 LIBCLANG_PATH=/usr/lib/llvm-18/lib cargo build --locked -p koharu-server
 ./target/debug/koharu-server --listen 127.0.0.1:8080
 ```

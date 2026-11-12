@@ -99,7 +99,7 @@ icu_normalizer = { version = "2.3.0", default-features = false, features = ["com
 icu_properties = "2.3.0"
 icu_segmenter = "2.3.0"
 jieba-rs = "0.11.0"
-fontique = "0.12.0"
+fontique = { version = "0.12.0", features = ["fontconfig-dlopen"] }
 pollster = "1.0.1"
 vello = "0.11.0"
 uuid = { version = "1.26.1", features = ["v4", "v7", "serde"] }
