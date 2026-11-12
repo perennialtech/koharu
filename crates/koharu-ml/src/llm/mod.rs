@@ -4,10 +4,9 @@ mod model;
 
 use std::{num::NonZeroU32, path::PathBuf, time::Duration};
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use image::DynamicImage;
-use schemars::JsonSchema;
-use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use serde::{Deserialize, Serialize};
 
 use self::model::Model;
 
@@ -16,12 +15,6 @@ pub use koharu_llama::model::params::LlamaLoadMode;
 const DEFAULT_GPU_LAYERS: u32 = 1000;
 const DEFAULT_MAX_TOKENS: usize = 512;
 const DEFAULT_SEED: u32 = 299_792_458;
-
-/// Marker consumed by llama.cpp's multimodal tokenizer for one attached image.
-#[must_use]
-pub fn media_marker() -> &'static str {
-    koharu_llama::mtmd::mtmd_default_marker()
-}
 
 /// A loaded GGUF language model with optional image input.
 #[derive(Debug)]
@@ -56,23 +49,9 @@ impl Llm {
         self.model.eos_token()
     }
 
-    /// Applies the GGUF chat template.
+    /// Applies the GGUF chat template with a generation prompt.
     pub fn render_chat_prompt(&self, messages: &[ChatMessage]) -> Result<String> {
-        self.render_chat_prompt_with_options(messages, ChatTemplateOptions::default())
-    }
-
-    /// Applies the GGUF chat template with explicit generation and reasoning behavior.
-    pub fn render_chat_prompt_with_options(
-        &self,
-        messages: &[ChatMessage],
-        options: ChatTemplateOptions,
-    ) -> Result<String> {
-        self.model.render_chat_prompt(messages, options)
-    }
-
-    /// Generates unconstrained text for an input.
-    pub fn inference(&self, input: &Input<'_>, options: &GenerationOptions) -> Result<Generation> {
-        self.inference_with_callback(input, options, |_| Ok(GenerationControl::Continue))
+        self.model.render_chat_prompt(messages)
     }
 
     /// Generates unconstrained text for several inputs together.
@@ -84,48 +63,6 @@ impl Llm {
         options: &GenerationOptions,
     ) -> Result<Vec<Generation>> {
         self.model.inference_batch(inputs, options)
-    }
-
-    /// Generates text and invokes `on_token` after each decoded token.
-    pub fn inference_with_callback<F>(
-        &self,
-        input: &Input<'_>,
-        options: &GenerationOptions,
-        on_token: F,
-    ) -> Result<Generation>
-    where
-        F: FnMut(TokenChunk<'_>) -> Result<GenerationControl>,
-    {
-        self.model.inference(input, options, None, on_token)
-    }
-
-    /// Generates JSON constrained by the supplied JSON Schema.
-    pub fn inference_with_json_schema(
-        &self,
-        input: &Input<'_>,
-        options: &GenerationOptions,
-        schema: &serde_json::Value,
-    ) -> Result<Generation> {
-        self.model.inference(input, options, Some(schema), |_| {
-            Ok(GenerationControl::Continue)
-        })
-    }
-
-    /// Generates and deserializes JSON constrained to the schema of `T`.
-    pub fn inference_structured<T>(
-        &self,
-        input: &Input<'_>,
-        options: &GenerationOptions,
-    ) -> Result<StructuredGeneration<T>>
-    where
-        T: DeserializeOwned + JsonSchema,
-    {
-        let schema = serde_json::to_value(schemars::schema_for!(T))
-            .context("failed to serialize structured output schema")?;
-        let generation = self.inference_with_json_schema(input, options, &schema)?;
-        let value = serde_json::from_str(generation.text.trim())
-            .context("failed to deserialize structured LLM output")?;
-        Ok(StructuredGeneration { value, generation })
     }
 }
 
@@ -299,30 +236,6 @@ impl Generation {
 pub enum FinishReason {
     StopToken,
     Length,
-    Callback,
-}
-
-/// Return value from a token callback.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum GenerationControl {
-    Continue,
-    Stop,
-}
-
-/// One newly generated token and the complete text generated through that token.
-#[derive(Debug, Clone, Copy)]
-pub struct TokenChunk<'a> {
-    pub token: koharu_llama::token::LlamaToken,
-    pub piece: &'a str,
-    pub text: &'a str,
-    pub generated_tokens: usize,
-}
-
-/// A schema-constrained generation and its deserialized value.
-#[derive(Debug, Clone)]
-pub struct StructuredGeneration<T> {
-    pub value: T,
-    pub generation: Generation,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -362,8 +275,6 @@ pub enum ChatRole {
     User,
     Assistant,
     Tool,
-    /// A model-specific role name used by specialized translation templates.
-    Named(String),
 }
 
 impl ChatRole {
@@ -374,24 +285,6 @@ impl ChatRole {
             Self::User => "user",
             Self::Assistant => "assistant",
             Self::Tool => "tool",
-            Self::Named(name) => name,
-        }
-    }
-}
-
-/// Options controlling GGUF chat-template application.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ChatTemplateOptions {
-    pub add_generation_prompt: bool,
-    /// Exposes the standard `enable_thinking` variable to compatible templates.
-    pub enable_thinking: bool,
-}
-
-impl Default for ChatTemplateOptions {
-    fn default() -> Self {
-        Self {
-            add_generation_prompt: true,
-            enable_thinking: false,
         }
     }
 }
@@ -408,19 +301,6 @@ fn rate(tokens: usize, duration: Duration) -> f64 {
 mod tests {
     use super::*;
 
-    #[derive(Debug, Deserialize, JsonSchema, PartialEq, Eq)]
-    struct ExampleOutput {
-        translated: String,
-    }
-
-    #[test]
-    fn generated_schema_round_trips_structured_type() {
-        let schema = serde_json::to_value(schemars::schema_for!(ExampleOutput)).unwrap();
-        assert_eq!(schema["type"], "object");
-        let value: ExampleOutput = serde_json::from_str(r#"{"translated":"hello"}"#).unwrap();
-        assert_eq!(value.translated, "hello");
-    }
-
     #[test]
     fn mtmd_defaults_to_projector_token_budget() {
         let options = MtmdOptions::new("projector.gguf");
@@ -431,11 +311,5 @@ mod tests {
     #[test]
     fn load_options_do_not_override_eos_by_default() {
         assert_eq!(LoadOptions::default().eos_token_id, None);
-    }
-
-    #[test]
-    fn named_chat_roles_preserve_model_specific_names() {
-        let role = ChatRole::Named("Japanese".to_owned());
-        assert_eq!(role.as_str(), "Japanese");
     }
 }

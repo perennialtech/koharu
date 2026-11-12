@@ -9,7 +9,7 @@ use specta::Type;
 
 use crate::{ProgressSink, Scope, Stage};
 use koharu_scene::EntityId;
-use koharu_translator::Language;
+use koharu_translator::{Language, Provider};
 
 #[derive(Clone, Debug)]
 pub struct InpaintingMask {
@@ -66,7 +66,10 @@ impl Operation {
 #[derive(Clone, Debug)]
 pub struct RequestTranslation {
     pub target_language: Language,
+    /// Optional guidance for engines that can follow it.
     pub instructions: Option<String>,
+    /// Replaces the configured engine order for this request.
+    pub engines: Option<Vec<Provider>>,
 }
 
 #[derive(Clone)]

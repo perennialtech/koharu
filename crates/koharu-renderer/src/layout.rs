@@ -370,14 +370,46 @@ impl<'a> TextLayout<'a> {
     }
 
     fn run_auto(&self, text: &str) -> Result<LayoutRun<'a>> {
-        let max_height = self.max_height.unwrap_or(f32::INFINITY);
-        let max_width = self.max_width.unwrap_or(f32::INFINITY);
         let maximum = self.max_font_size.unwrap_or(300.0).max(0.5);
         let minimum = self
             .min_font_size
             .unwrap_or(maximum.min(1.0))
             .max(0.5)
             .min(maximum);
+        if self.hyphenation_policy == HyphenationPolicy::LastResort {
+            let mut unhyphenated = self.clone();
+            unhyphenated.hyphenation_policy = HyphenationPolicy::Disabled;
+            let clean = unhyphenated.largest_fit(text, minimum, maximum)?;
+            // Avoiding a word break is no longer useful once it pins the text to
+            // the configured readability floor. Compare raster-size buckets so
+            // hyphenation must recover a visible pixel, not a tuned percentage.
+            if clean
+                .as_ref()
+                .is_some_and(|best| best.font_size.floor() > minimum.floor())
+            {
+                return Ok(clean.unwrap());
+            }
+            let hyphenated = self.largest_fit(text, minimum, maximum)?;
+            match (clean, hyphenated) {
+                (Some(clean), Some(hyphenated))
+                    if hyphenated.font_size.floor() > clean.font_size.floor() =>
+                {
+                    return Ok(hyphenated);
+                }
+                (Some(clean), _) => return Ok(clean),
+                (None, Some(hyphenated)) => return Ok(hyphenated),
+                (None, None) => {}
+            }
+        } else if let Some(best) = self.largest_fit(text, minimum, maximum)? {
+            return Ok(best);
+        }
+        self.run_with_size(text, minimum)
+    }
+
+    /// The largest size in `minimum..=maximum` whose layout fits, if any does.
+    fn largest_fit(&self, text: &str, minimum: f32, maximum: f32) -> Result<Option<LayoutRun<'a>>> {
+        let max_height = self.max_height.unwrap_or(f32::INFINITY);
+        let max_width = self.max_width.unwrap_or(f32::INFINITY);
         let fits = |layout: &LayoutRun<'_>| {
             !layout.overflowed()
                 && layout.width <= max_width + f32::EPSILON
@@ -388,61 +420,22 @@ impl<'a> TextLayout<'a> {
             // A balloon's usable width changes when the text reflows to a different
             // number of lines, so a smaller font can fail even though a larger one
             // fits. Search from largest to smallest instead of assuming monotonicity.
-            if self.hyphenation_policy == HyphenationPolicy::LastResort {
-                let mut unhyphenated = self.clone();
-                unhyphenated.hyphenation_policy = HyphenationPolicy::Disabled;
-                let clean = largest_fitting_font_size(
-                    minimum,
-                    maximum,
-                    |size| unhyphenated.run_with_size(text, size),
-                    fits,
-                )?;
-                // Avoiding a word break is no longer useful once it pins the text to
-                // the configured readability floor. Compare raster-size buckets so
-                // hyphenation must recover a visible pixel, not a tuned percentage.
-                if clean
-                    .as_ref()
-                    .is_some_and(|best| best.font_size.floor() > minimum.floor())
-                {
-                    return Ok(clean.unwrap());
-                }
-                let hyphenated = largest_fitting_font_size(
-                    minimum,
-                    maximum,
-                    |size| self.run_with_size(text, size),
-                    fits,
-                )?;
-                match (clean, hyphenated) {
-                    (Some(clean), Some(hyphenated))
-                        if hyphenated.font_size.floor() > clean.font_size.floor() =>
-                    {
-                        return Ok(hyphenated);
-                    }
-                    (Some(clean), _) => return Ok(clean),
-                    (None, Some(hyphenated)) => return Ok(hyphenated),
-                    (None, None) => {}
-                }
-            } else if let Some(best) = largest_fitting_font_size(
+            return largest_fitting_font_size(
                 minimum,
                 maximum,
                 |size| self.run_with_size(text, size),
                 fits,
-            )? {
-                return Ok(best);
-            }
-            return self.run_with_size(text, minimum);
+            );
         }
 
         let maximum_layout = self.run_with_size(text, maximum)?;
         if fits(&maximum_layout) {
-            return Ok(maximum_layout);
+            return Ok(Some(maximum_layout));
         }
-
         let mut best = self.run_with_size(text, minimum)?;
         if !fits(&best) {
-            return Ok(best);
+            return Ok(None);
         }
-
         let mut low = minimum;
         let mut high = maximum;
         let mut iterations = 0u32;
@@ -457,7 +450,7 @@ impl<'a> TextLayout<'a> {
                 high = size;
             }
         }
-        Ok(best)
+        Ok(Some(best))
     }
 
     fn run_with_size(&self, text: &str, font_size: f32) -> Result<LayoutRun<'a>> {

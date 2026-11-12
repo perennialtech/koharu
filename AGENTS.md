@@ -11,7 +11,7 @@ Document only durable, repository-specific constraints here. Do not record curre
 - Make the smallest change that solves the problem. Do not edit unrelated configuration, documentation, generated files, or workflows in the same change. A feature does not land beside drive-by cleanup.
 - If the current owner has moved, rebase onto that owner. Do not port a patch onto a deleted tree.
 - When two changes implement the same workflow, keep one and extend the existing command or configuration. Do not land both.
-- Hosted translator credentials come from `OPENROUTER_API_KEY` (required for OpenRouter) and `OPENAI_COMPATIBLE_API_KEY` (optional). Never persist credentials in the repository.
+- Translation credentials come from the environment variables `koharu-server --help` documents. Never persist credentials in the repository.
 - Once a subsystem is removed, delete its calls and dependency together. Do not leave a stub, alias, or disabled flag behind.
 
 ## Ownership
@@ -41,7 +41,8 @@ Document only durable, repository-specific constraints here. Do not record curre
 - Disable gradient tracking during inference.
 - Create generated token IDs and index tensors on the model device. A CPU tensor used against accelerator embeddings is a defect, not a later optimization.
 - Invalid model JSON fails closed. Do not add a silent repair layer that can change meaning.
-- Enforce a translation output schema through each provider's native structured-output API. A bounded retry belongs only to a provider that already has one. Hosted machine-translation providers fail immediately.
+- LLM providers enforce the translation output schema through their native structured-output API. A failing engine fails immediately, and translation moves on to the next engine in the requested order.
+- Translation instructions are optional guidance. Engines that cannot follow them ignore them.
 
 ## Upstream Alignment
 
@@ -58,6 +59,9 @@ Document only durable, repository-specific constraints here. Do not record curre
 - Account for asynchronous accelerator execution when timing work.
 - Load assets and warm models outside measured regions.
 - Report the device, input size, baseline, result, and correctness difference.
+- For manga bubble detection and inpainting, consult the
+  [hard-page evaluation repository](https://github.com/perennialtech/koharu-hard-page-eval)
+  for difficult test pages, model comparisons, and reproduction steps.
 
 ## Verification
 
@@ -67,7 +71,6 @@ Document only durable, repository-specific constraints here. Do not record curre
 - Run end-to-end tests only when the user explicitly asks for them.
 - Add a test when it protects a real regression boundary. Do not lock a translated phrase, a language display name, a registration string, or a one-line behavior the owner can read directly. Do not add a second harness for behavior the crate's existing tests already cover. Do not assert a compatibility shim.
 - A model port needs a structured comparison on identical inputs. A green build is not that comparison.
-- A green check is not acceptance. Small bug fixes, documentation, translations, and tests can be opened directly. A new product feature, significant UI change, platform integration, dependency, public API, schema change, or architectural refactor needs an issue discussion first.
 - Keep the pull-request text short: problem, change, and verification.
 
 ## Documentation

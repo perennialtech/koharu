@@ -9,7 +9,7 @@ use std::{
     fmt::{Debug, Formatter},
     num::NonZeroU32,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex, OnceLock, PoisonError},
+    sync::{Arc, Mutex},
     time::Instant,
 };
 
@@ -19,7 +19,6 @@ use koharu_llama::{
         LlamaContext,
         params::{LlamaAttentionType, LlamaContextParams},
     },
-    gguf::{self, GgufContext},
     llama_backend::LlamaBackend,
     llama_batch::LlamaBatch,
     model::{AddBos, LlamaModel, params::LlamaModelParams},
@@ -27,13 +26,9 @@ use koharu_llama::{
     sampling::LlamaSampler,
     token::LlamaToken,
 };
-use llguidance::{Matcher, ParserFactory, api::TopLevelGrammar};
 use minijinja::{Environment, Error as TemplateError, ErrorKind as TemplateErrorKind, context};
 
-use super::{
-    ChatMessage, ChatTemplateOptions, FinishReason, Generation, GenerationControl,
-    GenerationOptions, Input, LoadOptions, TokenChunk,
-};
+use super::{ChatMessage, FinishReason, Generation, GenerationOptions, Input, LoadOptions};
 use crate::Backend;
 
 const DEFAULT_MAX_UBATCH: u32 = 512;
@@ -45,7 +40,6 @@ pub(super) struct Model {
     mtmd: Option<Mutex<MtmdContext>>,
     eos_token: LlamaToken,
     chat_template: ChatTemplate,
-    llguidance_factory: OnceLock<std::result::Result<ParserFactory, String>>,
 }
 
 impl Debug for Model {
@@ -90,7 +84,7 @@ impl ChatTemplate {
         })
     }
 
-    fn render(&self, messages: &[ChatMessage], options: ChatTemplateOptions) -> Result<String> {
+    fn render(&self, messages: &[ChatMessage]) -> Result<String> {
         let messages = messages
             .iter()
             .map(|message| {
@@ -110,8 +104,8 @@ impl ChatTemplate {
                 messages => messages,
                 bos_token => self.bos_token.as_str(),
                 eos_token => self.eos_token.as_str(),
-                add_generation_prompt => options.add_generation_prompt,
-                enable_thinking => options.enable_thinking,
+                add_generation_prompt => true,
+                enable_thinking => false,
                 tools => Vec::<()>::new(),
                 documents => Vec::<()>::new(),
             })
@@ -153,9 +147,11 @@ impl Model {
             Some(options) => {
                 ensure_file(&options.projector_path, "MTMD projector")?;
                 validate_image_token_range(options.image_min_tokens, options.image_max_tokens)?;
-                let projector = vision_projector(&options.projector_path)?;
-                let projector_path = projector.to_str().with_context(|| {
-                    format!("invalid MTMD projector path {}", projector.display())
+                let projector_path = options.projector_path.to_str().with_context(|| {
+                    format!(
+                        "invalid MTMD projector path {}",
+                        options.projector_path.display()
+                    )
                 })?;
                 let mtmd = MtmdContext::init_from_file(
                     projector_path,
@@ -192,7 +188,6 @@ impl Model {
             mtmd,
             eos_token,
             chat_template,
-            llguidance_factory: OnceLock::new(),
         })
     }
 
@@ -204,147 +199,8 @@ impl Model {
         token_text(&self.model, self.eos_token).context("failed to decode model EOS token")
     }
 
-    pub(super) fn render_chat_prompt(
-        &self,
-        messages: &[ChatMessage],
-        options: ChatTemplateOptions,
-    ) -> Result<String> {
-        self.chat_template.render(messages, options)
-    }
-
-    pub(super) fn inference<F>(
-        &self,
-        input: &Input<'_>,
-        options: &GenerationOptions,
-        json_schema: Option<&serde_json::Value>,
-        mut on_token: F,
-    ) -> Result<Generation>
-    where
-        F: FnMut(TokenChunk<'_>) -> Result<GenerationControl>,
-    {
-        validate_generation_options(options)?;
-        if options.max_tokens == 0 {
-            return Ok(Generation::empty(FinishReason::Length));
-        }
-
-        let mtmd = if input.images().is_empty() {
-            None
-        } else {
-            Some(
-                self.mtmd
-                    .as_ref()
-                    .context("image input requires an MTMD projector")?
-                    .lock()
-                    .map_err(|_| anyhow::anyhow!("MTMD projector lock is poisoned"))?,
-            )
-        };
-        let prepared = self.prepare_prompt(input, options.add_special, mtmd.as_deref())?;
-        let context_config = context_config(&prepared, options)?;
-        let mut context = self
-            .model
-            .new_context(self.backend, context_config.params)
-            .context("failed to create llama.cpp context")?;
-        let (mut sampler, grammar) =
-            self.build_sampler(options, json_schema, &prepared.history_tokens)?;
-
-        let prompt_start = Instant::now();
-        let (mut next_token, mut position) = self.prefill(
-            &prepared,
-            mtmd.as_deref(),
-            &mut context,
-            &mut sampler,
-            context_config.n_batch,
-            0,
-        )?;
-        let prompt_duration = prompt_start.elapsed();
-        drop(mtmd);
-
-        let generation_start = Instant::now();
-        let mut decoder = encoding_rs::UTF_8.new_decoder();
-        let mut text = String::new();
-        let mut generated_tokens = 0;
-        let mut finish_reason = FinishReason::Length;
-
-        let n_batch =
-            usize::try_from(context_config.n_batch).context("batch size exceeds usize")?;
-        let mut pending = Vec::with_capacity(n_batch);
-        'generation: while generated_tokens < options.max_tokens {
-            // llguidance fast-forward: tokens the grammar forces after the sampled
-            // one are decoded in the same batch instead of one decode per token.
-            // A forced token is the only unmasked candidate, so sampling it would
-            // select it anyway; it is accepted into the chain to keep penalties and
-            // the matcher in step.
-            pending.clear();
-            pending.push(next_token);
-            if let Some(grammar) = &grammar {
-                let forced = grammar
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .compute_ff_tokens();
-                for token in forced.into_iter().take(n_batch - 1) {
-                    let token = LlamaToken::new(token.cast_signed());
-                    sampler.accept(token);
-                    pending.push(token);
-                }
-            }
-
-            for &token in &pending {
-                if self.should_stop(token) {
-                    finish_reason = FinishReason::StopToken;
-                    break 'generation;
-                }
-                let piece = self
-                    .model
-                    .token_to_piece(token, &mut decoder, true, None)
-                    .context("failed to decode generated token")?;
-                text.push_str(&piece);
-                generated_tokens += 1;
-
-                if matches!(
-                    on_token(TokenChunk {
-                        token,
-                        piece: &piece,
-                        text: &text,
-                        generated_tokens,
-                    })?,
-                    GenerationControl::Stop
-                ) {
-                    finish_reason = FinishReason::Callback;
-                    break 'generation;
-                }
-                if generated_tokens >= options.max_tokens {
-                    break 'generation;
-                }
-            }
-
-            let mut batch = LlamaBatch::new(pending.len(), 1);
-            let last = pending.len() - 1;
-            for (offset, &token) in pending.iter().enumerate() {
-                let token_position = position
-                    .checked_add(i32::try_from(offset).context("batch offset exceeds i32")?)
-                    .context("generated position exceeds i32")?;
-                batch
-                    .add(token, token_position, &[0], offset == last)
-                    .context("failed to build generated-token batch")?;
-            }
-            context
-                .decode(&mut batch)
-                .context("failed to decode generated token")?;
-            position = position
-                .checked_add(i32::try_from(pending.len()).context("batch size exceeds i32")?)
-                .context("generated position exceeds i32")?;
-            // llama_sampler_sample applies the chain and accepts the selected token.
-            next_token = sampler.sample(&context, -1);
-        }
-
-        Ok(Generation {
-            text,
-            prompt_tokens: prepared.prompt_tokens,
-            generated_tokens,
-            prompt_duration,
-            generation_duration: generation_start.elapsed(),
-            finish_reason,
-        })
+    pub(super) fn render_chat_prompt(&self, messages: &[ChatMessage]) -> Result<String> {
+        self.chat_template.render(messages)
     }
 
     /// Generates unconstrained text for several inputs in one context.
@@ -400,7 +256,7 @@ impl Model {
         }
         let mut sequences = Vec::with_capacity(prepared.len());
         for (index, prepared) in prepared.iter().enumerate() {
-            let (mut sampler, _) = self.build_sampler(options, None, &prepared.history_tokens)?;
+            let mut sampler = self.build_sampler(options, &prepared.history_tokens);
             let prompt_start = Instant::now();
             let (next_token, position) = self.prefill(
                 prepared,
@@ -643,43 +499,9 @@ impl Model {
     fn build_sampler(
         &self,
         options: &GenerationOptions,
-        json_schema: Option<&serde_json::Value>,
         history_tokens: &[LlamaToken],
-    ) -> Result<(LlamaSampler, Option<Arc<Mutex<Matcher>>>)> {
+    ) -> LlamaSampler {
         let mut samplers = Vec::new();
-        let mut grammar = None;
-
-        if let Some(schema) = json_schema {
-            let mut schema = schema.clone();
-            if let Some(schema) = schema.as_object_mut() {
-                schema.entry("x-guidance").or_insert_with(|| {
-                    serde_json::json!({
-                        "item_separator": ", ",
-                        "key_separator": ": ",
-                        "whitespace_flexible": false
-                    })
-                });
-            }
-            let schema = serde_json::to_string(&schema)
-                .context("failed to serialize structured output schema")?;
-            let factory = self
-                .llguidance_factory
-                .get_or_init(|| {
-                    let tok_env = LlamaSampler::llguidance_tok_env(&self.model);
-                    ParserFactory::new_simple(&tok_env).map_err(|error| error.to_string())
-                })
-                .as_ref()
-                .map_err(|error| anyhow::Error::msg(error.clone()))
-                .context("failed to initialize structured output tokenizer")?;
-            let schema = TopLevelGrammar::from_tagged_str("json_schema", &schema)
-                .context("failed to compile structured output schema")?;
-            let parser = factory
-                .create_parser(schema)
-                .context("failed to create structured output parser")?;
-            let matcher = Arc::new(Mutex::new(Matcher::new(Ok(parser))));
-            samplers.push(LlamaSampler::from(Arc::clone(&matcher)));
-            grammar = Some(matcher);
-        }
 
         let has_repeat =
             (options.repeat_penalty - 1.0).abs() >= f32::EPSILON && options.repeat_last_n != 0;
@@ -702,7 +524,7 @@ impl Model {
 
         if options.temperature <= 0.0 {
             samplers.push(LlamaSampler::greedy());
-            return Ok((LlamaSampler::chain_simple(samplers), grammar));
+            return LlamaSampler::chain_simple(samplers);
         }
         if let Some(top_k) = options.top_k.filter(|value| *value > 0) {
             samplers.push(LlamaSampler::top_k(
@@ -717,7 +539,7 @@ impl Model {
         }
         samplers.push(LlamaSampler::temp(options.temperature));
         samplers.push(LlamaSampler::dist(options.seed));
-        Ok((LlamaSampler::chain_simple(samplers), grammar))
+        LlamaSampler::chain_simple(samplers)
     }
 
     fn should_stop(&self, token: LlamaToken) -> bool {
@@ -766,31 +588,6 @@ fn model_params(
             .context("failed to select llama.cpp accelerator")?;
     }
     Ok(params)
-}
-
-fn context_config(prepared: &PreparedPrompt, options: &GenerationOptions) -> Result<ContextConfig> {
-    let values = context_values(prepared, options)?;
-    // Generation reads logits for only the last token of each decode, so the
-    // compute buffer needs one output row instead of one per batch token; for
-    // a 262k-token vocabulary that is about 1 MiB per row.
-    let mut params = LlamaContextParams::default()
-        .with_n_ctx(Some(values.n_ctx))
-        .with_n_batch(values.n_batch)
-        .with_n_ubatch(values.n_ubatch)
-        .with_n_outputs_max(1);
-    if prepared.non_causal {
-        params = params.with_attention_type(LlamaAttentionType::NonCausal);
-    }
-    if let Some(n_threads) = options.n_threads {
-        params = params.with_n_threads(n_threads);
-    }
-    if let Some(n_threads_batch) = options.n_threads_batch {
-        params = params.with_n_threads_batch(n_threads_batch);
-    }
-    Ok(ContextConfig {
-        params,
-        n_batch: values.n_batch,
-    })
 }
 
 /// Context for [`Model::inference_batch`]: one KV stream per sequence, each
@@ -847,7 +644,6 @@ fn batch_context_config(
 struct ContextValues {
     n_ctx: NonZeroU32,
     n_batch: u32,
-    n_ubatch: u32,
 }
 
 fn context_values(prepared: &PreparedPrompt, options: &GenerationOptions) -> Result<ContextValues> {
@@ -878,22 +674,7 @@ fn context_values(prepared: &PreparedPrompt, options: &GenerationOptions) -> Res
         n_batch >= required_batch,
         "n_batch is too small: need at least {required_batch} tokens"
     );
-    let n_ubatch = if prepared.non_causal {
-        n_batch
-    } else {
-        let n_ubatch = options
-            .n_ubatch
-            .unwrap_or_else(|| n_batch.min(DEFAULT_MAX_UBATCH))
-            .max(1);
-        ensure!(n_ubatch <= n_batch, "n_ubatch must not exceed n_batch");
-        n_ubatch
-    };
-
-    Ok(ContextValues {
-        n_ctx,
-        n_batch,
-        n_ubatch,
-    })
+    Ok(ContextValues { n_ctx, n_batch })
 }
 
 fn validate_generation_options(options: &GenerationOptions) -> Result<()> {
@@ -965,48 +746,6 @@ fn token_text(model: &LlamaModel, token: LlamaToken) -> Result<String> {
         .map_err(Into::into)
 }
 
-/// Returns a projector that carries only its vision encoder.
-///
-/// llama.cpp loads every encoder in an MTMD projector onto the device, and
-/// Gemma 4 E-series projectors also carry an audio encoder that Koharu never
-/// uses. Its weights and compute buffer cost hundreds of MiB of VRAM, so such a
-/// projector is loaded from a vision-only copy derived next to it. Tensor and
-/// key names follow llama.cpp's MTMD loader:
-/// https://github.com/ggml-org/llama.cpp/blob/b11642/tools/mtmd/clip-impl.h
-fn vision_projector(path: &Path) -> Result<PathBuf> {
-    const AUDIO_ENCODER: &str = "clip.has_audio_encoder";
-    let metadata = GgufContext::from_file(path)
-        .with_context(|| format!("failed to read MTMD projector {}", path.display()))?;
-    let key = metadata.find_key(AUDIO_ENCODER);
-    if key < 0 || !metadata.val_bool(key) {
-        return Ok(path.to_owned());
-    }
-    drop(metadata);
-
-    let vision = path.with_extension("vision.gguf");
-    if vision.is_file() {
-        return Ok(vision);
-    }
-    let file_name = vision
-        .file_name()
-        .context("MTMD projector has no file name")?
-        .to_string_lossy();
-    let pending = vision.with_file_name(format!(".{file_name}.{}.tmp", std::process::id()));
-    let written = gguf::write_subset(
-        path,
-        &pending,
-        |name| !name.starts_with("a.") && !name.starts_with("mm.a."),
-        &[(AUDIO_ENCODER, false)],
-    )
-    .and_then(|()| std::fs::rename(&pending, &vision));
-    if let Err(error) = written {
-        let _ = std::fs::remove_file(&pending);
-        return Err(error)
-            .with_context(|| format!("failed to derive vision projector {}", vision.display()));
-    }
-    Ok(vision)
-}
-
 fn ensure_file(path: &Path, description: &str) -> Result<()> {
     ensure!(
         path.exists(),
@@ -1045,7 +784,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn chat_template_preserves_messages_and_options() {
+    fn chat_template_preserves_messages() {
         let mut environment = Environment::new();
         minijinja_contrib::add_to_environment(&mut environment);
         environment
@@ -1061,28 +800,10 @@ mod tests {
             bos_token: "<s>".to_owned(),
             eos_token: "</s>".to_owned(),
         };
-        let messages = [
-            ChatMessage::system(" Translate "),
-            ChatMessage::user("こんにちは"),
-        ];
 
         assert_eq!(
-            template
-                .render(&messages, ChatTemplateOptions::default())
-                .unwrap(),
-            "<s>SYSTEM:Translate;USER:こんにちは;</s>|True|False|0|0"
-        );
-        assert_eq!(
-            template
-                .render(
-                    &[],
-                    ChatTemplateOptions {
-                        add_generation_prompt: false,
-                        enable_thinking: true,
-                    },
-                )
-                .unwrap(),
-            "<s></s>|False|True|0|0"
+            template.render(&[ChatMessage::user(" OCR: ")]).unwrap(),
+            "<s>USER:OCR:;</s>|True|False|0|0"
         );
     }
 
@@ -1117,19 +838,5 @@ mod tests {
             ..Default::default()
         };
         assert!(context_values(&prepared(5, false), &options).is_err());
-    }
-
-    #[test]
-    fn non_causal_context_uses_full_ubatch() {
-        let config = context_values(
-            &prepared(1024, true),
-            &GenerationOptions {
-                max_tokens: 1,
-                n_ubatch: Some(32),
-                ..Default::default()
-            },
-        )
-        .unwrap();
-        assert_eq!(config.n_ubatch, 1024);
     }
 }
