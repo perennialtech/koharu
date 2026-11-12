@@ -747,6 +747,7 @@ impl Traversal<'_> {
         let typography = self.snapshot.component::<Typography>(entity)?;
         let mut analysis = None;
         let mut source_font_size = None;
+        let mut source_bounds = None;
         if let Some(recognized) = self.snapshot.relation_from::<RecognizedFrom>(content)? {
             let region = recognized.value().target;
             dependencies.insert(RenderDependency::Relation(recognized.id()));
@@ -755,17 +756,19 @@ impl Traversal<'_> {
             dependencies.insert(component_dependency::<Geometry>(region));
             dependencies.insert(component_dependency::<SourceText>(content));
             analysis = self.snapshot.component::<OcrAnalysis>(region)?;
+            source_bounds = self
+                .snapshot
+                .component::<Geometry>(region)?
+                .and_then(|geometry| geometry_frame(&geometry, None))
+                .map(|frame| frame.bounds);
             source_font_size = self
                 .snapshot
                 .component::<SourceText>(content)?
-                .zip(
-                    self.snapshot
-                        .component::<Geometry>(region)?
-                        .and_then(|geometry| geometry_frame(&geometry, None)),
-                )
-                .and_then(|(source, frame)| source_glyph_size(&source.text.value, frame.bounds));
+                .zip(source_bounds)
+                .and_then(|(source, bounds)| source_glyph_size(&source.text.value, bounds));
         }
         let authored = self.snapshot.component::<Geometry>(entity)?;
+        let is_authored = authored.is_some();
         let placement = if let Some(placement) = self.balloon_flows.get(&entity) {
             dependencies.extend(placement.dependencies.iter().cloned());
             Some(placement.clone())
@@ -809,6 +812,29 @@ impl Traversal<'_> {
             dependencies.insert(RenderDependency::Font(family.clone()));
         }
         let is_bubble = balloon_contour.is_some();
+        // A box the user drew is theirs to fill; only an automatic free text
+        // placement is held to the area of the lettering it replaces.
+        let source_area = source_bounds
+            .filter(|_| !is_bubble && !is_authored)
+            .map(|bounds| bounds.width * bounds.height);
+        let foreground_color = typography
+            .as_ref()
+            .and_then(|value| value.color)
+            .unwrap_or([0, 0, 0, 255]);
+        let stroke = resolve_stroke(typography.as_ref()).or_else(|| {
+            // Free text spreads past the lettering it replaces, onto artwork
+            // the source never had to stand out against, so lettering without
+            // an outline gets one in the contrasting color. On the background
+            // the source did stand on, that outline is invisible. An outline
+            // the user removed stays removed.
+            let user = typography
+                .as_ref()
+                .is_some_and(|value| matches!(value.origin, Origin::User));
+            (!is_bubble && !user)
+                .then_some(source_font_size)
+                .flatten()
+                .map(|size| contrast_outline(foreground_color, size))
+        });
         let descriptor = TextNodeDescriptor {
             entity,
             text: text.clone(),
@@ -825,15 +851,13 @@ impl Traversal<'_> {
                 .map(Into::into),
             font_size: typography.as_ref().and_then(|value| value.size),
             source_font_size,
+            source_area,
             minimum_font_size: readable_font_size(self.width, self.height),
             auto_fit: typography.as_ref().is_none_or(|value| value.auto_fit),
             alignment,
             writing_mode,
-            foreground_color: typography
-                .as_ref()
-                .and_then(|value| value.color)
-                .unwrap_or([0, 0, 0, 255]),
-            stroke: resolve_stroke(typography.as_ref()),
+            foreground_color,
+            stroke,
             line_height: 1.2,
             letter_spacing: 0.0,
             word_spacing: 0.0,
@@ -1647,6 +1671,21 @@ fn resolve_alignment(
         TextAlignment::End if rtl => TextAlign::Left,
         TextAlignment::End => TextAlign::Right,
         TextAlignment::Justify => TextAlign::Justify,
+    }
+}
+
+/// An outline a tenth of the source em wide, about what detection measures on
+/// outlined manga lettering, in white or black opposite the fill.
+fn contrast_outline(fill: [u8; 4], source_font_size: f32) -> StrokeOptions {
+    let [red, green, blue, _] = fill.map(f32::from);
+    let luma = 0.299 * red + 0.587 * green + 0.114 * blue;
+    StrokeOptions {
+        color: if luma < 128.0 {
+            [u8::MAX; 4]
+        } else {
+            [0, 0, 0, u8::MAX]
+        },
+        width_px: source_font_size * 0.1,
     }
 }
 

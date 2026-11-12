@@ -14,6 +14,7 @@ use crate::{
     Result as RenderResult, TextAlign, TextLayout, WritingMode,
     bubble::LayoutBox,
     fonts::{Fonts, font_key},
+    layout::largest_fitting_font_size,
     script::is_chinese_or_japanese_text,
 };
 
@@ -32,6 +33,10 @@ pub(crate) struct TextNodeDescriptor {
     pub(crate) font_size: Option<f32>,
     /// Em size of the lettering this text replaces, when it is known.
     pub(crate) source_font_size: Option<f32>,
+    /// Area of the lettering free text replaces, when it is known. The
+    /// translation is set no larger than this so it carries the visual weight
+    /// of the source rather than of the room around it.
+    pub(crate) source_area: Option<f32>,
     pub(crate) minimum_font_size: f32,
     pub(crate) auto_fit: bool,
     pub(crate) alignment: TextAlign,
@@ -240,7 +245,13 @@ impl TextRenderer {
         } else {
             layout.with_font_size(descriptor.font_size.unwrap_or(maximum))
         };
-        let mut run = self.layout(&layout, &descriptor.text);
+        let budgeted = descriptor
+            .source_area
+            .filter(|_| !is_bubble_text && descriptor.auto_fit && !descriptor.point_text)
+            .and_then(|area| {
+                self.budgeted_layout(&layout, &descriptor.text, bounds, area, [minimum, maximum])
+            });
+        let mut run = budgeted.map_or_else(|| self.layout(&layout, &descriptor.text), Ok);
         // Free text that cannot fit at the readable size would spill onto
         // neighbouring text, which leaves both unreadable. Shrinking it keeps
         // the rest of the page legible; the diagnostic still reports it.
@@ -343,6 +354,66 @@ impl TextRenderer {
             },
             diagnostics,
         })
+    }
+}
+
+impl TextRenderer {
+    /// Lays free text out so its block covers at most `area` inside `bounds`,
+    /// the room it may move into. Wrap widths from the narrowest that
+    /// `bounds` allows to its full width each get the largest size whose
+    /// block fits the area, and the largest of those wins; among sizes less
+    /// than a pixel apart, the narrowest wrap wins. The block area is
+    /// measured on the laid-out lines, so a short phrase can take one line
+    /// while a long one stays a block of the source's size. Words are broken
+    /// only when no wrap fits whole words. Returns `None` when `bounds` is no
+    /// larger than `area` or nothing fits at `minimum`.
+    fn budgeted_layout<'a>(
+        &self,
+        layout: &TextLayout<'a>,
+        text: &str,
+        bounds: LayoutBox,
+        area: f32,
+        [minimum, maximum]: [f32; 2],
+    ) -> Option<LayoutRun<'a>> {
+        const STEPS: u8 = 8;
+        let narrowest = area / bounds.height;
+        if narrowest >= bounds.width {
+            return None;
+        }
+        let ratio = bounds.width / narrowest;
+        let widths =
+            (0..=STEPS).map(|step| narrowest * ratio.powf(f32::from(step) / f32::from(STEPS)));
+        let fit = |layout: &TextLayout<'a>| {
+            let mut best: Option<LayoutRun<'a>> = None;
+            for width in widths.clone() {
+                let wrapped = layout.clone().with_max_width(width);
+                let fits = |run: &LayoutRun<'_>| {
+                    !run.overflowed()
+                        && run.width <= width
+                        && run.height <= bounds.height
+                        && run.width * run.height <= area
+                };
+                let Ok(Some(run)) = largest_fitting_font_size(
+                    minimum,
+                    maximum,
+                    |size| self.layout(&wrapped.clone().with_font_size(size), text),
+                    fits,
+                ) else {
+                    continue;
+                };
+                if best
+                    .as_ref()
+                    .is_none_or(|best| run.font_size.floor() > best.font_size.floor())
+                {
+                    best = Some(run);
+                }
+            }
+            best
+        };
+        fit(&layout
+            .clone()
+            .with_hyphenation_policy(HyphenationPolicy::Disabled))
+        .or_else(|| fit(layout))
     }
 }
 
@@ -488,6 +559,7 @@ mod tests {
             font_style: None,
             font_size: Some(6.0),
             source_font_size: None,
+            source_area: None,
             minimum_font_size: 9.0,
             auto_fit: true,
             alignment: TextAlign::Center,
@@ -511,6 +583,34 @@ mod tests {
         assert_eq!(automatic_maximum(&descriptor, bounds, true), 240.0);
         descriptor.source_font_size = Some(80.0);
         assert_eq!(automatic_maximum(&descriptor, bounds, false), 80.0);
+    }
+
+    #[test]
+    fn free_text_in_a_wide_room_keeps_the_area_of_its_source() {
+        let font = FontSystem::new().first_font().unwrap();
+        let layout = TextLayout::new(&font)
+            .with_max_width(1000.0)
+            .with_max_height(1000.0)
+            .with_max_font_size(200.0)
+            .with_min_font_size(9.0);
+        let text = "I'm looking after this temple while the head priest is away.";
+        let bounds = LayoutBox {
+            x: 0.0,
+            y: 0.0,
+            width: 1000.0,
+            height: 1000.0,
+        };
+        let area = 250.0 * 1000.0;
+        let renderer = TextRenderer::new();
+
+        let room = renderer.layout(&layout, text).unwrap();
+        let budgeted = renderer
+            .budgeted_layout(&layout, text, bounds, area, [9.0, 200.0])
+            .unwrap();
+
+        assert!(room.width * room.height > area);
+        assert!(budgeted.width * budgeted.height <= area);
+        assert!(budgeted.font_size >= 9.0);
     }
 
     #[test]
