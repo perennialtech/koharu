@@ -3,7 +3,7 @@
 //! https://github.com/huggingface/transformers/blob/v4.57.6/src/transformers/models/rt_detr/image_processing_rt_detr.py
 
 use anyhow::{Result, anyhow, ensure};
-use fast_image_resize::{FilterType, ResizeAlg, ResizeOptions, Resizer};
+use fast_image_resize::{FilterType, ResizeAlg, ResizeOptions, pixels::U8x3};
 use image::{DynamicImage, RgbImage};
 use koharu_torch::{Device, IndexOp, Kind, Tensor};
 use serde::Serialize;
@@ -51,13 +51,12 @@ pub(super) fn preprocess(image: &DynamicImage, device: Device) -> Result<Tensor>
     );
     let image = image.to_rgb8();
     let mut resized = RgbImage::new(SIZE, SIZE);
-    Resizer::new()
-        .resize(
-            &image,
-            &mut resized,
-            &ResizeOptions::new().resize_alg(ResizeAlg::Convolution(FilterType::Bilinear)),
-        )
-        .map_err(|error| anyhow!("failed to resize image for bubble detection: {error}"))?;
+    crate::resize_image::<U8x3>(
+        &image,
+        &mut resized,
+        &ResizeOptions::new().resize_alg(ResizeAlg::Convolution(FilterType::Bilinear)),
+    )
+    .map_err(|error| anyhow!("failed to resize image for bubble detection: {error}"))?;
     Ok(Tensor::from_slice(resized.as_raw())
         .view([1, i64::from(SIZE), i64::from(SIZE), 3])
         .permute([0, 3, 1, 2])

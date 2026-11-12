@@ -5,7 +5,10 @@
 //! https://github.com/Sanster/IOPaint/blob/61a759fb3f332bacdce8b2813f4837495c9b86e0/iopaint/helper.py#L187-L267
 
 use anyhow::{Context, Result, anyhow, ensure};
-use fast_image_resize::{FilterType, ResizeAlg, ResizeOptions, Resizer};
+use fast_image_resize::{
+    FilterType, ResizeAlg, ResizeOptions,
+    pixels::{U8, U8x3},
+};
 use image::{DynamicImage, GrayImage, RgbImage};
 use imageproc::contours::{BorderType, find_contours_with_threshold};
 use koharu_torch::{Device, Kind, Tensor};
@@ -154,25 +157,23 @@ fn resize_dimensions(width: u32, height: u32, size_limit: u32) -> (u32, u32) {
 
 fn resize_rgb(image: &RgbImage, width: u32, height: u32) -> Result<RgbImage> {
     let mut output = RgbImage::new(width, height);
-    Resizer::new()
-        .resize(
-            image,
-            &mut output,
-            &ResizeOptions::new().resize_alg(ResizeAlg::Convolution(FilterType::CatmullRom)),
-        )
-        .map_err(|error| anyhow!("failed to resize LaMa RGB image: {error}"))?;
+    crate::resize_image::<U8x3>(
+        image,
+        &mut output,
+        &ResizeOptions::new().resize_alg(ResizeAlg::Convolution(FilterType::CatmullRom)),
+    )
+    .map_err(|error| anyhow!("failed to resize LaMa RGB image: {error}"))?;
     Ok(output)
 }
 
 fn resize_gray(image: &GrayImage, width: u32, height: u32) -> Result<GrayImage> {
     let mut output = GrayImage::new(width, height);
-    Resizer::new()
-        .resize(
-            image,
-            &mut output,
-            &ResizeOptions::new().resize_alg(ResizeAlg::Convolution(FilterType::CatmullRom)),
-        )
-        .map_err(|error| anyhow!("failed to resize LaMa mask: {error}"))?;
+    crate::resize_image::<U8>(
+        image,
+        &mut output,
+        &ResizeOptions::new().resize_alg(ResizeAlg::Convolution(FilterType::CatmullRom)),
+    )
+    .map_err(|error| anyhow!("failed to resize LaMa mask: {error}"))?;
     Ok(output)
 }
 

@@ -3,7 +3,7 @@
 //! https://github.com/huggingface/diffusers/blob/a37f6f8394ac2a7ee8360c3abea811efe54512b1/src/diffusers/pipelines/flux2/image_processor.py
 
 use anyhow::{Result, ensure};
-use fast_image_resize::{FilterType, ResizeAlg, ResizeOptions, Resizer};
+use fast_image_resize::{FilterType, ResizeAlg, ResizeOptions, pixels::U8x3};
 use image::{DynamicImage, GrayImage, Luma, RgbImage};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -75,15 +75,14 @@ impl Flux2ImageProcessor {
         let height = (f64::from(image.height()) * scale).floor().max(1.0) as u32;
         let source = image.to_rgb8();
         let mut resized = RgbImage::new(width, height);
-        Resizer::new()
-            .resize(
-                &source,
-                &mut resized,
-                &ResizeOptions::new()
-                    .resize_alg(ResizeAlg::Convolution(FilterType::Lanczos3))
-                    .use_alpha(false),
-            )
-            .expect("source and destination images have the same pixel type");
+        crate::resize_image::<U8x3>(
+            &source,
+            &mut resized,
+            &ResizeOptions::new()
+                .resize_alg(ResizeAlg::Convolution(FilterType::Lanczos3))
+                .use_alpha(false),
+        )
+        .expect("source and destination images have the same pixel type");
         DynamicImage::ImageRgb8(resized)
     }
 
@@ -177,15 +176,14 @@ impl Flux2ImageProcessor {
         };
         let source = image.to_rgb8();
         let mut resized = RgbImage::new(resized_width, resized_height);
-        Resizer::new()
-            .resize(
-                &source,
-                &mut resized,
-                &ResizeOptions::new()
-                    .resize_alg(ResizeAlg::Convolution(FilterType::Lanczos3))
-                    .use_alpha(false),
-            )
-            .expect("source and destination images have the same pixel type");
+        crate::resize_image::<U8x3>(
+            &source,
+            &mut resized,
+            &ResizeOptions::new()
+                .resize_alg(ResizeAlg::Convolution(FilterType::Lanczos3))
+                .use_alpha(false),
+        )
+        .expect("source and destination images have the same pixel type");
         let mut output = RgbImage::new(width, height);
         image::imageops::overlay(
             &mut output,
