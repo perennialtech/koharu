@@ -33,13 +33,7 @@ async fn stop_is_a_successful_partial_result() {
 #[tokio::test]
 async fn stop_after_a_page_keeps_completed_progress() {
     let translation = TranslationConfig {
-        model: koharu_translator::ModelSelection {
-            provider: koharu_translator::Provider::OpenAiCompatible,
-            model: Some("gpt-5.6-luna".to_owned()),
-            quantization: None,
-            vision: true,
-            reasoning: true,
-        },
+        engines: vec![koharu_translator::Provider::OpenAiCompatible],
         ..Default::default()
     };
     let pipeline = pipeline(translation);

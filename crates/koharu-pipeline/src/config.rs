@@ -1,5 +1,5 @@
 use anyhow::Result;
-use koharu_translator::{GenerationConfig, Language};
+use koharu_translator::{GenerationConfig, Language, Provider};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use specta::Type;
 
@@ -155,7 +155,8 @@ impl Default for PipelineConfig {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Type)]
 pub struct TranslationConfig {
-    pub model: koharu_translator::ModelSelection,
+    /// Engines to try in order until one returns a complete translation.
+    pub engines: Vec<Provider>,
     pub generation: GenerationConfig,
     #[specta(type = String)]
     pub target_language: Language,
@@ -165,7 +166,7 @@ pub struct TranslationConfig {
 impl Default for TranslationConfig {
     fn default() -> Self {
         Self {
-            model: koharu_translator::ModelSelection::default(),
+            engines: vec![Provider::GoogleWeb, Provider::MicrosoftEdge],
             generation: GenerationConfig::default(),
             target_language: Language::English,
             instructions: None,

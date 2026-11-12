@@ -1,9 +1,9 @@
-use std::sync::Arc;
+use std::{borrow::Cow, sync::Arc};
 
 use axum::{
     Json, Router,
     body::Bytes,
-    extract::{DefaultBodyLimit, Multipart, Path, State, multipart::MultipartRejection},
+    extract::{DefaultBodyLimit, FromRef, Multipart, Path, State, multipart::MultipartRejection},
     http::{StatusCode, header},
     response::{
         IntoResponse, Response, Sse,
@@ -12,7 +12,7 @@ use axum::{
     routing::{get, post},
 };
 use futures::{Stream, stream};
-use koharu_translator::Language;
+use koharu_translator::{Language, Provider, ProvidersConfig};
 use serde::Serialize;
 use utoipa::{OpenApi, ToSchema};
 use utoipa_swagger_ui::SwaggerUi;
@@ -20,18 +20,41 @@ use utoipa_swagger_ui::SwaggerUi;
 use crate::jobs::{Input, Job, Jobs, Translation};
 
 #[derive(OpenApi)]
-#[openapi(paths(submit, status, events, cancel, result))]
+#[openapi(paths(translators, submit, status, events, cancel, result))]
 struct Api;
 
-pub(crate) fn router(jobs: Jobs) -> Router {
+/// Translation engines this server can call and the order it uses by default.
+#[derive(Clone)]
+pub(crate) struct Engines {
+    pub(crate) providers: ProvidersConfig,
+    pub(crate) default: Vec<Provider>,
+}
+
+#[derive(Clone)]
+struct AppState {
+    jobs: Jobs,
+    engines: Arc<Engines>,
+}
+
+impl FromRef<AppState> for Jobs {
+    fn from_ref(state: &AppState) -> Self {
+        state.jobs.clone()
+    }
+}
+
+pub(crate) fn router(jobs: Jobs, engines: Engines) -> Router {
     Router::new()
+        .route("/translators", get(translators))
         .route("/translations", post(submit))
         .route("/translations/{id}", get(status))
         .route("/translations/{id}/events", get(events))
         .route("/translations/{id}/cancel", post(cancel))
         .route("/translations/{id}/result", get(result))
         .layer(DefaultBodyLimit::disable())
-        .with_state(jobs)
+        .with_state(AppState {
+            jobs,
+            engines: Arc::new(engines),
+        })
         .merge(SwaggerUi::new("/docs").url("/openapi.json", Api::openapi()))
 }
 
@@ -43,8 +66,14 @@ struct Upload {
     /// Language tag or name. Defaults to English.
     #[schema(value_type = Option<String>, example = "en")]
     target_language: Option<Language>,
-    /// Additional translation guidance.
+    /// Optional guidance for engines that can follow it, such as LLMs.
+    /// Machine-translation engines ignore it.
     instructions: Option<String>,
+    /// Engine to try, by provider name from `GET /translators`. Repeat the
+    /// field to fail over in order. Defaults to the server's order. LLM
+    /// engines use the model the server configures.
+    #[schema(value_type = Option<Vec<String>>, example = json!(["google-web", "microsoft-edge"]))]
+    translator: Vec<Provider>,
 }
 
 impl Upload {
@@ -52,6 +81,7 @@ impl Upload {
         let mut image = None;
         let mut target_language = None;
         let mut instructions = None;
+        let mut translator = Vec::new();
         while let Some(field) = multipart
             .next_field()
             .await
@@ -69,15 +99,24 @@ impl Upload {
                             .map_err(|_| ApiError::MULTIPART)?
                             .parse()
                             .map_err(|_| {
-                                ApiError(StatusCode::BAD_REQUEST, "Unknown target language")
+                                ApiError::new(StatusCode::BAD_REQUEST, "Unknown target language")
                             })?,
                     );
                 }
                 Some("instructions") if instructions.is_none() => {
                     instructions = Some(field.text().await.map_err(|_| ApiError::MULTIPART)?);
                 }
+                Some("translator") => {
+                    let value = field.text().await.map_err(|_| ApiError::MULTIPART)?;
+                    translator.push(value.trim().parse().map_err(|_| {
+                        ApiError::new(
+                            StatusCode::BAD_REQUEST,
+                            format!("Unknown translator '{value}'"),
+                        )
+                    })?);
+                }
                 _ => {
-                    return Err(ApiError(
+                    return Err(ApiError::new(
                         StatusCode::BAD_REQUEST,
                         "Unexpected or repeated multipart field",
                     ));
@@ -85,13 +124,23 @@ impl Upload {
             }
         }
         Ok(Self {
-            image: image.ok_or(ApiError(StatusCode::BAD_REQUEST, "Missing image field"))?,
+            image: image.ok_or(ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "Missing image field",
+            ))?,
             target_language,
             instructions,
+            translator,
         })
     }
 
-    fn validate(self) -> Result<Input, ApiError> {
+    fn validate(self, engines: &Engines) -> Result<Input, ApiError> {
+        for &engine in &self.translator {
+            engines
+                .providers
+                .validate(engine)
+                .map_err(|error| ApiError::new(StatusCode::BAD_REQUEST, error.to_string()))?;
+        }
         let format = image::guess_format(&self.image).map_err(|_| ApiError::IMAGE)?;
         let media_type = match format {
             image::ImageFormat::Jpeg => "image/jpeg",
@@ -108,6 +157,7 @@ impl Upload {
             height: decoded.height(),
             language: self.target_language.unwrap_or(Language::English),
             instructions: self.instructions,
+            engines: (!self.translator.is_empty()).then_some(self.translator),
         })
     }
 }
@@ -116,19 +166,29 @@ impl Upload {
 struct Problem {
     status: u16,
     title: &'static str,
-    detail: &'static str,
+    detail: Cow<'static, str>,
 }
 
 #[derive(Debug)]
-struct ApiError(StatusCode, &'static str);
+struct ApiError(StatusCode, Cow<'static, str>);
 
 impl ApiError {
-    const MULTIPART: Self = Self(StatusCode::BAD_REQUEST, "Expected multipart/form-data");
+    fn new(status: StatusCode, detail: impl Into<Cow<'static, str>>) -> Self {
+        Self(status, detail.into())
+    }
+
+    const MULTIPART: Self = Self(
+        StatusCode::BAD_REQUEST,
+        Cow::Borrowed("Expected multipart/form-data"),
+    );
     const IMAGE: Self = Self(
         StatusCode::BAD_REQUEST,
-        "Expected a valid JPEG, PNG, or WebP image",
+        Cow::Borrowed("Expected a valid JPEG, PNG, or WebP image"),
     );
-    const NOT_FOUND: Self = Self(StatusCode::NOT_FOUND, "Translation job not found");
+    const NOT_FOUND: Self = Self(
+        StatusCode::NOT_FOUND,
+        Cow::Borrowed("Translation job not found"),
+    );
 }
 
 impl IntoResponse for ApiError {
@@ -151,6 +211,50 @@ fn find(jobs: &Jobs, id: &str) -> Result<Arc<Job>, ApiError> {
     jobs.get(id).ok_or(ApiError::NOT_FOUND)
 }
 
+#[derive(Serialize, ToSchema)]
+struct Translators {
+    /// Engines tried in order when a submission names none.
+    #[schema(example = json!(["google-web", "microsoft-edge"]))]
+    default: Vec<&'static str>,
+    /// Engines this server can call.
+    engines: Vec<EngineInfo>,
+}
+
+#[derive(Serialize, ToSchema)]
+struct EngineInfo {
+    #[schema(example = "google-web")]
+    provider: &'static str,
+    #[schema(example = "Google Translate (web)")]
+    name: &'static str,
+    /// Model an LLM engine uses, set by the server.
+    model: Option<String>,
+}
+
+/// List the translation engines this server can call.
+#[utoipa::path(
+    get, path = "/translators",
+    responses((status = 200, description = "Available engines", body = Translators))
+)]
+async fn translators(State(AppState { engines, .. }): State<AppState>) -> Json<Translators> {
+    Json(Translators {
+        default: engines
+            .default
+            .iter()
+            .map(|&engine| engine.into())
+            .collect(),
+        engines: engines
+            .providers
+            .available_providers()
+            .into_iter()
+            .map(|provider: Provider| EngineInfo {
+                provider: provider.into(),
+                name: provider.name(),
+                model: engines.providers.model(provider).map(ToOwned::to_owned),
+            })
+            .collect(),
+    })
+}
+
 /// Submit a page for translation.
 ///
 /// The accepted job runs independently of the connection.
@@ -166,17 +270,17 @@ fn find(jobs: &Jobs, id: &str) -> Result<Arc<Job>, ApiError> {
     )
 )]
 async fn submit(
-    State(jobs): State<Jobs>,
+    State(AppState { jobs, engines }): State<AppState>,
     multipart: Result<Multipart, MultipartRejection>,
 ) -> Result<impl IntoResponse, ApiError> {
     let upload = Upload::parse(multipart.map_err(|_| ApiError::MULTIPART)?).await?;
-    let input = tokio::task::spawn_blocking(move || upload.validate())
+    let input = tokio::task::spawn_blocking(move || upload.validate(&engines))
         .await
         .map_err(|error| {
             tracing::error!(%error, "image validation task failed");
-            ApiError(StatusCode::INTERNAL_SERVER_ERROR, "Image validation failed")
+            ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Image validation failed")
         })??;
-    let translation = jobs.submit(input).ok_or(ApiError(
+    let translation = jobs.submit(input).ok_or(ApiError::new(
         StatusCode::SERVICE_UNAVAILABLE,
         "Translation worker unavailable",
     ))?;
@@ -274,7 +378,7 @@ async fn cancel(
     State(jobs): State<Jobs>,
     Path(id): Path<String>,
 ) -> Result<Json<Translation>, ApiError> {
-    find(&jobs, &id)?.cancel().map(Json).ok_or(ApiError(
+    find(&jobs, &id)?.cancel().map(Json).ok_or(ApiError::new(
         StatusCode::CONFLICT,
         "Translation job already finished",
     ))
@@ -301,7 +405,7 @@ impl IntoResponse for Png {
     )
 )]
 async fn result(State(jobs): State<Jobs>, Path(id): Path<String>) -> Result<Png, ApiError> {
-    let png = find(&jobs, &id)?.result().ok_or(ApiError(
+    let png = find(&jobs, &id)?.result().ok_or(ApiError::new(
         StatusCode::CONFLICT,
         "Translation job has no completed result",
     ))?;

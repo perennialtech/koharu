@@ -1,5 +1,7 @@
 use thiserror::Error;
 
+use crate::Language;
+
 pub type Result<T> = std::result::Result<T, Error>;
 
 #[derive(Debug, Error)]
@@ -17,6 +19,11 @@ pub enum Error {
         provider: &'static str,
         status: u16,
         message: String,
+    },
+    #[error("{provider} does not support {language}")]
+    UnsupportedLanguage {
+        provider: &'static str,
+        language: Language,
     },
     #[error(transparent)]
     Other(#[from] anyhow::Error),
