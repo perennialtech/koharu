@@ -107,3 +107,20 @@ macro_rules! model_repository {
 }
 
 pub(crate) use model_repository;
+
+/// Resizes with the resampler instantiated for `P` only. The untyped
+/// `Resizer::resize` dispatches on the runtime pixel type, so each call
+/// monomorphizes every pixel type's resampler into this crate and costs
+/// minutes of codegen in optimized builds.
+pub(crate) fn resize_image<P: fast_image_resize::PixelTrait>(
+    source: &impl fast_image_resize::IntoImageView,
+    destination: &mut impl fast_image_resize::IntoImageViewMut,
+    options: &fast_image_resize::ResizeOptions,
+) -> Result<(), fast_image_resize::ResizeError> {
+    let (Some(source), Some(mut destination)) =
+        (source.image_view::<P>(), destination.image_view_mut::<P>())
+    else {
+        return Err(fast_image_resize::ResizeError::PixelTypesAreDifferent);
+    };
+    fast_image_resize::Resizer::new().resize_typed(&source, &mut destination, options)
+}

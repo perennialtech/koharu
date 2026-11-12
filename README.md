@@ -82,11 +82,11 @@ state or immediately on server restart. Each submission runs independently.
 
 ## Bare-metal build
 
-On Linux, install Rust 1.99 or later, Clang and libclang, CMake, and the
-Fontconfig development headers. For Ubuntu 24.04:
+On Linux, install Rust 1.99 or later, Clang and libclang. Fontconfig is loaded
+at runtime. For Ubuntu 24.04:
 
 ```sh
-sudo apt-get install clang libclang-dev cmake libfontconfig-dev
+sudo apt-get install clang libclang-dev libfontconfig1
 LIBCLANG_PATH=/usr/lib/llvm-18/lib cargo build --locked -p koharu-server
 ./target/debug/koharu-server --listen 127.0.0.1:8080
 ```
@@ -109,15 +109,16 @@ engines you select; LLM engines also receive the page image. Without any
 configuration, Koharu uses Google Translate's web endpoint and falls back to
 Microsoft Translator's Edge endpoint. Neither needs an account.
 
-To use DeepL without an API key, run a [DeepLX](https://github.com/OwO-Network/DeepLX)
-server, for example `docker run -d -p 127.0.0.1:1188:1188
-ghcr.io/owo-network/deeplx:latest`, and point `KOHARU_DEEPLX_BASE_URL` at it.
+To use DeepL without an API key, uncomment the optional `deeplx` service in
+[`compose.yaml`](compose.yaml), set `KOHARU_DEEPLX_BASE_URL=http://deeplx:1188`
+in the environment where you run Compose, and start the stack. DeepLX is
+accessible to Koharu over the Compose network but has no published host port.
+Set `KOHARU_TRANSLATORS=deeplx` to use it as the default translator.
 
 ## Development
 
 See [AGENTS.md](AGENTS.md) for repository rules and the one command used by CI
-to check changes. Keep contributions focused and follow the
-[Code of Conduct](CODE_OF_CONDUCT.md).
+to check changes. Keep contributions focused.
 
 ## License
 

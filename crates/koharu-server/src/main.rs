@@ -3,7 +3,7 @@
 mod api;
 mod jobs;
 
-use std::{collections::BTreeMap, future::Future, io, net::SocketAddr, sync::Arc, time::Duration};
+use std::{collections::BTreeMap, future::Future, net::SocketAddr, sync::Arc, time::Duration};
 
 use anyhow::{Context, Result};
 use axum::body::Bytes;
@@ -195,10 +195,7 @@ impl Worker {
         let rasterizer = self.rasterizer.clone();
         tokio::task::spawn_blocking(move || {
             let raster = rasterizer.rasterize(&frame, RasterOptions::default())?;
-            let mut png = io::Cursor::new(Vec::new());
-            image::DynamicImage::ImageRgba8(raster.image)
-                .write_to(&mut png, image::ImageFormat::Png)?;
-            Ok(Some(Bytes::from(png.into_inner())))
+            Ok(Some(Bytes::from(raster.encode_png()?)))
         })
         .await?
     }
