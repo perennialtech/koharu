@@ -55,6 +55,9 @@ const MIN_MEASURED_STROKE_WIDTH: u8 = 2;
 const DIALOGUE_MASK_CONTAINMENT_THRESHOLD: f32 = 0.9;
 /// Largest gap, in line thicknesses, between lines of one text block.
 const TEXT_BLOCK_GAP: f32 = 0.6;
+/// Share of a text block a bubble must hold to be joined with the rest of a
+/// split balloon.
+const SPLIT_BUBBLE_MIN_SHARE: f32 = 0.2;
 // RF-DETR proposals far below its own bubble threshold still carry usable
 // masks for bubbles that the box-only bubble detector finds.
 const BUBBLE_MASK_CANDIDATE_THRESHOLD: f32 = 0.05;
@@ -440,6 +443,7 @@ async fn write_page(
     }
     non_maximum_suppression(&mut detections, 0.5);
     merge_text_blocks(&mut detections);
+    join_split_bubbles(&mut detections);
     sort_by_layout(&mut detections);
 
     let image = image.to_rgb8();
@@ -1875,47 +1879,59 @@ fn merge_text_blocks(detections: &mut Vec<KoharuLayoutDetection>) {
             .or_default()
             .push(text);
     }
-    let mut merged = Vec::new();
-    let mut absorbed = vec![false; detections.len()];
-    for group in groups.into_values().filter(|group| group.len() > 1) {
-        let bbox = group
+    let groups = groups
+        .into_values()
+        .filter(|group| group.len() > 1)
+        .collect::<Vec<_>>();
+    replace_with_unions(detections, &groups);
+}
+
+/// The bubble detector splits some balloons in two, and `same_text` then
+/// joins their text into one block that neither half contains, so the block
+/// would be set as free text over the balloon's edge. Bubbles that each hold
+/// part of such a block, and together hold all of it, become one bubble.
+fn join_split_bubbles(detections: &mut Vec<KoharuLayoutDetection>) {
+    let bubbles = indices_with_label(detections, "bubble");
+    let mut used = vec![false; detections.len()];
+    let mut groups = Vec::new();
+    for text in indices_with_label(detections, "text") {
+        let text = &detections[text];
+        let contains = |bubble: &KoharuLayoutDetection| {
+            mask_containment(&bubble.mask, &text.mask, text.bbox)
+                >= DIALOGUE_MASK_CONTAINMENT_THRESHOLD
+        };
+        if bubbles.iter().any(|&bubble| contains(&detections[bubble])) {
+            continue;
+        }
+        let parts = bubbles
             .iter()
-            .fold(detections[group[0]].bbox, |bounds, &index| {
-                let value = detections[index].bbox;
-                [
-                    bounds[0].min(value[0]),
-                    bounds[1].min(value[1]),
-                    bounds[2].max(value[2]),
-                    bounds[3].max(value[3]),
-                ]
-            });
-        let x = bbox[0].floor().max(0.0) as u32;
-        let y = bbox[1].floor().max(0.0) as u32;
-        let width = (bbox[2].ceil() as u32).saturating_sub(x).max(1);
-        let height = (bbox[3].ceil() as u32).saturating_sub(y).max(1);
-        let mut mask = GrayImage::new(width, height);
-        for &index in &group {
-            stamp_mask(&mut mask, &detections[index].mask, x, y);
+            .copied()
+            .filter(|&bubble| {
+                !used[bubble]
+                    && containment(detections[bubble].bbox, text.bbox) >= SPLIT_BUBBLE_MIN_SHARE
+            })
+            .collect::<Vec<_>>();
+        if parts.len() < 2 || !contains(&union_detection(detections, &parts)) {
+            continue;
+        }
+        for &part in &parts {
+            used[part] = true;
+        }
+        groups.push(parts);
+    }
+    replace_with_unions(detections, &groups);
+}
+
+/// Replaces each group of same-label detections with one detection covering
+/// their union.
+fn replace_with_unions(detections: &mut Vec<KoharuLayoutDetection>, groups: &[Vec<usize>]) {
+    let mut absorbed = vec![false; detections.len()];
+    let mut merged = Vec::new();
+    for group in groups {
+        merged.push(union_detection(detections, group));
+        for &index in group {
             absorbed[index] = true;
         }
-        let pixels = mask.into_raw();
-        merged.push(KoharuLayoutDetection {
-            label_id: detections[group[0]].label_id,
-            label: "text".to_owned(),
-            score: group
-                .iter()
-                .map(|&index| detections[index].score)
-                .fold(0.0, f32::max),
-            bbox,
-            area: pixels.iter().filter(|value| **value != 0).count() as u32,
-            mask: KoharuLayoutMask {
-                x,
-                y,
-                width,
-                height,
-                pixels,
-            },
-        });
     }
     let mut index = 0;
     detections.retain(|_| {
@@ -1923,6 +1939,46 @@ fn merge_text_blocks(detections: &mut Vec<KoharuLayoutDetection>) {
         !absorbed[index - 1]
     });
     detections.extend(merged);
+}
+
+fn union_detection(detections: &[KoharuLayoutDetection], group: &[usize]) -> KoharuLayoutDetection {
+    let bbox = group
+        .iter()
+        .fold(detections[group[0]].bbox, |bounds, &index| {
+            let value = detections[index].bbox;
+            [
+                bounds[0].min(value[0]),
+                bounds[1].min(value[1]),
+                bounds[2].max(value[2]),
+                bounds[3].max(value[3]),
+            ]
+        });
+    let x = bbox[0].floor().max(0.0) as u32;
+    let y = bbox[1].floor().max(0.0) as u32;
+    let width = (bbox[2].ceil() as u32).saturating_sub(x).max(1);
+    let height = (bbox[3].ceil() as u32).saturating_sub(y).max(1);
+    let mut mask = GrayImage::new(width, height);
+    for &index in group {
+        stamp_mask(&mut mask, &detections[index].mask, x, y);
+    }
+    let pixels = mask.into_raw();
+    KoharuLayoutDetection {
+        label_id: detections[group[0]].label_id,
+        label: detections[group[0]].label.clone(),
+        score: group
+            .iter()
+            .map(|&index| detections[index].score)
+            .fold(0.0, f32::max),
+        bbox,
+        area: pixels.iter().filter(|value| **value != 0).count() as u32,
+        mask: KoharuLayoutMask {
+            x,
+            y,
+            width,
+            height,
+            pixels,
+        },
+    }
 }
 
 /// Mostly overlapping boxes cover the same text, even when the bubble
@@ -2752,6 +2808,44 @@ mod tests {
             .unwrap();
         assert!(block.mask.contains(3900, 1000) && block.mask.contains(4400, 1000));
         assert!(!block.mask.contains(4280, 1000));
+    }
+
+    #[test]
+    fn bubbles_split_across_one_text_block_join() {
+        // 144304368_p6: two overlapping balloons hold one utterance, detected
+        // as one text box. A block sticking out of its bubbles keeps them apart.
+        let masked = |label: &str, bbox: [f32; 4]| {
+            let [left, top, right, bottom] = bbox.map(|value| value as u32);
+            KoharuLayoutDetection {
+                mask: full_mask(left, top, right - left, bottom - top),
+                ..detection(label, 0.9, bbox)
+            }
+        };
+        let mut detections = vec![
+            masked("bubble", [4380.0, 4876.0, 4782.0, 6045.0]),
+            masked("bubble", [3808.0, 4894.0, 4513.0, 6630.0]),
+            masked("text", [3967.0, 5052.0, 4628.0, 6543.0]),
+            masked("bubble", [0.0, 0.0, 180.0, 400.0]),
+            masked("bubble", [170.0, 0.0, 250.0, 400.0]),
+            masked("text", [100.0, 100.0, 300.0, 300.0]),
+        ];
+
+        super::join_split_bubbles(&mut detections);
+
+        let mut bubbles = detections
+            .iter()
+            .filter(|detection| detection.label == "bubble")
+            .map(|detection| detection.bbox)
+            .collect::<Vec<_>>();
+        bubbles.sort_by(|left, right| left[0].total_cmp(&right[0]));
+        assert_eq!(
+            bubbles,
+            [
+                [0.0, 0.0, 180.0, 400.0],
+                [170.0, 0.0, 250.0, 400.0],
+                [3808.0, 4876.0, 4782.0, 6630.0],
+            ]
+        );
     }
 
     #[test]
