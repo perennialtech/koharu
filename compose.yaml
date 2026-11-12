@@ -33,7 +33,7 @@ services:
   # Uncomment to run DeepLX on the Compose network without publishing a port.
   # Set KOHARU_DEEPLX_BASE_URL=http://deeplx:1188 in the host environment.
   # deeplx:
-  #   image: ghcr.io/owo-network/deeplx:v1.3.1
+  #   image: ghcr.io/owo-network/deeplx@sha256:f1af0bce495dedd71708317d098a37d4d23ee8f40fe3c634e72cb2e86e6ad93f # v1.3.1
   #   read_only: true
   #   cap_drop:
   #     - ALL
