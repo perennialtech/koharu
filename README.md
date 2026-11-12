@@ -1,9 +1,9 @@
 # Koharu
 
 Koharu is a headless manga-page translation service. It detects text regions,
-reads Japanese text with PaddleOCR-VL 1.6, translates it with local Gemma 4 E4B
-or an explicitly selected hosted provider, removes the original text, and
-renders the translation as a PNG. It accepts JPEG, PNG, and WebP pages.
+reads Japanese text with PaddleOCR-VL 1.6, translates it through machine
+translation services or hosted LLMs, removes the original text, and renders
+the translation as a PNG. It accepts JPEG, PNG, and WebP pages.
 
 ## Docker
 
@@ -56,22 +56,21 @@ unprivileged user, with a read-only root filesystem, a temporary `/tmp`, and
 capabilities dropped. Do not mount the Docker socket or give the container
 `--privileged` access.
 
-The default translator runs locally. For a hosted translator, set
-`KOHARU_PROVIDER`, `KOHARU_MODEL`, and the appropriate API key in your shell;
-Compose passes those variables through if set. For `docker run`, add the
-corresponding `--env KOHARU_PROVIDER --env KOHARU_MODEL` and
-`--env OPENROUTER_API_KEY` (or `--env OPENAI_COMPATIBLE_API_KEY`) flags. The
-optional `KOHARU_OPENAI_COMPATIBLE_BASE_URL` and `KOHARU_INPAINTING` settings
-are also available. Do not commit credentials or put them in command-line
-values. Run `docker run --rm ghcr.io/perennialtech/koharu:latest --help` for
-the complete configuration reference.
+Set configuration and API keys as environment variables in your shell;
+Compose passes the documented ones through if set. For `docker run`, add an
+`--env NAME` flag for each. Do not commit credentials or put them in
+command-line values. Run `docker run --rm ghcr.io/perennialtech/koharu:latest
+--help` for the complete configuration reference.
 
 ## HTTP API
 
 Open [Swagger UI](http://127.0.0.1:8080/docs/) to try the API, or use the
 [OpenAPI JSON](http://127.0.0.1:8080/openapi.json) to build a client.
 
-Submit a page as multipart form data to `POST /translations`. The response
+`GET /translators` lists the engines this server can call and its default
+order. Submit a page as multipart form data to `POST /translations`, with one
+`translator` field per engine to try in order; leave them out to use the
+default order. The response
 includes a job ID and a `Location` header. Poll that URL or subscribe to its
 `/events` endpoint for live progress. When the job completes, download the PNG
 from the `result_url` in the response. Use the job's `/cancel` endpoint to
@@ -96,19 +95,23 @@ On other systems, set `LIBCLANG_PATH` to the directory containing the
 installed `libclang` library as needed. The same HTTP API is available
 without a container.
 
-## Configuration and privacy
+## Configuration
 
 Run `koharu-server --help` (or `./target/debug/koharu-server --help`) for the
-supported flags, defaults and environment-variable fallbacks. You can choose
-the translator, model, inpainting model, listener address, and
-OpenAI-compatible base URL there.
+supported flags, defaults, environment-variable fallbacks and the API keys
+each translation provider reads. You can choose the translation engines and
+their failover order, the models LLM engines use, the inpainting model, the
+listener address, and the endpoints of self-hosted translators there. API
+callers choose engines by name but never their models.
 
-Local Gemma translation is the default and does not send images or text to a
-hosted translation provider. Selecting OpenRouter or an OpenAI-compatible
-endpoint is an explicit operator decision. Hosted translation sends page
-images and recognized text to that service. Set `OPENROUTER_API_KEY` for
-OpenRouter; `OPENAI_COMPATIBLE_API_KEY` is optional for OpenAI-compatible
-endpoints. Never put credentials in command arguments or the repository.
+Every translation engine is a remote service, so recognized text goes to the
+engines you select; LLM engines also receive the page image. Without any
+configuration, Koharu uses Google Translate's web endpoint and falls back to
+Microsoft Translator's Edge endpoint. Neither needs an account.
+
+To use DeepL without an API key, run a [DeepLX](https://github.com/OwO-Network/DeepLX)
+server, for example `docker run -d -p 127.0.0.1:1188:1188
+ghcr.io/owo-network/deeplx:latest`, and point `KOHARU_DEEPLX_BASE_URL` at it.
 
 ## Development
 

@@ -102,7 +102,6 @@ jieba-rs = "0.11.0"
 fontique = "0.12.0"
 pollster = "1.0.1"
 vello = "0.11.0"
-schemars = { version = "1.2.2", features = ["chrono04", "indexmap2", "uuid1"] }
 uuid = { version = "1.26.1", features = ["v4", "v7", "serde"] }
 atomicwrites = "0.4.4"
 fs4 = "1.1.0"
@@ -112,10 +111,8 @@ walkdir = "2.5.0"
 base64 = "0.23.1"
 unicode-bidi = "0.3.18"
 criterion = { version = "0.8.2", features = ["html_reports"] }
-llguidance = "1.9.1"
 fast-glob = "1.1.2"
 tar = "0.4.46"
-toktrie = "1.9.1"
 bytes = "1.12.1"
 half = "2.7.1"
 lazy_static = "1.5.1"

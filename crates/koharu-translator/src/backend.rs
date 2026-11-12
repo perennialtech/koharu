@@ -15,6 +15,8 @@ pub struct TranslationRequest {
     pub segments: Vec<String>,
     pub source_language: Option<Language>,
     pub target_language: Language,
+    /// Optional guidance for providers that can follow it. Machine-translation
+    /// providers ignore it.
     pub instructions: Option<String>,
     pub context: Vec<TranslationContext>,
     pub image: Option<Arc<DynamicImage>>,

@@ -9,23 +9,23 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
 use super::send_json;
-use crate::{GenerationConfig, Result, TranslationRequest, backend::encode_image, prompt};
+use crate::{
+    GenerationConfig, Result, TranslationRequest,
+    backend::encode_image,
+    prompt,
+    provider::{OPENROUTER_API_KEY, credential},
+};
 
 const CHAT_URL: &str = "https://openrouter.ai/api/v1/chat/completions";
 
-#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize, specta::Type)]
-#[serde(default)]
-pub struct OpenRouterConfig {}
-
 pub(super) async fn translate(
     client: &Client,
-    _config: &OpenRouterConfig,
     model: &str,
     generation: &GenerationConfig,
     request: &TranslationRequest,
 ) -> Result<Vec<String>> {
-    let api_key = std::env::var("OPENROUTER_API_KEY")
-        .context("OPENROUTER_API_KEY is required for OpenRouter")?;
+    let api_key = credential(OPENROUTER_API_KEY)
+        .with_context(|| format!("{OPENROUTER_API_KEY} is required for openrouter"))?;
     let (system, user) = prompt::prompts(request)?;
     let user_content = match request.image.as_deref() {
         Some(image) => MessageContent::Parts(vec![

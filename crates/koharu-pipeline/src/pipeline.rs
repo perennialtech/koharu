@@ -32,7 +32,7 @@ impl Pipeline {
         providers: Config<koharu_translator::ProvidersConfig>,
         device: koharu_ml::Device,
     ) -> Result<Self> {
-        let translator = koharu_translator::Translator::from_config(device.clone(), providers)?;
+        let translator = koharu_translator::Translator::from_config(providers)?;
         let resources = ResourceMonitor::new(&device);
         let runner = {
             let value = config.read()?;

@@ -13,6 +13,13 @@ use tower::ServiceExt;
 use super::*;
 use crate::jobs::Failure;
 
+fn engines() -> Engines {
+    Engines {
+        providers: ProvidersConfig::default(),
+        default: vec![Provider::GoogleWeb],
+    }
+}
+
 async fn request(app: &Router, method: Method, uri: &str) -> Response {
     app.clone()
         .oneshot(
@@ -72,7 +79,7 @@ async fn submit_page(app: &Router, image: &[u8]) -> String {
 #[tokio::test]
 async fn progress_and_result_are_available_across_connections() {
     let (jobs, mut queue) = Jobs::new();
-    let app = router(jobs);
+    let app = router(jobs, engines());
     let png = png();
     let location = submit_page(&app, &png).await;
     let events = format!("{location}/events");
@@ -98,6 +105,7 @@ async fn progress_and_result_are_available_across_connections() {
     let input = job.start().unwrap();
     assert_eq!(input.language, Language::Japanese);
     assert_eq!(input.instructions.as_deref(), Some("Keep character names"));
+    assert_eq!(input.engines, None);
     assert_eq!(input.source.as_ref(), png);
 
     job.progress(Progress::Finished {
@@ -163,7 +171,7 @@ async fn progress_and_result_are_available_across_connections() {
 #[tokio::test]
 async fn shutdown_cancels_jobs_and_closes_active_events() {
     let (jobs, mut queue) = Jobs::new();
-    let app = router(jobs.clone());
+    let app = router(jobs.clone(), engines());
     let png = png();
     let running = submit_page(&app, &png).await;
     let queued = submit_page(&app, &png).await;
@@ -208,7 +216,7 @@ async fn shutdown_cancels_jobs_and_closes_active_events() {
 #[tokio::test]
 async fn cancels_queued_and_running_jobs_independently() {
     let (jobs, mut queue) = Jobs::new();
-    let app = router(jobs);
+    let app = router(jobs, engines());
     let png = png();
     let running = submit_page(&app, &png).await;
     let queued = submit_page(&app, &png).await;
@@ -241,9 +249,9 @@ async fn cancels_queued_and_running_jobs_independently() {
 #[tokio::test]
 async fn serves_openapi_and_reports_failures() {
     let (jobs, mut queue) = Jobs::new();
-    let app = router(jobs);
+    let app = router(jobs, engines());
     let spec = json(request(&app, Method::GET, "/openapi.json").await).await;
-    assert_eq!(spec["paths"].as_object().unwrap().len(), 5);
+    assert_eq!(spec["paths"].as_object().unwrap().len(), 6);
     assert_eq!(
         spec["components"]["schemas"]["Upload"]["properties"]["image"]["format"],
         "binary"
@@ -284,4 +292,59 @@ async fn serves_openapi_and_reports_failures() {
     assert_eq!(status["status"], "failed");
     assert_eq!(status["error"]["code"], "processing_failed");
     assert_eq!(status["stages"][0]["status"], "cancelled");
+}
+
+async fn upload_with_translators(app: &Router, translators: &[&str]) -> Response {
+    let mut body = b"--page\r\nContent-Disposition: form-data; name=\"image\"; filename=\"page.png\"\r\nContent-Type: image/png\r\n\r\n".to_vec();
+    body.extend_from_slice(&png());
+    for translator in translators {
+        body.extend_from_slice(
+            format!("\r\n--page\r\nContent-Disposition: form-data; name=\"translator\"\r\n\r\n{translator}").as_bytes(),
+        );
+    }
+    body.extend_from_slice(b"\r\n--page--\r\n");
+    app.clone()
+        .oneshot(
+            Request::post("/translations")
+                .header(header::CONTENT_TYPE, "multipart/form-data; boundary=page")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn lists_engines_and_keeps_requested_failover_order() {
+    let (jobs, mut queue) = Jobs::new();
+    let app = router(jobs, engines());
+
+    let listing = json(request(&app, Method::GET, "/translators").await).await;
+    assert_eq!(listing["default"], serde_json::json!(["google-web"]));
+    let providers = listing["engines"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|engine| engine["provider"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert!(providers.contains(&"google-web"));
+    assert!(!providers.contains(&"deeplx"));
+
+    let response = upload_with_translators(&app, &["microsoft-edge", "google-web"]).await;
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    let input = queue.recv().await.unwrap().start().unwrap();
+    assert_eq!(
+        input.engines,
+        Some(vec![Provider::MicrosoftEdge, Provider::GoogleWeb])
+    );
+
+    for translators in [&["deeplx"][..], &["openrouter:any/model"], &["local"]] {
+        let response = upload_with_translators(&app, translators).await;
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_REQUEST,
+            "{translators:?}"
+        );
+    }
+    assert!(queue.try_recv().is_err());
 }

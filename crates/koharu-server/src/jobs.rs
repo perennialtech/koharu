@@ -6,7 +6,7 @@ use std::{
 
 use axum::body::Bytes;
 use koharu_pipeline::{ErrorKind, PipelineError, Progress, Stage, StopToken};
-use koharu_translator::Language;
+use koharu_translator::{Language, Provider};
 use serde::Serialize;
 use tokio::sync::{mpsc, watch};
 use utoipa::ToSchema;
@@ -21,6 +21,7 @@ pub(crate) struct Input {
     pub(crate) height: u32,
     pub(crate) language: Language,
     pub(crate) instructions: Option<String>,
+    pub(crate) engines: Option<Vec<Provider>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, ToSchema)]

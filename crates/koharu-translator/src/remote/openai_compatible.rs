@@ -6,34 +6,25 @@ use serde::{Deserialize, Serialize};
 use url::Url;
 
 use super::send_json;
-use crate::{GenerationConfig, Result, TranslationRequest, backend::encode_image, prompt};
-
-const DEFAULT_BASE_URL: &str = "http://localhost:11434/v1";
-
-#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize, specta::Type)]
-#[serde(default)]
-pub struct OpenAiCompatibleConfig {
-    pub base_url: Option<Url>,
-}
-
-impl Default for OpenAiCompatibleConfig {
-    fn default() -> Self {
-        Self {
-            base_url: Some(
-                Url::parse(DEFAULT_BASE_URL).expect("default OpenAI-compatible URL is valid"),
-            ),
-        }
-    }
-}
+use crate::{
+    GenerationConfig, ProvidersConfig, Result, TranslationRequest,
+    backend::encode_image,
+    prompt,
+    provider::{OPENAI_COMPATIBLE_API_KEY, credential},
+};
 
 pub(super) async fn translate(
     client: &Client,
-    config: &OpenAiCompatibleConfig,
+    providers: &ProvidersConfig,
     model: &str,
     generation: &GenerationConfig,
     request: &TranslationRequest,
 ) -> Result<Vec<String>> {
-    let api_key = std::env::var("OPENAI_COMPATIBLE_API_KEY").ok();
+    let base_url = providers
+        .openai_compatible_base_url
+        .as_ref()
+        .context("openai-compatible requires a base URL")?;
+    let api_key = credential(OPENAI_COMPATIBLE_API_KEY);
     let (system, user) = prompt::prompts(request)?;
     let user_content = match request.image.as_deref() {
         Some(image) => MessageContent::Parts(vec![
@@ -76,7 +67,7 @@ pub(super) async fn translate(
         },
     };
     let http = client
-        .post(endpoint(config.base_url.as_ref(), "chat/completions"))
+        .post(endpoint(base_url, "chat/completions"))
         .json(&body);
     let http = match api_key {
         Some(api_key) => http.bearer_auth(api_key),
@@ -98,11 +89,10 @@ pub(super) async fn translate(
     )?)
 }
 
-fn endpoint(base_url: Option<&Url>, suffix: &str) -> String {
-    let base_url = base_url.map_or(DEFAULT_BASE_URL, Url::as_str);
+fn endpoint(base_url: &Url, suffix: &str) -> String {
     format!(
         "{}/{}",
-        base_url.trim_end_matches('/'),
+        base_url.as_str().trim_end_matches('/'),
         suffix.trim_start_matches('/')
     )
 }
@@ -187,10 +177,7 @@ mod tests {
     #[test]
     fn endpoint_preserves_base_path() {
         let url = Url::parse("http://localhost:1234/v1").unwrap();
-        assert_eq!(
-            endpoint(Some(&url), "models"),
-            "http://localhost:1234/v1/models"
-        );
+        assert_eq!(endpoint(&url, "models"), "http://localhost:1234/v1/models");
     }
 
     #[test]

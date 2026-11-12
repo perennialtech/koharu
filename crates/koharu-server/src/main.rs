@@ -5,7 +5,7 @@ mod jobs;
 
 use std::{collections::BTreeMap, future::Future, io, net::SocketAddr, sync::Arc, time::Duration};
 
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result};
 use axum::body::Bytes;
 use clap::{Parser, ValueEnum};
 use koharu_config::Config;
@@ -16,21 +16,11 @@ use koharu_pipeline::{
 use koharu_rasterizer::{RasterOptions, Rasterizer};
 use koharu_renderer::Renderer;
 use koharu_scene::{AssetInput, AssetMetadata, AssetRole, At, PageDraft, Session};
-use koharu_translator::{ModelSelection, Provider, ProvidersConfig};
+use koharu_translator::{Provider, ProvidersConfig};
 use tracing_subscriber::EnvFilter;
 use url::Url;
 
 use jobs::{Failure, Input, Job, Jobs};
-
-#[derive(Clone, Copy, Debug, ValueEnum)]
-enum ProviderChoice {
-    #[value(name = "local")]
-    Local,
-    #[value(name = "openrouter")]
-    OpenRouter,
-    #[value(name = "openai-compatible")]
-    OpenAiCompatible,
-}
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
 enum InpaintingChoice {
@@ -45,17 +35,39 @@ struct Arguments {
     #[arg(long, env = "KOHARU_LISTEN", default_value = "0.0.0.0:8080")]
     listen: SocketAddr,
 
-    /// Local inference or an explicitly selected hosted translator.
-    #[arg(long, env = "KOHARU_PROVIDER", value_enum, default_value = "local")]
-    provider: ProviderChoice,
+    /// Translation engine to try when a request names none. Repeat it, or
+    /// separate values with commas, to fail over in order. Providers:
+    /// google-web, microsoft-edge, deeplx, deepl, google-cloud, azure,
+    /// openrouter, openai-compatible. Defaults to google-web, then
+    /// microsoft-edge.
+    ///
+    /// deepl reads DEEPL_API_KEY, google-cloud reads
+    /// GOOGLE_CLOUD_TRANSLATION_API_KEY, azure reads AZURE_TRANSLATOR_KEY,
+    /// openrouter reads OPENROUTER_API_KEY, and openai-compatible reads the
+    /// optional OPENAI_COMPATIBLE_API_KEY.
+    #[arg(long, env = "KOHARU_TRANSLATORS", value_delimiter = ',')]
+    translator: Vec<Provider>,
 
-    /// Translation model. Local defaults to gemma4-e4b-it; hosted requires a model.
-    #[arg(long, env = "KOHARU_MODEL")]
-    model: Option<String>,
+    /// Model the openrouter provider uses, such as google/gemini-2.5-flash.
+    #[arg(long, env = "KOHARU_OPENROUTER_MODEL")]
+    openrouter_model: Option<String>,
 
-    /// OpenAI-compatible endpoint, including its /v1 path.
+    /// Model the openai-compatible provider uses.
+    #[arg(long, env = "KOHARU_OPENAI_COMPATIBLE_MODEL")]
+    openai_compatible_model: Option<String>,
+
+    /// DeepLX server root, for the deeplx provider.
+    #[arg(long, env = "KOHARU_DEEPLX_BASE_URL")]
+    deeplx_base_url: Option<Url>,
+
+    /// OpenAI-compatible endpoint, including its /v1 path, for the
+    /// openai-compatible provider.
     #[arg(long, env = "KOHARU_OPENAI_COMPATIBLE_BASE_URL")]
     openai_compatible_base_url: Option<Url>,
+
+    /// Azure AI Translator resource region, for regional resources.
+    #[arg(long, env = "KOHARU_AZURE_REGION")]
+    azure_region: Option<String>,
 
     /// Inpainting model used to erase original text.
     #[arg(long, env = "KOHARU_INPAINTING", value_enum, default_value = "lama")]
@@ -65,50 +77,20 @@ struct Arguments {
 impl Arguments {
     fn configs(&self) -> Result<(PipelineConfig, ProvidersConfig)> {
         let mut pipeline = PipelineConfig::default();
-        let mut providers = ProvidersConfig::default();
-        pipeline.translation.model = match self.provider {
-            ProviderChoice::Local => {
-                if let Some(model) = self.model.as_deref() {
-                    ensure!(
-                        model == "gemma4-e4b-it",
-                        "only gemma4-e4b-it is supported locally"
-                    );
-                }
-                ModelSelection::default()
-            }
-            ProviderChoice::OpenRouter | ProviderChoice::OpenAiCompatible => {
-                pipeline.translation.generation.reasoning = None;
-                let model = self
-                    .model
-                    .as_deref()
-                    .filter(|model| !model.is_empty())
-                    .context("--model is required for hosted translation")?;
-                if matches!(self.provider, ProviderChoice::OpenRouter) {
-                    ensure!(
-                        std::env::var("OPENROUTER_API_KEY").is_ok_and(|key| !key.is_empty()),
-                        "OPENROUTER_API_KEY is required for OpenRouter"
-                    );
-                }
-                ModelSelection {
-                    provider: match self.provider {
-                        ProviderChoice::OpenRouter => Provider::OpenRouter,
-                        ProviderChoice::OpenAiCompatible => Provider::OpenAiCompatible,
-                        ProviderChoice::Local => unreachable!(),
-                    },
-                    model: Some(model.to_owned()),
-                    quantization: None,
-                    vision: true,
-                    reasoning: true,
-                }
-            }
+        let providers = ProvidersConfig {
+            deeplx_base_url: self.deeplx_base_url.clone(),
+            openai_compatible_base_url: self.openai_compatible_base_url.clone(),
+            openai_compatible_model: self.openai_compatible_model.clone(),
+            openrouter_model: self.openrouter_model.clone(),
+            azure_region: self.azure_region.clone(),
         };
-        if self.openai_compatible_base_url.is_some()
-            && !matches!(self.provider, ProviderChoice::OpenAiCompatible)
-        {
-            bail!("--openai-compatible-base-url requires --provider openai-compatible");
+        if !self.translator.is_empty() {
+            pipeline.translation.engines = self.translator.clone();
         }
-        if let Some(url) = &self.openai_compatible_base_url {
-            providers.openai_compatible.base_url = Some(url.clone());
+        for engine in &pipeline.translation.engines {
+            providers
+                .validate(*engine)
+                .with_context(|| format!("cannot use translator {engine}"))?;
         }
         pipeline.inpainting = match self.inpainting {
             InpaintingChoice::Lama => InpaintingModel::LaMa {},
@@ -153,6 +135,7 @@ impl Worker {
             height,
             language,
             instructions,
+            engines,
         } = input;
         let mut session = Session::memory().await?;
         let mut page = None;
@@ -192,6 +175,7 @@ impl Worker {
                     translation: Some(RequestTranslation {
                         target_language: language,
                         instructions,
+                        engines,
                     }),
                     stop: stop.clone(),
                     progress: Some(Arc::new(move |event| progress.progress(event))),
@@ -255,6 +239,10 @@ async fn serve() -> Result<()> {
         .init();
     let arguments = Arguments::parse();
     let (pipeline_config, provider_config) = arguments.configs()?;
+    let engines = api::Engines {
+        providers: provider_config.clone(),
+        default: pipeline_config.translation.engines.clone(),
+    };
     let mut shutdown = Box::pin(shutdown_signal()?);
     let handle = tokio::runtime::Handle::current();
     let mut startup = tokio::task::spawn_blocking(move || {
@@ -279,7 +267,7 @@ async fn serve() -> Result<()> {
             let (jobs, queue) = Jobs::new();
             tokio::spawn(worker.run(queue));
             let shutdown_jobs = jobs.clone();
-            let app = api::router(jobs);
+            let app = api::router(jobs, engines);
             let listener = tokio::net::TcpListener::bind(arguments.listen).await?;
             tracing::info!(address = %listener.local_addr()?, "Koharu HTTP server listening");
             Ok::<_, anyhow::Error>((listener, app, shutdown_jobs))
@@ -365,7 +353,14 @@ mod tests {
 
         let (jobs, _queue) = Jobs::new();
         let (started_tx, mut started_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
-        let app = api::router(jobs.clone()).layer(axum::middleware::from_fn(
+        let app = api::router(
+            jobs.clone(),
+            api::Engines {
+                providers: ProvidersConfig::default(),
+                default: PipelineConfig::default().translation.engines,
+            },
+        )
+        .layer(axum::middleware::from_fn(
             move |request: axum::extract::Request, next: axum::middleware::Next| {
                 let started_tx = started_tx.clone();
                 async move {
@@ -404,38 +399,63 @@ mod tests {
             .unwrap();
     }
 
+    fn configs(arguments: &[&str]) -> Result<(PipelineConfig, ProvidersConfig)> {
+        Arguments::try_parse_from(std::iter::once("koharu-server").chain(arguments.iter().copied()))
+            .unwrap()
+            .configs()
+    }
+
     #[test]
-    fn cli_keeps_local_only_and_selected_inpainters() {
-        let arguments =
-            Arguments::try_parse_from(["koharu-server", "--inpainting", "flux2-klein"]).unwrap();
-        let (config, _) = arguments.configs().unwrap();
+    fn cli_defaults_to_keyless_engines_and_keeps_selected_inpainter() {
+        let (config, _) = configs(&["--inpainting", "flux2-klein"]).unwrap();
         assert_eq!(
-            config.translation.model.model.as_deref(),
-            Some("gemma4-e4b-it")
+            config.translation.engines,
+            [Provider::GoogleWeb, Provider::MicrosoftEdge]
         );
         assert!(matches!(config.inpainting, InpaintingModel::Flux2Klein(_)));
     }
 
     #[test]
-    fn hosted_models_do_not_receive_unsolicited_reasoning_parameters() {
-        let arguments = Arguments::try_parse_from([
-            "koharu-server",
-            "--provider",
+    fn cli_translators_keep_their_order() {
+        let (config, _) = configs(&[
+            "--translator",
+            "microsoft-edge,deeplx",
+            "--translator",
             "openai-compatible",
-            "--model",
-            "vision-model",
+            "--deeplx-base-url",
+            "http://deeplx:1188",
+            "--openai-compatible-base-url",
+            "http://llm:8000/v1",
+            "--openai-compatible-model",
+            "qwen/qwen3:32b",
         ])
         .unwrap();
-        let (pipeline, _) = arguments.configs().unwrap();
-        assert_eq!(pipeline.translation.generation.reasoning, None);
+        assert_eq!(
+            config.translation.engines,
+            [
+                Provider::MicrosoftEdge,
+                Provider::DeepLx,
+                Provider::OpenAiCompatible
+            ]
+        );
     }
 
     #[test]
-    fn hosted_translation_requires_a_model() {
-        let arguments =
-            Arguments::try_parse_from(["koharu-server", "--provider", "openai-compatible"])
-                .unwrap();
-        assert!(arguments.configs().is_err());
+    fn cli_rejects_translators_the_server_cannot_call() {
+        assert!(configs(&["--translator", "deeplx"]).is_err());
+        assert!(
+            Arguments::try_parse_from(["koharu-server", "--translator", "openrouter:model"])
+                .is_err()
+        );
+        assert!(
+            configs(&[
+                "--translator",
+                "openai-compatible",
+                "--openai-compatible-base-url",
+                "http://llm:8000/v1",
+            ])
+            .is_err()
+        );
     }
 
     #[cfg(target_os = "linux")]
