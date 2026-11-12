@@ -133,9 +133,6 @@ debug = 1
 [profile.dev.package.blake3]
 opt-level = 3
 
-[profile.dev.package.koharu-rasterizer]
-opt-level = 3
-
 [profile.dev.package.postcard]
 opt-level = 3
 
