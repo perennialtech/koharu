@@ -18,8 +18,16 @@ env:
   CARGO_PROFILE_DEV_DEBUG: 0
 
 jobs:
-  rust:
-    name: Rust
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: Swatinem/rust-cache@v2
+      - run: ./scripts/check.sh lint
+
+  test:
+    name: Test
     runs-on: ubuntu-latest
     steps:
       # The build needs nothing beyond the runner image. Vulkan and the CJK
@@ -43,4 +51,4 @@ jobs:
           while [ ! -f "$APT_STATUS" ]; do sleep 1; done
           cat "$RUNNER_TEMP/apt.log"
           exit "$(cat "$APT_STATUS")"
-      - run: ./scripts/check.sh
+      - run: ./scripts/check.sh test
