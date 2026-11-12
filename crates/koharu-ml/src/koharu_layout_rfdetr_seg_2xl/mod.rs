@@ -13,7 +13,7 @@ use anyhow::{Context, Result};
 use image::DynamicImage;
 use koharu_torch::Device;
 
-use crate::backend::TryIntoDevice;
+use crate::backend::{TryIntoDevice, recover_torch_oom};
 
 pub use self::{
     config::{KoharuLayoutRFDetrSeg2XLConfig, KoharuLayoutThresholds},
@@ -50,10 +50,12 @@ impl KoharuLayoutRFDetrSeg2XL {
             .context("failed to resolve KoharuLayout RF-DETR weights")?;
         let config = KoharuLayoutRFDetrSeg2XLConfig::from_file(&config_path)?;
         let processor = KoharuLayoutRFDetrImageProcessor::new(&config)?;
-        let mut model = Model::new(device);
-        model
-            .load(&weights_path)
-            .with_context(|| format!("failed to load {}", weights_path.display()))?;
+        let model = recover_torch_oom(|| {
+            let mut model = Model::new(device);
+            model.load(&weights_path)?;
+            Ok(model)
+        })
+        .with_context(|| format!("failed to load {}", weights_path.display()))?;
         Ok(Self {
             device,
             model,
@@ -70,16 +72,18 @@ impl KoharuLayoutRFDetrSeg2XL {
         image: &DynamicImage,
         thresholds: KoharuLayoutThresholds,
     ) -> Result<KoharuLayoutDetections> {
-        koharu_torch::no_grad(|| {
-            let pixel_values = self.processor.preprocess(image, self.device)?;
-            let output = self.model.forward(&pixel_values);
-            self.processor.postprocess(
-                &self.model,
-                &output,
-                image.width(),
-                image.height(),
-                thresholds,
-            )
+        recover_torch_oom(|| {
+            koharu_torch::no_grad(|| {
+                let pixel_values = self.processor.preprocess(image, self.device)?;
+                let output = self.model.forward(&pixel_values);
+                self.processor.postprocess(
+                    &self.model,
+                    &output,
+                    image.width(),
+                    image.height(),
+                    thresholds,
+                )
+            })
         })
     }
 

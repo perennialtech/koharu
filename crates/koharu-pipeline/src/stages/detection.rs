@@ -1813,10 +1813,12 @@ fn non_maximum_suppression(detections: &mut Vec<KoharuLayoutDetection>, threshol
     });
     let mut kept = Vec::with_capacity(detections.len());
     for candidate in detections.drain(..) {
-        let suppressed = kept.iter().any(|existing: &KoharuLayoutDetection| {
-            existing.label == candidate.label
-                && intersection_over_union(existing.bbox, candidate.bbox) >= threshold
-        });
+        // Text overlaps are resolved by merging their boxes and masks.
+        let suppressed = candidate.label != "text"
+            && kept.iter().any(|existing: &KoharuLayoutDetection| {
+                existing.label == candidate.label
+                    && intersection_over_union(existing.bbox, candidate.bbox) >= threshold
+            });
         if !suppressed {
             kept.push(candidate);
         }
@@ -1825,9 +1827,9 @@ fn non_maximum_suppression(detections: &mut Vec<KoharuLayoutDetection>, threshol
 }
 
 /// RF-DETR proposes a text box per column or line and, separately, boxes
-/// spanning several of them, and NMS keeps both when one only half covers the
-/// other. Each detection becomes one translated segment, so a paragraph split
-/// this way is translated as unrelated fragments, some of them twice. Boxes
+/// spanning several of them. A lower-scoring box can cover ink that a
+/// higher-scoring box misses. Each text region becomes one translated segment,
+/// so a split paragraph is translated as unrelated fragments, some twice. Boxes
 /// that mostly overlap, and neighbouring lines of one paragraph (separated by
 /// less than a line's thickness and running mostly side by side), become one
 /// block. Neighbouring lines in different bubbles stay apart.
@@ -1953,10 +1955,15 @@ fn union_detection(detections: &[KoharuLayoutDetection], group: &[usize]) -> Koh
                 bounds[3].max(value[3]),
             ]
         });
-    let x = bbox[0].floor().max(0.0) as u32;
-    let y = bbox[1].floor().max(0.0) as u32;
-    let width = (bbox[2].ceil() as u32).saturating_sub(x).max(1);
-    let height = (bbox[3].ceil() as u32).saturating_sub(y).max(1);
+    // A predicted box can end inside its own foreground mask.
+    let [x, y, right, bottom] = group
+        .iter()
+        .map(|&index| &detections[index].mask)
+        .filter(|mask| mask.width != 0 && mask.height != 0)
+        .map(|mask| [mask.x, mask.y, mask.x + mask.width, mask.y + mask.height])
+        .reduce(union_bounds)
+        .unwrap_or_default();
+    let (width, height) = (right - x, bottom - y);
     let mut mask = GrayImage::new(width, height);
     for &index in group {
         stamp_mask(&mut mask, &detections[index].mask, x, y);
@@ -2849,28 +2856,66 @@ mod tests {
     }
 
     #[test]
-    fn nms_removes_lower_scored_overlapping_regions_per_class() {
+    fn overlapping_text_keeps_both_masks_while_nms_suppresses_duplicate_bubbles() {
         let mut detections = vec![
-            detection("text", 0.8, [5.0, 5.0, 105.0, 105.0]),
+            KoharuLayoutDetection {
+                mask: full_mask(110, 10, 30, 80),
+                ..detection("text", 0.8, [0.0, 0.0, 150.0, 100.0])
+            },
+            KoharuLayoutDetection {
+                mask: full_mask(10, 10, 80, 80),
+                ..detection("text", 0.9, [0.0, 0.0, 100.0, 100.0])
+            },
             detection("bubble", 0.7, [0.0, 0.0, 100.0, 100.0]),
-            detection("text", 0.9, [0.0, 0.0, 100.0, 100.0]),
-            detection("text", 0.5, [20.0, 20.0, 80.0, 80.0]),
+            detection("bubble", 0.5, [5.0, 5.0, 105.0, 105.0]),
             detection("text", 0.6, [200.0, 0.0, 250.0, 50.0]),
         ];
 
         non_maximum_suppression(&mut detections, 0.5);
+        super::merge_text_blocks(&mut detections);
 
-        let text_scores = detections
+        let text = detections
             .iter()
             .filter(|detection| detection.label == "text")
+            .collect::<Vec<_>>();
+        assert_eq!(text.len(), 2);
+        let paragraph = text
+            .iter()
+            .find(|detection| detection.score == 0.9)
+            .unwrap();
+        assert_eq!(paragraph.bbox, [0.0, 0.0, 150.0, 100.0]);
+        assert!(paragraph.mask.contains(20, 20));
+        assert!(paragraph.mask.contains(120, 20));
+        let bubble_scores = detections
+            .iter()
+            .filter(|detection| detection.label == "bubble")
             .map(|detection| detection.score)
             .collect::<Vec<_>>();
-        assert_eq!(text_scores, [0.9, 0.6, 0.5]);
-        assert!(
-            detections
-                .iter()
-                .any(|detection| detection.label == "bubble")
-        );
+        assert_eq!(bubble_scores, [0.7]);
+    }
+
+    #[test]
+    fn paragraph_union_keeps_mask_pixels_outside_the_box() {
+        let mut detections = vec![
+            KoharuLayoutDetection {
+                mask: full_mask(7, 11, 8, 30),
+                ..detection("text", 0.9, [10.0, 10.0, 40.0, 50.0])
+            },
+            KoharuLayoutDetection {
+                mask: full_mask(65, 12, 10, 28),
+                ..detection("text", 0.8, [40.0, 10.0, 70.0, 50.0])
+            },
+        ];
+
+        super::merge_text_blocks(&mut detections);
+
+        let [paragraph] = detections.as_slice() else {
+            panic!("expected one paragraph");
+        };
+        assert_eq!(paragraph.bbox, [10.0, 10.0, 70.0, 50.0]);
+        assert!(paragraph.mask.contains(7, 11));
+        assert!(paragraph.mask.contains(74, 39));
+        assert_eq!(paragraph.area, 520);
     }
 
     #[test]
