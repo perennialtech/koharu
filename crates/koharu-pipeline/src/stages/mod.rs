@@ -10,7 +10,7 @@ use async_trait::async_trait;
 use koharu_scene::{Edit, EntityId, Generation, Patch, ProducerId, Snapshot};
 
 pub use detection::KoharuLayoutRFDetrSeg2XLConfig;
-pub use inpainting::{Flux2KleinConfig, RoremMixedConfig};
+pub use inpainting::Flux2KleinConfig;
 
 use crate::{Bounds, ImageCache, InpaintingMask, PipelineConfig, RequestTranslation, Stage};
 
@@ -155,10 +155,9 @@ mod tests {
 
     #[tokio::test]
     async fn registry_contains_every_stage() {
-        let translator = koharu_translator::Translator::from_config(
-            koharu_ml::Device::cpu(),
-            koharu_config::Config::memory(koharu_translator::ProvidersConfig::default()),
-        )
+        let translator = koharu_translator::Translator::from_config(koharu_config::Config::memory(
+            koharu_translator::ProvidersConfig::default(),
+        ))
         .unwrap();
         let stages = Stages::new(
             &PipelineConfig::default(),
@@ -172,7 +171,7 @@ mod tests {
             [
                 "koharu-layout-rfdetr-seg-2xl",
                 "paddleocr-vl-1.6",
-                "local",
+                "translator",
                 "lama",
             ]
         );

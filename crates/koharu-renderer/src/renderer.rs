@@ -10,11 +10,11 @@ use arc_swap::ArcSwap;
 use futures::future::try_join_all;
 use koharu_rasterizer::{RasterOptions, Rasterizer};
 use koharu_scene::{
-    Asset, AssetRole, BlobId, Change, Component, ComponentOwner, EntityChange, EntityId, FitsTo,
-    FlowsIn, Geometry, Group, OcrAnalysis, Origin, Page, Presents, RasterLayer, RasterLayerKind,
-    RecognizedFrom, Region, RelationChange, RelationId, RelationSpec, Revision, Snapshot,
-    TextAlignment, TextDirection, TextLayout as SceneTextLayout, TextLayoutKind, Translation,
-    Typography, Visibility,
+    Asset, AssetRole, BlobId, BubbleRegion, Change, Component, ComponentOwner, EntityChange,
+    EntityId, FitsTo, FlowsIn, Geometry, Group, OcrAnalysis, Origin, Page, PanelRegion, Presents,
+    RasterLayer, RasterLayerKind, RecognizedFrom, Region, RegionSpec, RelationChange, RelationId,
+    RelationSpec, Revision, Snapshot, SourceText, TextAlignment, TextDirection,
+    TextLayout as SceneTextLayout, TextLayoutKind, TextRegion, Translation, Typography, Visibility,
 };
 use parking_lot::Mutex;
 use rayon::prelude::*;
@@ -50,7 +50,14 @@ const MAX_SURFACE_PIXELS: u64 = 268_435_456;
 const DEFAULT_RETAINED_NODES: usize = 2_048;
 const MAX_RESOURCE_READS: usize = 8;
 const ASSETS_KIND: &str = "dev.koharu.assets";
+// The smallest readable font size is a share of the page, because scans range
+// from phone screenshots to 600 dpi. 9 px on a 1654 px wide page.
 const MINIMUM_FONT_SIZE: f32 = 9.0;
+const MINIMUM_FONT_SIZE_PER_PAGE_SIDE: f32 = 1.0 / 180.0;
+// Free text whose source region is at least this much taller than wide is a
+// vertical column that horizontal translations cannot fill.
+const FREE_TEXT_COLUMN_ASPECT: f32 = 1.5;
+const FREE_TEXT_GAP: f32 = 4.0;
 
 #[derive(Clone)]
 pub struct Renderer {
@@ -737,6 +744,27 @@ impl Traversal<'_> {
         if text.trim().is_empty() {
             return Ok(None);
         }
+        let typography = self.snapshot.component::<Typography>(entity)?;
+        let mut analysis = None;
+        let mut source_font_size = None;
+        if let Some(recognized) = self.snapshot.relation_from::<RecognizedFrom>(content)? {
+            let region = recognized.value().target;
+            dependencies.insert(RenderDependency::Relation(recognized.id()));
+            dependencies.insert(RenderDependency::Entity(region));
+            dependencies.insert(component_dependency::<OcrAnalysis>(region));
+            dependencies.insert(component_dependency::<Geometry>(region));
+            dependencies.insert(component_dependency::<SourceText>(content));
+            analysis = self.snapshot.component::<OcrAnalysis>(region)?;
+            source_font_size = self
+                .snapshot
+                .component::<SourceText>(content)?
+                .zip(
+                    self.snapshot
+                        .component::<Geometry>(region)?
+                        .and_then(|geometry| geometry_frame(&geometry, None)),
+                )
+                .and_then(|(source, frame)| source_glyph_size(&source.text.value, frame.bounds));
+        }
         let authored = self.snapshot.component::<Geometry>(entity)?;
         let placement = if let Some(placement) = self.balloon_flows.get(&entity) {
             dependencies.extend(placement.dependencies.iter().cloned());
@@ -744,7 +772,7 @@ impl Traversal<'_> {
         } else if let Some(placement) = self.balloon_flow(entity, dependencies)? {
             Some(placement)
         } else {
-            self.fit(entity, dependencies)?
+            self.fit(entity, source_font_size, dependencies)?
         };
         let (geometry, frame, balloon_contour) = if let Some(geometry) = authored {
             let Some(frame) = geometry_frame(&geometry, layout.angle_degrees) else {
@@ -765,19 +793,6 @@ impl Traversal<'_> {
                 placement.balloon_contour,
             )
         };
-        let typography = self.snapshot.component::<Typography>(entity)?;
-        let analysis =
-            if let Some(recognized) = self.snapshot.relation_from::<RecognizedFrom>(content)? {
-                dependencies.insert(RenderDependency::Relation(recognized.id()));
-                dependencies.insert(RenderDependency::Entity(recognized.value().target));
-                dependencies.insert(component_dependency::<OcrAnalysis>(
-                    recognized.value().target,
-                ));
-                self.snapshot
-                    .component::<OcrAnalysis>(recognized.value().target)?
-            } else {
-                None
-            };
         let writing_mode =
             resolve_writing_mode(&text, frame.bounds, typography.as_ref(), analysis.as_ref());
         let (direction, _) = shaping_direction_for_text(&text, writing_mode);
@@ -809,7 +824,8 @@ impl Traversal<'_> {
                 .and_then(|value| value.font_style)
                 .map(Into::into),
             font_size: typography.as_ref().and_then(|value| value.size),
-            minimum_font_size: MINIMUM_FONT_SIZE,
+            source_font_size,
+            minimum_font_size: readable_font_size(self.width, self.height),
             auto_fit: typography.as_ref().is_none_or(|value| value.auto_fit),
             alignment,
             writing_mode,
@@ -845,6 +861,7 @@ impl Traversal<'_> {
     fn fit(
         &self,
         entity: EntityId,
+        source_font_size: Option<f32>,
         dependencies: &mut BTreeSet<RenderDependency>,
     ) -> Result<Option<ResolvedPlacement>> {
         let Some(relation) = self.snapshot.relation_from::<FitsTo>(entity)? else {
@@ -861,12 +878,100 @@ impl Traversal<'_> {
         let Some(frame) = geometry_frame(&geometry, None) else {
             return Ok(None);
         };
+        if frame.bounds.height < frame.bounds.width * FREE_TEXT_COLUMN_ASPECT {
+            return Ok(Some(ResolvedPlacement {
+                geometry,
+                frame,
+                balloon_contour: None,
+                dependencies: Arc::from([]),
+            }));
+        }
+        // Neighbouring free text keeps at least half a source glyph of space.
+        let gap = source_font_size.map_or(FREE_TEXT_GAP, |size| (size * 0.5).max(FREE_TEXT_GAP));
+        // A tilted column widens in its own axes. Its unrotated bounds share
+        // the column's center, which is close enough to test neighbours at the
+        // few degrees lettering is tilted by.
+        let bounds = self.widen_free_text(target, frame.bounds, gap, dependencies)?;
+        let (sin, cos) = f64::from(frame.angle_degrees).to_radians().sin_cos();
+        let center_x = f64::from(bounds.x) + f64::from(bounds.width) * 0.5;
+        let center_y = f64::from(bounds.y) + f64::from(bounds.height) * 0.5;
+        let (half_width, half_height) = (
+            f64::from(bounds.width) * 0.5,
+            f64::from(bounds.height) * 0.5,
+        );
+        let geometry = Geometry {
+            origin: geometry.origin,
+            points: [(-1.0, -1.0), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0)]
+                .into_iter()
+                .map(|(x, y)| {
+                    let (x, y) = (x * half_width, y * half_height);
+                    koharu_scene::Point {
+                        x: center_x + x * cos - y * sin,
+                        y: center_y + x * sin + y * cos,
+                    }
+                })
+                .collect(),
+        };
         Ok(Some(ResolvedPlacement {
             geometry,
-            frame,
+            frame: GeometryFrame {
+                bounds,
+                angle_degrees: frame.angle_degrees,
+            },
             balloon_contour: None,
             dependencies: Arc::from([]),
         }))
+    }
+
+    /// Collects the panels and neighbouring text and balloons that bound a
+    /// free vertical text column on this page.
+    fn widen_free_text(
+        &self,
+        target: EntityId,
+        column: LayoutBox,
+        gap: f32,
+        dependencies: &mut BTreeSet<RenderDependency>,
+    ) -> Result<LayoutBox> {
+        dependencies.insert(RenderDependency::Hierarchy(self.page));
+        let mut panels = Vec::new();
+        let mut obstacles = Vec::new();
+        for entity in self.snapshot.children(self.page)? {
+            if entity == target {
+                continue;
+            }
+            dependencies.insert(component_dependency::<Region>(entity));
+            let Some(region) = self.snapshot.component::<Region>(entity)? else {
+                continue;
+            };
+            let panel = region.kind == PanelRegion::kind();
+            if !panel && region.kind != TextRegion::kind() && region.kind != BubbleRegion::kind() {
+                continue;
+            }
+            dependencies.insert(component_dependency::<Geometry>(entity));
+            let Some(bounds) = self
+                .snapshot
+                .component::<Geometry>(entity)?
+                .as_ref()
+                .and_then(geometry_bounds)
+            else {
+                continue;
+            };
+            if panel {
+                panels.push(bounds);
+            } else {
+                obstacles.push(Obstacle {
+                    bounds,
+                    shared: region.kind == TextRegion::kind(),
+                });
+            }
+        }
+        let page = LayoutBox {
+            x: 0.0,
+            y: 0.0,
+            width: self.width as f32,
+            height: self.height as f32,
+        };
+        Ok(widen_column(column, &panels, page, &obstacles, gap))
     }
 
     fn balloon_flow(
@@ -894,6 +999,78 @@ impl Traversal<'_> {
             frame,
             dependencies: Arc::from([]),
         }))
+    }
+}
+
+struct Obstacle {
+    bounds: LayoutBox,
+    /// Free text beside a column may widen toward it too, so the gap between
+    /// them is shared at its midpoint. A balloon keeps its own bounds.
+    shared: bool,
+}
+
+/// Widens a vertical column toward a square inside the smallest panel holding
+/// its center, keeping `gap` from the panel edge and from text and balloons
+/// beside it. Growth is centered and spills to the other side when one side is
+/// blocked.
+fn widen_column(
+    column: LayoutBox,
+    panels: &[LayoutBox],
+    page: LayoutBox,
+    obstacles: &[Obstacle],
+    gap: f32,
+) -> LayoutBox {
+    let center_x = column.x + column.width * 0.5;
+    let center_y = column.y + column.height * 0.5;
+    let container = panels
+        .iter()
+        .filter(|panel| {
+            panel.x <= center_x
+                && center_x <= panel.x + panel.width
+                && panel.y <= center_y
+                && center_y <= panel.y + panel.height
+        })
+        .min_by(|left, right| (left.width * left.height).total_cmp(&(right.width * right.height)))
+        .copied()
+        .unwrap_or(page);
+    let column_right = column.x + column.width;
+    let column_bottom = column.y + column.height;
+    let mut left = container.x.max(page.x) + gap;
+    let mut right = (container.x + container.width).min(page.x + page.width) - gap;
+    for Obstacle { bounds, shared } in obstacles {
+        if bounds.y >= column_bottom || bounds.y + bounds.height <= column.y {
+            continue;
+        }
+        let bounds_right = bounds.x + bounds.width;
+        if bounds_right <= column.x {
+            let edge = if *shared {
+                (bounds_right + column.x + gap) * 0.5
+            } else {
+                bounds_right + gap
+            };
+            left = left.max(edge);
+        } else if bounds.x >= column_right {
+            let edge = if *shared {
+                (bounds.x + column_right - gap) * 0.5
+            } else {
+                bounds.x - gap
+            };
+            right = right.min(edge);
+        }
+    }
+    let left_room = (column.x - left).max(0.0);
+    let right_room = (right - column_right).max(0.0);
+    let extra = (column.height - column.width).min(left_room + right_room);
+    if extra <= 0.0 {
+        return column;
+    }
+    let grow_right = (extra * 0.5).min(right_room).max(extra - left_room);
+    let grow_left = extra - grow_right;
+    LayoutBox {
+        x: column.x - grow_left,
+        y: column.y,
+        width: column.width + extra,
+        height: column.height,
     }
 }
 
@@ -1400,6 +1577,26 @@ fn surface_size(page: &Page) -> Result<(u32, u32)> {
     Ok((width, height))
 }
 
+fn readable_font_size(width: u32, height: u32) -> f32 {
+    (width.min(height) as f32 * MINIMUM_FONT_SIZE_PER_PAGE_SIDE).max(MINIMUM_FONT_SIZE)
+}
+
+/// Estimates the em size of the source lettering from how many glyph cells
+/// fill its region. CJK glyphs, punctuation included, each occupy a square
+/// cell, so a region of `n` glyphs has an area near `n` cells. Whitespace and
+/// line-break characters take no cell.
+fn source_glyph_size(text: &str, bounds: LayoutBox) -> Option<f32> {
+    let glyphs = text.chars().filter(|value| !value.is_whitespace()).count();
+    if glyphs == 0 || bounds.width <= 0.0 || bounds.height <= 0.0 {
+        return None;
+    }
+    Some(
+        (bounds.width * bounds.height / glyphs as f32)
+            .sqrt()
+            .min(bounds.width.min(bounds.height)),
+    )
+}
+
 fn resolve_writing_mode(
     text: &str,
     bounds: LayoutBox,
@@ -1678,6 +1875,65 @@ impl OutlinePen for PreviewOutline<'_> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn free_columns_widen_inside_their_panel_and_stop_at_neighbours() {
+        use super::{LayoutBox, Obstacle, widen_column};
+        let rect = |x, y, width, height| LayoutBox {
+            x,
+            y,
+            width,
+            height,
+        };
+        let page = rect(0.0, 0.0, 1000.0, 1000.0);
+        let column = rect(500.0, 100.0, 40.0, 200.0);
+
+        // Unobstructed: centered growth to a square, inside the panel.
+        let panel = rect(300.0, 50.0, 500.0, 400.0);
+        assert_eq!(
+            widen_column(column, &[panel], page, &[], 4.0),
+            rect(420.0, 100.0, 200.0, 200.0)
+        );
+        // A balloon on the right blocks that side; growth spills left.
+        let balloon = Obstacle {
+            bounds: rect(560.0, 150.0, 100.0, 100.0),
+            shared: false,
+        };
+        assert_eq!(
+            widen_column(column, &[panel], page, &[balloon], 4.0),
+            rect(356.0, 100.0, 200.0, 200.0)
+        );
+        // A tight panel limits both sides, short of its border.
+        let narrow = rect(480.0, 50.0, 100.0, 400.0);
+        assert_eq!(
+            widen_column(column, &[narrow, panel], page, &[], 4.0),
+            rect(484.0, 100.0, 92.0, 200.0)
+        );
+    }
+
+    #[test]
+    fn neighbouring_free_columns_split_the_gap_between_them() {
+        use super::{LayoutBox, Obstacle, widen_column};
+        let rect = |x, y, width, height| LayoutBox {
+            x,
+            y,
+            width,
+            height,
+        };
+        let page = rect(0.0, 0.0, 1000.0, 1000.0);
+        let first = rect(500.0, 100.0, 40.0, 400.0);
+        let second = rect(600.0, 120.0, 40.0, 400.0);
+        let shared = |bounds| Obstacle {
+            bounds,
+            shared: true,
+        };
+
+        let widened_first = widen_column(first, &[], page, &[shared(second)], 10.0);
+        let widened_second = widen_column(second, &[], page, &[shared(first)], 10.0);
+
+        assert_eq!(widened_first.x + widened_first.width, 565.0);
+        assert_eq!(widened_second.x, 575.0);
+    }
+
     use std::{collections::BTreeMap, io::Cursor};
 
     use koharu_scene::{

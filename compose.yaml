@@ -17,12 +17,30 @@ services:
     volumes:
       - koharu-cache:/var/cache/koharu
     environment:
-      - KOHARU_PROVIDER
-      - KOHARU_MODEL
+      - KOHARU_TRANSLATORS
       - KOHARU_INPAINTING
+      - KOHARU_DEEPLX_BASE_URL
       - KOHARU_OPENAI_COMPATIBLE_BASE_URL
+      - KOHARU_OPENAI_COMPATIBLE_MODEL
+      - KOHARU_OPENROUTER_MODEL
+      - KOHARU_AZURE_REGION
+      - DEEPL_API_KEY
+      - GOOGLE_CLOUD_TRANSLATION_API_KEY
+      - AZURE_TRANSLATOR_KEY
       - OPENROUTER_API_KEY
       - OPENAI_COMPATIBLE_API_KEY
+
+  # Uncomment to run DeepLX on the Compose network without publishing a port.
+  # Set KOHARU_DEEPLX_BASE_URL=http://deeplx:1188 in the host environment.
+  # deeplx:
+  #   image: ghcr.io/owo-network/deeplx@sha256:f1af0bce495dedd71708317d098a37d4d23ee8f40fe3c634e72cb2e86e6ad93f # v1.3.1
+  #   read_only: true
+  #   cap_drop:
+  #     - ALL
+  #   security_opt:
+  #     - no-new-privileges:true
+  #   tmpfs:
+  #     - /tmp:rw,nosuid,nodev
 
 volumes:
   koharu-cache:

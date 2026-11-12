@@ -1,9 +1,9 @@
 use anyhow::Result;
-use koharu_translator::{GenerationConfig, Language};
+use koharu_translator::{GenerationConfig, Language, Provider};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use specta::Type;
 
-use crate::stages::{Flux2KleinConfig, KoharuLayoutRFDetrSeg2XLConfig, RoremMixedConfig};
+use crate::stages::{Flux2KleinConfig, KoharuLayoutRFDetrSeg2XLConfig};
 
 #[derive(Clone, Debug, PartialEq, Type)]
 pub struct PipelineConfig {
@@ -64,23 +64,15 @@ impl Serialize for PipelineConfig {
         };
         let inpainting = match &self.inpainting {
             InpaintingModel::LaMa {} => "lama",
-            InpaintingModel::AotInpainting {} => "aot-inpainting",
             InpaintingModel::Flux2Klein(_) => "flux2-klein",
-            InpaintingModel::RoremMixed(_) => "rorem-mixed",
         };
         let mut processor = self.processor.clone();
         let DetectionModel::KoharuLayoutRFDetrSeg2XL(config) = &self.detection;
         processor
             .koharu_layout_rfdetr_seg_2xl
             .get_or_insert_with(|| config.clone());
-        match &self.inpainting {
-            InpaintingModel::Flux2Klein(config) => {
-                processor.flux2_klein.get_or_insert_with(|| config.clone());
-            }
-            InpaintingModel::RoremMixed(config) => {
-                processor.rorem_mixed.get_or_insert_with(|| config.clone());
-            }
-            InpaintingModel::LaMa {} | InpaintingModel::AotInpainting {} => {}
+        if let InpaintingModel::Flux2Klein(config) = &self.inpainting {
+            processor.flux2_klein.get_or_insert_with(|| config.clone());
         }
         PipelineFile {
             detection: ModelSelection {
@@ -128,12 +120,8 @@ impl<'de> Deserialize<'de> for PipelineConfig {
         };
         let inpainting = match file.inpainting.model.as_str() {
             "lama" => InpaintingModel::LaMa {},
-            "aot-inpainting" => InpaintingModel::AotInpainting {},
             "flux2-klein" => {
                 InpaintingModel::Flux2Klein(file.processor.flux2_klein.clone().unwrap_or_default())
-            }
-            "rorem-mixed" => {
-                InpaintingModel::RoremMixed(file.processor.rorem_mixed.clone().unwrap_or_default())
             }
             model => {
                 return Err(serde::de::Error::custom(format!(
@@ -167,7 +155,8 @@ impl Default for PipelineConfig {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Type)]
 pub struct TranslationConfig {
-    pub model: koharu_translator::ModelSelection,
+    /// Engines to try in order until one returns a complete translation.
+    pub engines: Vec<Provider>,
     pub generation: GenerationConfig,
     #[specta(type = String)]
     pub target_language: Language,
@@ -177,7 +166,7 @@ pub struct TranslationConfig {
 impl Default for TranslationConfig {
     fn default() -> Self {
         Self {
-            model: koharu_translator::ModelSelection::default(),
+            engines: vec![Provider::GoogleWeb, Provider::MicrosoftEdge],
             generation: GenerationConfig::default(),
             target_language: Language::English,
             instructions: None,
@@ -206,16 +195,9 @@ impl PipelineConfig {
     pub fn inpainting(&self) -> Result<InpaintingModel> {
         match &self.inpainting {
             InpaintingModel::LaMa {} => Ok(InpaintingModel::LaMa {}),
-            InpaintingModel::AotInpainting {} => Ok(InpaintingModel::AotInpainting {}),
             InpaintingModel::Flux2Klein(config) => Ok(InpaintingModel::Flux2Klein(
                 self.processor
                     .flux2_klein
-                    .clone()
-                    .unwrap_or_else(|| config.clone()),
-            )),
-            InpaintingModel::RoremMixed(config) => Ok(InpaintingModel::RoremMixed(
-                self.processor
-                    .rorem_mixed
                     .clone()
                     .unwrap_or_else(|| config.clone()),
             )),
@@ -236,8 +218,6 @@ pub struct ProcessorConfig {
     pub koharu_layout_rfdetr_seg_2xl: Option<KoharuLayoutRFDetrSeg2XLConfig>,
     #[serde(rename = "flux2-klein")]
     pub flux2_klein: Option<Flux2KleinConfig>,
-    #[serde(rename = "rorem-mixed")]
-    pub rorem_mixed: Option<RoremMixedConfig>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Type)]
@@ -259,12 +239,8 @@ pub enum OcrModel {
 pub enum InpaintingModel {
     #[serde(rename = "lama")]
     LaMa {},
-    #[serde(rename = "aot-inpainting")]
-    AotInpainting {},
     #[serde(rename = "flux2-klein")]
     Flux2Klein(Flux2KleinConfig),
-    #[serde(rename = "rorem-mixed")]
-    RoremMixed(RoremMixedConfig),
 }
 
 #[cfg(test)]
@@ -294,11 +270,10 @@ mod tests {
                 model = "paddleocr-vl-1.6"
 
                 [inpainting]
-                model = "rorem-mixed"
+                model = "flux2-klein"
 
-                [processor."rorem-mixed"]
+                [processor."flux2-klein"]
                 prompt = "Remove the lettering."
-                negative_prompt = "letters, words"
             "#,
         )
         .unwrap();
@@ -310,9 +285,8 @@ mod tests {
         assert!(matches!(config.ocr, OcrModel::PaddleOcrVl1_6));
         assert!(matches!(
             config.inpainting(),
-            Ok(InpaintingModel::RoremMixed(config))
+            Ok(InpaintingModel::Flux2Klein(config))
                 if config.prompt == "Remove the lettering."
-                    && config.negative_prompt == "letters, words"
         ));
     }
 

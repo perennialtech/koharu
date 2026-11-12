@@ -15,7 +15,6 @@ publish.workspace = true
 anyhow = { workspace = true }
 arc-swap = { workspace = true }
 async-trait = { workspace = true }
-clap = { workspace = true }
 futures = { workspace = true }
 image = { workspace = true }
 imageproc = { workspace = true }
@@ -34,14 +33,9 @@ tokio = { workspace = true }
 tokio-rayon = { workspace = true }
 tracing = { workspace = true }
 
-[target.'cfg(any(target_os = "linux", target_os = "windows"))'.dependencies]
+[target.'cfg(target_os = "linux")'.dependencies]
 nvml-wrapper = { workspace = true }
-
-[target.'cfg(target_os = "windows")'.dependencies]
-windows = { workspace = true, features = [
-    "Win32_Graphics_Dxgi",
-    "Win32_Graphics_Dxgi_Common",
-] }
 
 [dev-dependencies]
 toml = { workspace = true }
+tracing-subscriber = { workspace = true }

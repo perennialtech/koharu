@@ -2,7 +2,7 @@
 name = "koharu-translator"
 version.workspace = true
 edition.workspace = true
-description = "Local and hosted translation backends for Koharu."
+description = "Machine-translation and hosted LLM translation backends for Koharu."
 license.workspace = true
 authors.workspace = true
 readme.workspace = true
@@ -13,13 +13,10 @@ publish.workspace = true
 
 [dependencies]
 koharu-config = { workspace = true }
-koharu-ml = { workspace = true }
 koharu-runtime = { workspace = true }
 anyhow = { workspace = true }
 base64 = { workspace = true }
-clap = { workspace = true }
 fast_image_resize = { workspace = true }
-futures = { workspace = true }
 image = { workspace = true }
 indoc = { workspace = true }
 reqwest = { workspace = true }
@@ -28,7 +25,8 @@ serde_json = { workspace = true }
 specta = { workspace = true }
 strum = { workspace = true }
 thiserror = { workspace = true }
-tokio = { workspace = true }
-tokio-rayon = { workspace = true }
 tracing = { workspace = true }
 url = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }

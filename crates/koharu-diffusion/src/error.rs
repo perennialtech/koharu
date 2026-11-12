@@ -21,17 +21,6 @@ pub enum Error {
     ZeroImageDimension,
     #[error("native image has {actual} channels; expected {expected}")]
     UnexpectedNativeImageChannelCount { expected: u32, actual: u32 },
-    #[error(
-        "invalid audio buffer: {sample_count} samples across {channels} channels requires {expected} values, got {actual}"
-    )]
-    InvalidAudioBuffer {
-        sample_count: u64,
-        channels: u32,
-        expected: usize,
-        actual: usize,
-    },
-    #[error("audio dimensions overflow the addressable buffer size")]
-    AudioDimensionsOverflow,
     #[error("{field} has {len} entries, which exceeds the native API limit")]
     CountOverflow { field: &'static str, len: usize },
     #[error("invalid parameter {name}: {reason}")]
@@ -43,26 +32,12 @@ pub enum Error {
     ContextCreationFailed,
     #[error("stable-diffusion.cpp failed to generate images")]
     ImageGenerationFailed,
-    #[error("stable-diffusion.cpp failed to generate video")]
-    VideoGenerationFailed,
     #[error("stable-diffusion.cpp returned an invalid {kind} output")]
     InvalidNativeOutput { kind: &'static str },
-    #[error("stable-diffusion.cpp failed to create an upscaler context")]
-    UpscalerCreationFailed,
-    #[error("stable-diffusion.cpp failed to upscale the image")]
-    UpscaleFailed,
-    #[error("stable-diffusion.cpp failed to convert the model")]
-    ConversionFailed,
-    #[error("stable-diffusion.cpp failed to preprocess the image")]
-    PreprocessFailed,
-    #[error("stable-diffusion.cpp failed to load the importance matrix")]
-    ImatrixLoadFailed,
     #[error("a native callback cannot be reconfigured from inside a native call or callback")]
     ReentrantCallbackConfiguration,
     #[error("preview interval must be greater than zero")]
     InvalidPreviewInterval,
-    #[error("an importance-matrix collection is already active")]
-    ImatrixCollectionAlreadyActive,
     #[error("invalid {kind} value returned by stable-diffusion.cpp: {value}")]
     InvalidEnum { kind: &'static str, value: i64 },
     #[error("unknown {kind} name: {value}")]

@@ -32,19 +32,11 @@ pub use layer_norm::*;
 mod sparse;
 pub use sparse::*;
 
-mod rnn;
-pub use rnn::*;
-
 mod func;
 pub use func::*;
 
 mod sequential;
 pub use sequential::*;
-
-mod optimizer;
-pub use optimizer::{
-    adam, adamw, rms_prop, sgd, Adam, AdamW, Optimizer, OptimizerConfig, RmsProp, Sgd,
-};
 
 /// An identity layer. This just propagates its tensor input as output.
 #[derive(Debug)]
@@ -53,17 +45,5 @@ pub struct Id();
 impl ModuleT for Id {
     fn forward_t(&self, xs: &crate::Tensor, _train: bool) -> crate::Tensor {
         xs.shallow_clone()
-    }
-}
-
-impl Module for crate::CModule {
-    fn forward(&self, xs: &crate::Tensor) -> crate::Tensor {
-        self.forward_ts(&[xs]).unwrap()
-    }
-}
-
-impl ModuleT for crate::TrainableCModule {
-    fn forward_t(&self, xs: &crate::Tensor, _train: bool) -> crate::Tensor {
-        self.inner.forward_ts(&[xs]).unwrap()
     }
 }

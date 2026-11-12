@@ -1,9 +1,9 @@
 # Koharu
 
 Koharu is a headless manga-page translation service. It detects text regions,
-reads Japanese text with PaddleOCR-VL 1.6, translates it with local Gemma 4 E4B
-or an explicitly selected hosted provider, removes the original text, and
-renders the translation as a PNG. It accepts JPEG, PNG, and WebP pages.
+reads Japanese text with PaddleOCR-VL 1.6, translates it through machine
+translation services or hosted LLMs, removes the original text, and renders
+the translation as a PNG. It accepts JPEG, PNG, and WebP pages.
 
 ## Docker
 
@@ -34,7 +34,7 @@ docker run --rm --name koharu --gpus all \
 ### Docker Compose
 
 The included [`compose.yaml`](compose.yaml) runs the same image and mounts the
-same persistent cache with the same hardening settings:
+same model and runtime cache with the same hardening settings:
 
 ```sh
 docker compose up -d
@@ -56,63 +56,69 @@ unprivileged user, with a read-only root filesystem, a temporary `/tmp`, and
 capabilities dropped. Do not mount the Docker socket or give the container
 `--privileged` access.
 
-The default translator runs locally. For a hosted translator, set
-`KOHARU_PROVIDER`, `KOHARU_MODEL`, and the appropriate API key in your shell;
-Compose passes those variables through if set. For `docker run`, add the
-corresponding `--env KOHARU_PROVIDER --env KOHARU_MODEL` and
-`--env OPENROUTER_API_KEY` (or `--env OPENAI_COMPATIBLE_API_KEY`) flags. The
-optional `KOHARU_OPENAI_COMPATIBLE_BASE_URL` and `KOHARU_INPAINTING` settings
-are also available. Do not commit credentials or put them in command-line
-values. Run `docker run --rm ghcr.io/perennialtech/koharu:latest --help` for
-the complete configuration reference.
+Set configuration and API keys as environment variables in your shell;
+Compose passes the documented ones through if set. For `docker run`, add an
+`--env NAME` flag for each. Do not commit credentials or put them in
+command-line values. Run `docker run --rm ghcr.io/perennialtech/koharu:latest
+--help` for the complete configuration reference.
 
-Send a page as the raw request body:
+## HTTP API
 
-```sh
-curl --fail --data-binary @page.webp \
-  'http://127.0.0.1:8080/translate?target_language=en' \
-  --output page.en.png
-```
+Open [Swagger UI](http://127.0.0.1:8080/docs/) to try the API, or use the
+[OpenAPI JSON](http://127.0.0.1:8080/openapi.json) to build a client.
 
-`POST /translate` returns `image/png`. The `target_language` query parameter
-defaults to English; the optional `instructions` parameter accepts URL-encoded
-translation guidance. Identical requests are served from a disk cache in the
-same volume. The service processes requests one at a time.
+`GET /translators` lists the engines this server can call and its default
+order. Submit a page as multipart form data to `POST /translations`, with one
+`translator` field per engine to try in order; leave them out to use the
+default order. The response
+includes a job ID and a `Location` header. Poll that URL or subscribe to its
+`/events` endpoint for live progress. When the job completes, download the PNG
+from the `result_url` in the response. Use the job's `/cancel` endpoint to
+request cancellation.
+
+Koharu runs one job at a time. Jobs continue after clients disconnect. Jobs
+and their results live in memory and expire after an hour in a terminal
+state or immediately on server restart. Each submission runs independently.
 
 ## Bare-metal build
 
-On Linux, install Rust 1.99 or later, Clang and libclang, CMake, and the
-Fontconfig development headers. For Ubuntu 24.04:
+On Linux, install Rust 1.99 or later, Clang and libclang. Fontconfig is loaded
+at runtime. For Ubuntu 24.04:
 
 ```sh
-sudo apt-get install clang libclang-dev cmake libfontconfig-dev
+sudo apt-get install clang libclang-dev libfontconfig1
 LIBCLANG_PATH=/usr/lib/llvm-18/lib cargo build --locked -p koharu-server
 ./target/debug/koharu-server --listen 127.0.0.1:8080
 ```
 
 On other systems, set `LIBCLANG_PATH` to the directory containing the
-installed `libclang` library as needed. The same `/translate` endpoint is
-available without a container.
+installed `libclang` library as needed. The same HTTP API is available
+without a container.
 
-## Configuration and privacy
+## Configuration
 
 Run `koharu-server --help` (or `./target/debug/koharu-server --help`) for the
-supported flags, defaults and environment-variable fallbacks. You can choose
-the translator, model, inpainting model, listener address, cache directory and
-OpenAI-compatible base URL there.
+supported flags, defaults, environment-variable fallbacks and the API keys
+each translation provider reads. You can choose the translation engines and
+their failover order, the models LLM engines use, the inpainting model, the
+listener address, and the endpoints of self-hosted translators there. API
+callers choose engines by name but never their models.
 
-Local Gemma translation is the default and does not send images or text to a
-hosted translation provider. Selecting OpenRouter or an OpenAI-compatible
-endpoint is an explicit operator decision. Hosted translation sends page
-images and recognized text to that service. Set `OPENROUTER_API_KEY` for
-OpenRouter; `OPENAI_COMPATIBLE_API_KEY` is optional for OpenAI-compatible
-endpoints. Never put credentials in command arguments or the repository.
+Every translation engine is a remote service, so recognized text goes to the
+engines you select; LLM engines also receive the page image. Without any
+configuration, Koharu uses Google Translate's web endpoint and falls back to
+Microsoft Translator's Edge endpoint. Neither needs an account.
+
+To use DeepL without an API key, uncomment the optional `deeplx` service in
+[`compose.yaml`](compose.yaml), set `KOHARU_DEEPLX_BASE_URL=http://deeplx:1188`
+in the environment where you run Compose, and start the stack. DeepLX is
+accessible to Koharu over the Compose network but has no published host port.
+Set `KOHARU_TRANSLATORS=deeplx` to use it as the default translator.
 
 ## Development
 
 See [AGENTS.md](AGENTS.md) for repository rules and the one command used by CI
-to check changes. Keep contributions focused and follow the
-[Code of Conduct](CODE_OF_CONDUCT.md).
+to check changes. Keep contributions focused.
 
 ## License
 

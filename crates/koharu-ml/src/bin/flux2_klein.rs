@@ -20,6 +20,8 @@ struct Cli {
     #[arg(short, long, value_name = "TEXT")]
     prompt: String,
 
+    /// Image the model is conditioned on. When inpainting it must have the
+    /// input's size and defaults to the input.
     #[arg(long, value_name = "FILE")]
     reference: Option<PathBuf>,
 
@@ -47,7 +49,7 @@ async fn main() -> Result<()> {
     let mask = cli.mask.as_ref().map(image::open).transpose()?;
     let reference = cli.reference.as_ref().map(image::open).transpose()?;
 
-    koharu_ml::init().await?;
+    koharu_ml::init(&[koharu_ml::Feature::Diffusion]).await?;
 
     let output = if let Some(mask) = mask.as_ref() {
         let input = input

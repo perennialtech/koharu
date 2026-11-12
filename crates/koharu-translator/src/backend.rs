@@ -2,7 +2,10 @@ use std::{io::Cursor, sync::Arc};
 
 use anyhow::Context;
 use base64::{Engine as _, engine::general_purpose::STANDARD};
-use fast_image_resize::{FilterType, ResizeAlg, ResizeOptions, Resizer};
+use fast_image_resize::{
+    FilterType, IntoImageView as _, IntoImageViewMut as _, ResizeAlg, ResizeOptions, Resizer,
+    pixels::U8x3,
+};
 use image::{DynamicImage, ImageEncoder, RgbImage, codecs::jpeg::JpegEncoder};
 
 use crate::Language;
@@ -15,6 +18,8 @@ pub struct TranslationRequest {
     pub segments: Vec<String>,
     pub source_language: Option<Language>,
     pub target_language: Language,
+    /// Optional guidance for providers that can follow it. Machine-translation
+    /// providers ignore it.
     pub instructions: Option<String>,
     pub context: Vec<TranslationContext>,
     pub image: Option<Arc<DynamicImage>>,
@@ -77,15 +82,25 @@ impl TranslationRequest {
             (u64::from(height) * u64::from(MAX_IMAGE_DIMENSION) / u64::from(longest)).max(1) as u32;
         let source = image.to_rgb8();
         let mut resized = RgbImage::new(resized_width, resized_height);
-        Resizer::new()
-            .resize(
-                &source,
-                &mut resized,
-                &ResizeOptions::new()
-                    .resize_alg(ResizeAlg::Convolution(FilterType::Lanczos3))
-                    .use_alpha(false),
-            )
-            .context("failed to resize translation image")?;
+        // `resize_typed` instantiates the resampler for one pixel type; the
+        // untyped `resize` monomorphizes all of them into this crate.
+        {
+            let (Some(source_view), Some(mut resized_view)) = (
+                source.image_view::<U8x3>(),
+                resized.image_view_mut::<U8x3>(),
+            ) else {
+                anyhow::bail!("translation image is not 8-bit RGB");
+            };
+            Resizer::new()
+                .resize_typed(
+                    &source_view,
+                    &mut resized_view,
+                    &ResizeOptions::new()
+                        .resize_alg(ResizeAlg::Convolution(FilterType::Lanczos3))
+                        .use_alpha(false),
+                )
+                .context("failed to resize translation image")?;
+        }
         self.image = Some(Arc::new(DynamicImage::ImageRgb8(resized)));
         Ok(())
     }

@@ -1,12 +1,12 @@
 //! Safe, owning wrappers for the stable-diffusion.cpp C API.
 //!
 //! The crate mirrors the upstream API closely while keeping C strings, input
-//! buffers, contexts, generated images, and generated audio under Rust
+//! buffers, contexts, and generated images under Rust
 //! ownership. The native library is loaded dynamically by
 //! [`koharu_diffusion_sys`].
 //!
 //! Raster inputs and outputs use the `image` crate directly: [`RgbImage`] for
-//! generated/reference/control images and video frames, and [`GrayImage`] for
+//! generated/reference/control images, and [`GrayImage`] for
 //! masks.
 //!
 //! ```no_run
@@ -33,14 +33,12 @@
 
 mod callbacks;
 mod context;
-mod convert;
 mod enums;
 mod error;
 mod ffi;
 mod image;
 mod params;
 mod system;
-mod upscaler;
 
 pub use ::image::{GrayImage, RgbImage};
 pub use callbacks::{
@@ -50,16 +48,11 @@ pub use callbacks::{
     set_preview_callback, set_progress_callback,
 };
 pub use context::{CancelHandle, Context};
-pub use convert::{
-    CannyParams, ComponentConversion, Conversion, ImatrixCollector, begin_imatrix_collection,
-    convert, convert_with_components, load_imatrix, preprocess_canny,
-};
 pub use enums::*;
 pub use error::{Error, Result};
-pub use image::{Audio, RgbImageView, Video};
+pub use image::RgbImageView;
 pub use params::*;
-pub use system::{Device, commit, list_devices, physical_core_count, system_info, version};
-pub use upscaler::{Upscaler, UpscalerParams};
+pub use system::physical_core_count;
 
 /// Low-level bindings for functionality not yet represented by the safe API.
 pub use koharu_diffusion_sys as sys;

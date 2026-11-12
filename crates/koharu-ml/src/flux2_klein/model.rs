@@ -53,7 +53,6 @@ impl Model {
 fn context_params(device: &crate::Device, paths: ModelPaths) -> ContextParams {
     let use_accelerator = device.backend != Backend::Cpu;
     let use_cuda = device.backend == Backend::Cuda;
-    let keep_parameters_resident = use_accelerator && device.memory_free >= 20 * 1024 * 1024 * 1024;
     ContextParams {
         diffusion_model_path: Some(paths.transformer),
         llm_path: Some(paths.text_encoder),
@@ -64,11 +63,14 @@ fn context_params(device: &crate::Device, paths: ModelPaths) -> ContextParams {
         diffusion_conv_direct: use_cuda,
         vae_conv_direct: use_cuda,
         vae_format: VaeFormat::Flux2,
+        // stable-diffusion.cpp rejects the context when SageAttention has no
+        // kernel for the device, and its kernels start at SM80.
+        sage_attention: use_cuda && device.compute_capability() >= 80,
         backend: Some(device.name.clone()),
-        // The text encoder and denoiser run in separate phases. Cards with less
-        // headroom keep source parameters in RAM; high-VRAM cards avoid repeated
-        // staging by retaining both quantized models on the accelerator.
-        params_backend: (use_accelerator && !keep_parameters_resident).then(|| "*=cpu".to_owned()),
+        // The prompt is constant, so the conditioning cache runs the text
+        // encoder once per load. Its parameters stay in RAM; the denoiser and
+        // VAE run for every tile and stay resident on the accelerator.
+        params_backend: use_accelerator.then(|| "te=cpu".to_owned()),
         ..ContextParams::default()
     }
 }

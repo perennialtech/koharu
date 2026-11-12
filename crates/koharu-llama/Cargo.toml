@@ -19,13 +19,6 @@ koharu-llama-sys = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 tracing-core = { workspace = true }
-llguidance = { workspace = true, optional = true }
-toktrie = { workspace = true, optional = true }
-
-[features]
-default = []
-sampler = []
-llguidance = ["dep:llguidance", "dep:toktrie"]
 
 [dev-dependencies]
 tracing-subscriber = { workspace = true }

@@ -134,7 +134,6 @@ impl Cuda {
             memory_total,
             memory_free: 0,
             compute_capability,
-            target: None,
         })
     }
 }
@@ -149,26 +148,7 @@ pub(super) fn probe() -> Vec<Device> {
         .collect()
 }
 
-#[cfg(target_os = "windows")]
-fn load_library() -> Option<Library> {
-    // Exclude application-local and working-directory DLLs from driver discovery.
-    unsafe {
-        libloading::os::windows::Library::load_with_flags(
-            "nvcuda.dll",
-            libloading::os::windows::LOAD_LIBRARY_SEARCH_SYSTEM32,
-        )
-        .ok()
-        .map(Into::into)
-    }
-}
-
-#[cfg(target_os = "linux")]
 fn load_library() -> Option<Library> {
     // The unversioned name may resolve to a toolkit stub instead of the driver.
     unsafe { Library::new("libcuda.so.1").ok() }
-}
-
-#[cfg(not(any(target_os = "windows", target_os = "linux")))]
-fn load_library() -> Option<Library> {
-    None
 }

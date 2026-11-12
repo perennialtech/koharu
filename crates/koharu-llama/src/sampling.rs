@@ -372,16 +372,6 @@ impl LlamaSampler {
         }
     }
 
-    /// Build and return the reusable llguidance tokenizer environment for `model`.
-    ///
-    /// Use it to construct an `llguidance::ParserFactory`, create a matcher for each
-    /// generation, and convert that matcher into a sampler with `LlamaSampler::from`.
-    #[cfg(feature = "llguidance")]
-    #[must_use]
-    pub fn llguidance_tok_env(model: &std::sync::Arc<LlamaModel>) -> toktrie::TokEnv {
-        crate::llguidance_sampler::llguidance_build_tok_env(model)
-    }
-
     fn sanitize_grammar_strings(
         grammar_str: &str,
         grammar_root: &str,
