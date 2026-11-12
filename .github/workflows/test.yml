@@ -32,7 +32,7 @@ jobs:
     steps:
       # The build needs nothing beyond the runner image. Vulkan and the CJK
       # fonts are only needed to run the tests, so install them while the
-      # Rust cache restores.
+      # tests build.
       - name: Start installing test packages
         run: |
           sudo rm -f /var/lib/man-db/auto-update
@@ -46,6 +46,8 @@ jobs:
           ' "$status" > "$RUNNER_TEMP/apt.log" 2>&1 &
       - uses: actions/checkout@v7
       - uses: Swatinem/rust-cache@v2
+      - name: Build tests
+        run: cargo test --workspace --tests --no-run
       - name: Wait for test packages
         run: |
           while [ ! -f "$APT_STATUS" ]; do sleep 1; done
