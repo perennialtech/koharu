@@ -116,8 +116,7 @@ ghcr.io/owo-network/deeplx:latest`, and point `KOHARU_DEEPLX_BASE_URL` at it.
 ## Development
 
 See [AGENTS.md](AGENTS.md) for repository rules and the one command used by CI
-to check changes. Keep contributions focused and follow the
-[Code of Conduct](CODE_OF_CONDUCT.md).
+to check changes. Keep contributions focused.
 
 ## License
 
