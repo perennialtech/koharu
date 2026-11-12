@@ -30,6 +30,8 @@ pub(crate) struct TextNodeDescriptor {
     pub(crate) font_weight: Option<u16>,
     pub(crate) font_style: Option<FontStyle>,
     pub(crate) font_size: Option<f32>,
+    /// Em size of the lettering this text replaces, when it is known.
+    pub(crate) source_font_size: Option<f32>,
     pub(crate) minimum_font_size: f32,
     pub(crate) auto_fit: bool,
     pub(crate) alignment: TextAlign,
@@ -157,10 +159,16 @@ impl TextRenderer {
             width: descriptor.width,
             height: descriptor.height,
         };
+        // Free text has no balloon to keep its outline off neighbouring
+        // artwork and text, so the outline stays inside the frame.
         let bounds = if is_bubble_text {
             inset(frame, descriptor.text_inset)
         } else {
-            frame
+            let outline = descriptor.stroke.map_or(0.0, |stroke| stroke.width_px);
+            inset(
+                frame,
+                [outline.min(frame.width.min(frame.height) * 0.25); 4],
+            )
         };
         if bounds.width <= 0.0 || bounds.height <= 0.0 {
             return Err(Error::invalid(format!(
@@ -222,7 +230,7 @@ impl TextRenderer {
         if let Some(language) = &descriptor.language {
             layout = layout.with_hyphenation_language_tag(language.as_str());
         }
-        if is_bubble_text && descriptor.writing_mode == WritingMode::Horizontal {
+        if descriptor.writing_mode == WritingMode::Horizontal {
             layout = layout.with_hyphenation_policy(HyphenationPolicy::LastResort);
         }
         let layout = if descriptor.auto_fit && !descriptor.point_text {
@@ -232,12 +240,23 @@ impl TextRenderer {
         } else {
             layout.with_font_size(descriptor.font_size.unwrap_or(maximum))
         };
-        let layout = self
-            .layout(&layout, &descriptor.text)
-            .map_err(|source| Error::Layout {
-                entity: descriptor.entity,
-                source,
-            })?;
+        let mut run = self.layout(&layout, &descriptor.text);
+        // Free text that cannot fit at the readable size would spill onto
+        // neighbouring text, which leaves both unreadable. Shrinking it keeps
+        // the rest of the page legible; the diagnostic still reports it.
+        if !is_bubble_text
+            && descriptor.auto_fit
+            && !descriptor.point_text
+            && run.as_ref().is_ok_and(|run| {
+                run.overflowed() || run.width > bounds.width || run.height > bounds.height
+            })
+        {
+            run = self.layout(&layout.with_min_font_size(1.0), &descriptor.text);
+        }
+        let layout = run.map_err(|source| Error::Layout {
+            entity: descriptor.entity,
+            source,
+        })?;
         let (mut x, mut y) = if descriptor.point_text {
             (bounds.x, bounds.y)
         } else {
@@ -254,8 +273,16 @@ impl TextRenderer {
         };
         let mut scene = PreparedScene::default();
         let mut resources = Vec::new();
+        // The outline was measured around the source lettering and keeps its
+        // proportion to the glyphs at the size the translation is set in.
         if let Some(stroke) = descriptor.stroke {
-            options.stroke = Some(stroke);
+            let scale = descriptor
+                .source_font_size
+                .map_or(1.0, |source| (layout.font_size / source).min(1.0));
+            options.stroke = Some(StrokeOptions {
+                width_px: (stroke.width_px * scale).max(1.0),
+                ..stroke
+            });
         }
         self.render(
             &mut scene,
@@ -288,7 +315,7 @@ impl TextRenderer {
             width: layout.width,
             height: layout.height,
         };
-        let stroke_padding = descriptor
+        let stroke_padding = options
             .stroke
             .map_or(0.0, |stroke| stroke.width_px.max(0.0));
         Ok(RenderedTextNode {
@@ -331,7 +358,9 @@ fn automatic_maximum(
             bounds.width
         }
     } else {
-        24.0
+        descriptor
+            .source_font_size
+            .unwrap_or_else(|| bounds.width.min(bounds.height))
     }
 }
 
@@ -445,8 +474,8 @@ mod tests {
     use crate::fonts::FontSystem;
 
     #[test]
-    fn automatic_size_preserves_free_text_default_and_balloon_extent() {
-        let descriptor = TextNodeDescriptor {
+    fn automatic_size_follows_the_source_lettering_and_balloon_extent() {
+        let mut descriptor = TextNodeDescriptor {
             entity: EntityId::new(),
             text: "Hi".to_owned(),
             language: None,
@@ -458,6 +487,7 @@ mod tests {
             font_weight: None,
             font_style: None,
             font_size: Some(6.0),
+            source_font_size: None,
             minimum_font_size: 9.0,
             auto_fit: true,
             alignment: TextAlign::Center,
@@ -477,8 +507,10 @@ mod tests {
             height: 120.0,
         };
 
-        assert_eq!(automatic_maximum(&descriptor, bounds, false), 24.0);
+        assert_eq!(automatic_maximum(&descriptor, bounds, false), 120.0);
         assert_eq!(automatic_maximum(&descriptor, bounds, true), 240.0);
+        descriptor.source_font_size = Some(80.0);
+        assert_eq!(automatic_maximum(&descriptor, bounds, false), 80.0);
     }
 
     #[test]
