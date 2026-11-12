@@ -191,7 +191,7 @@ pub struct TextLayout<'a> {
     cjk_punctuation_layout: bool,
 }
 
-fn largest_fitting_font_size<T>(
+pub(crate) fn largest_fitting_font_size<T>(
     minimum: f32,
     maximum: f32,
     mut layout_at: impl FnMut(f32) -> Result<T>,

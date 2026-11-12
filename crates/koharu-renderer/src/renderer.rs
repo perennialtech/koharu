@@ -747,6 +747,7 @@ impl Traversal<'_> {
         let typography = self.snapshot.component::<Typography>(entity)?;
         let mut analysis = None;
         let mut source_font_size = None;
+        let mut source_bounds = None;
         if let Some(recognized) = self.snapshot.relation_from::<RecognizedFrom>(content)? {
             let region = recognized.value().target;
             dependencies.insert(RenderDependency::Relation(recognized.id()));
@@ -755,17 +756,19 @@ impl Traversal<'_> {
             dependencies.insert(component_dependency::<Geometry>(region));
             dependencies.insert(component_dependency::<SourceText>(content));
             analysis = self.snapshot.component::<OcrAnalysis>(region)?;
+            source_bounds = self
+                .snapshot
+                .component::<Geometry>(region)?
+                .and_then(|geometry| geometry_frame(&geometry, None))
+                .map(|frame| frame.bounds);
             source_font_size = self
                 .snapshot
                 .component::<SourceText>(content)?
-                .zip(
-                    self.snapshot
-                        .component::<Geometry>(region)?
-                        .and_then(|geometry| geometry_frame(&geometry, None)),
-                )
-                .and_then(|(source, frame)| source_glyph_size(&source.text.value, frame.bounds));
+                .zip(source_bounds)
+                .and_then(|(source, bounds)| source_glyph_size(&source.text.value, bounds));
         }
         let authored = self.snapshot.component::<Geometry>(entity)?;
+        let is_authored = authored.is_some();
         let placement = if let Some(placement) = self.balloon_flows.get(&entity) {
             dependencies.extend(placement.dependencies.iter().cloned());
             Some(placement.clone())
@@ -809,6 +812,11 @@ impl Traversal<'_> {
             dependencies.insert(RenderDependency::Font(family.clone()));
         }
         let is_bubble = balloon_contour.is_some();
+        // A box the user drew is theirs to fill; only an automatic free text
+        // placement is held to the area of the lettering it replaces.
+        let source_area = source_bounds
+            .filter(|_| !is_bubble && !is_authored)
+            .map(|bounds| bounds.width * bounds.height);
         let descriptor = TextNodeDescriptor {
             entity,
             text: text.clone(),
@@ -825,6 +833,7 @@ impl Traversal<'_> {
                 .map(Into::into),
             font_size: typography.as_ref().and_then(|value| value.size),
             source_font_size,
+            source_area,
             minimum_font_size: readable_font_size(self.width, self.height),
             auto_fit: typography.as_ref().is_none_or(|value| value.auto_fit),
             alignment,
