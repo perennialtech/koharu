@@ -206,22 +206,26 @@ async fn infer_text<M: Send + 'static>(
     .await
 }
 
-// Manga OCR can emit replacement-box glyphs for an isolated Japanese ellipsis.
-// Normalize only an all-placeholder sequence so ordinary OCR output is preserved.
+// PaddleOCR-VL reads a column of dots, as in a silent reaction balloon, as
+// boxes, circles or emoji. Normalize only text made entirely of such symbols so
+// ordinary OCR output, and hearts and notes used as lettering, are preserved.
 fn normalize_ocr_text(text: String) -> String {
     let visible = text
         .chars()
-        .filter(|character| !character.is_whitespace())
+        .filter(|character| !character.is_whitespace() && *character != '\u{FE0F}')
         .collect::<Vec<_>>();
-    if visible.len() >= 2
-        && visible
-            .iter()
-            .all(|character| matches!(character, '☐' | '□' | '▢' | '▣' | '�'))
-    {
+    if visible.len() >= 2 && visible.iter().copied().all(misread_dot) {
         "…".to_owned()
     } else {
         text
     }
+}
+
+fn misread_dot(character: char) -> bool {
+    matches!(
+        character,
+        '\u{25A0}'..='\u{27BF}' | '\u{1F300}'..='\u{1FAFF}' | '∗' | '•' | '�'
+    ) && !matches!(character, '♡' | '♥' | '❤' | '♩' | '♪' | '♫' | '♬')
 }
 
 // Detected text boxes hug the ink, and PaddleOCR-VL drops or misreads glyphs
@@ -268,14 +272,23 @@ mod tests {
     }
 
     #[test]
-    fn repeated_placeholder_glyphs_are_an_ellipsis() {
-        assert_eq!(normalize_ocr_text("☐ ☐ ☐".to_owned()), "…");
-        assert_eq!(normalize_ocr_text("□\n□".to_owned()), "…");
+    fn symbols_read_from_a_column_of_dots_are_an_ellipsis() {
+        for text in [
+            "☐ ☐ ☐",
+            "□\n□",
+            "○●●",
+            "☑ ☐ ☒ ☐ ☐",
+            "● ● ● ● ●",
+            "☀️ 🌞 ☁️ ☉ ⚪️ ☛️",
+        ] {
+            assert_eq!(normalize_ocr_text(text.to_owned()), "…", "{text}");
+        }
     }
 
     #[test]
-    fn ordinary_text_and_single_boxes_are_unchanged() {
-        assert_eq!(normalize_ocr_text("待って…".to_owned()), "待って…");
-        assert_eq!(normalize_ocr_text("☐".to_owned()), "☐");
+    fn ordinary_text_lettering_symbols_and_single_boxes_are_unchanged() {
+        for text in ["待って…", "・・・", "!!", "♡♡", "♪♪", "☐"] {
+            assert_eq!(normalize_ocr_text(text.to_owned()), text);
+        }
     }
 }
