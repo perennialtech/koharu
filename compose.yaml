@@ -30,6 +30,18 @@ services:
       - OPENROUTER_API_KEY
       - OPENAI_COMPATIBLE_API_KEY
 
+  # Uncomment to run DeepLX on the Compose network without publishing a port.
+  # Set KOHARU_DEEPLX_BASE_URL=http://deeplx:1188 in the host environment.
+  # deeplx:
+  #   image: ghcr.io/owo-network/deeplx:v1.3.1
+  #   read_only: true
+  #   cap_drop:
+  #     - ALL
+  #   security_opt:
+  #     - no-new-privileges:true
+  #   tmpfs:
+  #     - /tmp:rw,nosuid,nodev
+
 volumes:
   koharu-cache:
     name: koharu-cache
