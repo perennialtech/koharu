@@ -39,8 +39,7 @@ use specta::Type;
 use super::{StageInput, StageProcessor, finish, generation};
 use crate::{DetectionModel, ModelCell};
 
-const MODEL_ID: &str =
-    "mayocream/koharu-layout-rfdetr-seg-2xl-1152+ogkalu/comic-text-and-bubble-detector";
+const MODEL_ID: &str = "mayocream/koharu-layout-highres+ogkalu/comic-text-and-bubble-detector";
 const MODEL_NAME: &str = "koharu-layout-rfdetr-seg-2xl";
 const PRODUCER: &str = "dev.koharu.pipeline.detection";
 const ANGLE_SNAP_DEGREES: f32 = 3.0;

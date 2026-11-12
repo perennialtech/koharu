@@ -12,7 +12,7 @@ use koharu_torch::{
     nn::{self, Module},
 };
 
-const RESOLUTION: i64 = 1152;
+const RESOLUTION: i64 = 1920;
 const PATCH_SIZE: i64 = 12;
 const NUM_WINDOWS: i64 = 2;
 const DINO_DIM: i64 = 384;
