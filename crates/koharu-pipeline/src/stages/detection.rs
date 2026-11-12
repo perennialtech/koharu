@@ -14,7 +14,7 @@ use image::{
 use imageproc::{
     contours::{BorderType, find_contours_with_threshold},
     distance_transform::{Norm, distance_transform},
-    geometry::{approximate_polygon_dp, arc_length, contour_area},
+    geometry::convex_hull,
     morphology::{close, dilate},
 };
 use koharu_ml::{
@@ -243,7 +243,19 @@ fn with_detected_bubbles(
             .max_by(|left, right| left.0.total_cmp(&right.0))
             .map_or_else(
                 || ellipse_mask(bbox, &detections),
-                |(_, proposal)| clip_mask(&proposal.mask, bbox),
+                |(_, proposal)| {
+                    // Over translucent balloons the proposal mask hugs the
+                    // text or loses bites to the artwork behind it, while the
+                    // detector's box follows the balloon. The inscribed
+                    // ellipse restores the body; the proposal keeps corners
+                    // of balloons that are not elliptical.
+                    let mut mask = ellipse_mask(bbox, &detections);
+                    let mut image = GrayImage::from_raw(mask.width, mask.height, mask.pixels)
+                        .expect("ellipse mask matches its size");
+                    stamp_mask(&mut image, &clip_mask(&proposal.mask, bbox), mask.x, mask.y);
+                    mask.pixels = image.into_raw();
+                    mask
+                },
             );
         bubble_detections.push(KoharuLayoutDetection {
             label_id: RFDETR_BUBBLE_LABEL_ID,
@@ -1491,21 +1503,16 @@ fn mask_geometry(mask: &KoharuLayoutMask) -> Option<Geometry> {
     let mask = GrayImage::from_raw(mask.width, mask.height, mask.pixels.clone())?;
     let mut padded = GrayImage::new(mask.width() + 2, mask.height() + 2);
     image::imageops::replace(&mut padded, &mask, 1, 1);
-    let contours = find_contours_with_threshold::<i32>(&padded, 0);
-    let contour = contours
-        .iter()
+    // Balloons are convex outside joins between lobes, and the bubble detector
+    // boxes each lobe separately. Notches in a mask are artwork showing
+    // through a translucent balloon, and would leave text only the narrow
+    // spans between them, so the outline is the mask's convex hull.
+    let points = find_contours_with_threshold::<i32>(&padded, 0)
+        .into_iter()
         .filter(|contour| contour.border_type == BorderType::Outer)
-        .max_by(|left, right| {
-            contour_area(&left.points)
-                .partial_cmp(&contour_area(&right.points))
-                .unwrap_or(Ordering::Equal)
-        })?;
-    if contour.points.len() < 3 {
-        return None;
-    }
-
-    let epsilon = (arc_length(&contour.points, true) * 0.001).max(f64::EPSILON);
-    let points = approximate_polygon_dp(&contour.points, epsilon, true)
+        .flat_map(|contour| contour.points)
+        .collect::<Vec<_>>();
+    let points = convex_hull(points)
         .into_iter()
         .map(|point| Point {
             x: f64::from(point.x - 1) + f64::from(origin.0),
@@ -2356,8 +2363,19 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(bubbles.len(), 1);
         assert_eq!(bubbles[0].bbox, [8.0, 8.0, 52.0, 92.0]);
-        assert_eq!((bubbles[0].mask.x, bubbles[0].mask.width), (12, 40));
-        assert_eq!(bubbles[0].area, 40 * 76);
+        // Clipped to the box, joined with the box's inscribed ellipse.
+        assert_eq!((bubbles[0].mask.x, bubbles[0].mask.width), (8, 44));
+        assert!(bubbles[0].mask.contains(13, 13) && bubbles[0].mask.contains(30, 91));
+        assert!(!bubbles[0].mask.contains(9, 9) && !bubbles[0].mask.contains(55, 50));
+        assert_eq!(
+            bubbles[0].area as usize,
+            bubbles[0]
+                .mask
+                .pixels
+                .iter()
+                .filter(|value| **value != 0)
+                .count()
+        );
         assert_eq!(output.detections.len(), 2);
     }
 
@@ -2430,6 +2448,35 @@ mod tests {
                 .iter()
                 .any(|point| point.x == 14.0 && point.y == 20.0)
         );
+    }
+
+    #[test]
+    fn bubble_geometry_fills_notches_in_the_mask() {
+        // A balloon mask with a slit cut down its middle, as artwork behind a
+        // translucent balloon leaves it.
+        let (width, height) = (40, 60);
+        let mut pixels = vec![u8::MAX; width * height];
+        for y in 10..60 {
+            for x in 18..22 {
+                pixels[y * width + x] = 0;
+            }
+        }
+
+        let geometry = mask_geometry(&KoharuLayoutMask {
+            x: 0,
+            y: 0,
+            width: width as u32,
+            height: height as u32,
+            pixels,
+        })
+        .unwrap();
+
+        let xs = geometry.points.iter().map(|point| point.x);
+        let ys = geometry.points.iter().map(|point| point.y);
+        assert_eq!(geometry.points.len(), 4);
+        assert_eq!(xs.clone().fold(f64::MAX, f64::min), 0.0);
+        assert_eq!(xs.fold(f64::MIN, f64::max), 39.0);
+        assert_eq!(ys.fold(f64::MIN, f64::max), 59.0);
     }
 
     fn masked_text(
