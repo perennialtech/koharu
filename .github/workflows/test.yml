@@ -8,25 +8,39 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 env:
   CARGO_TERM_COLOR: always
+  # Debug info roughly doubles the cache and link times; CI never reads it.
+  CARGO_PROFILE_DEV_DEBUG: 0
 
 jobs:
   rust:
     name: Rust
     runs-on: ubuntu-latest
     steps:
-      - run: |
-          sudo apt update
-          sudo apt install --no-install-recommends \
-            build-essential \
-            clang \
-            libclang-dev \
-            cmake \
-            libfontconfig-dev \
-            libvulkan1 \
-            mesa-vulkan-drivers \
-            fonts-noto-cjk
+      # The build needs nothing beyond the runner image. Vulkan and the CJK
+      # fonts are only needed to run the tests, so install them while the
+      # Rust cache restores.
+      - name: Start installing test packages
+        run: |
+          sudo rm -f /var/lib/man-db/auto-update
+          status="$RUNNER_TEMP/apt.status"
+          echo "APT_STATUS=$status" >> "$GITHUB_ENV"
+          nohup sh -c '
+            sudo apt-get update -qq &&
+            sudo apt-get install -y -qq --no-install-recommends \
+              libfontconfig1 libvulkan1 mesa-vulkan-drivers fonts-noto-cjk
+            echo $? > "$0"
+          ' "$status" > "$RUNNER_TEMP/apt.log" 2>&1 &
       - uses: actions/checkout@v7
       - uses: Swatinem/rust-cache@v2
+      - name: Wait for test packages
+        run: |
+          while [ ! -f "$APT_STATUS" ]; do sleep 1; done
+          cat "$RUNNER_TEMP/apt.log"
+          exit "$(cat "$APT_STATUS")"
       - run: ./scripts/check.sh
