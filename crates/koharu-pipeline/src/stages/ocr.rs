@@ -224,13 +224,25 @@ fn normalize_ocr_text(text: String) -> String {
     }
 }
 
+// Detected text boxes hug the ink, and PaddleOCR-VL drops or misreads glyphs
+// that touch the crop edge. A margin of a fraction of the line thickness, the
+// box's shorter side, restores them without reaching neighbouring lines.
+const CROP_MARGIN: f64 = 0.15;
+
 fn crop(source: &DynamicImage, geometry: &Geometry) -> Result<DynamicImage> {
     let (min_x, min_y, max_x, max_y) =
         geometry_extents(geometry).ok_or_else(|| anyhow!("geometry is empty"))?;
-    let x = min_x.floor().max(0.0) as u32;
-    let y = min_y.floor().max(0.0) as u32;
-    let right = max_x.ceil().max(0.0).min(f64::from(source.width())) as u32;
-    let bottom = max_y.ceil().max(0.0).min(f64::from(source.height())) as u32;
+    let margin = (max_x - min_x).min(max_y - min_y).max(0.0) * CROP_MARGIN;
+    let x = (min_x - margin).floor().max(0.0) as u32;
+    let y = (min_y - margin).floor().max(0.0) as u32;
+    let right = (max_x + margin)
+        .ceil()
+        .max(0.0)
+        .min(f64::from(source.width())) as u32;
+    let bottom = (max_y + margin)
+        .ceil()
+        .max(0.0)
+        .min(f64::from(source.height())) as u32;
     if right <= x || bottom <= y {
         bail!("geometry does not overlap the image");
     }
@@ -239,7 +251,21 @@ fn crop(source: &DynamicImage, geometry: &Geometry) -> Result<DynamicImage> {
 
 #[cfg(test)]
 mod tests {
-    use super::normalize_ocr_text;
+    use image::DynamicImage;
+    use koharu_scene::Geometry;
+
+    use super::{crop, normalize_ocr_text};
+
+    #[test]
+    fn crops_keep_a_margin_around_the_text_within_the_page() {
+        let source = DynamicImage::new_luma8(200, 100);
+
+        let column = crop(&source, &Geometry::rectangle(50.0, 20.0, 20.0, 60.0)).unwrap();
+        let edge = crop(&source, &Geometry::rectangle(0.0, 0.0, 40.0, 100.0)).unwrap();
+
+        assert_eq!((column.width(), column.height()), (26, 66));
+        assert_eq!((edge.width(), edge.height()), (46, 100));
+    }
 
     #[test]
     fn repeated_placeholder_glyphs_are_an_ellipsis() {
