@@ -47,15 +47,13 @@ const ANGLE_SNAP_DEGREES: f32 = 3.0;
 const ANGLE_SEARCH_HALF_STEPS: i32 = 90;
 const ANGLE_SEARCH_STEP_DEGREES: f64 = 0.5;
 const TYPOGRAPHY_SAMPLE_MARGIN: f32 = 2.0;
-const COLOR_SNAP_DARK_LUMINANCE: u32 = 64 * 256;
-const COLOR_SNAP_LIGHT_LUMINANCE: u32 = 191 * 256;
+const COLOR_SNAP_DARK: u8 = 88;
+const COLOR_SNAP_LIGHT: u8 = 191;
 const COLOR_CLUSTER_MIN_DISTANCE_SQUARED: u32 = 32 * 32;
 const COLOR_CLUSTER_COUNT: usize = 4;
 const MIN_EXTREME_COLOR_PIXELS: u32 = 4;
 const MIN_MEASURED_STROKE_WIDTH: u8 = 2;
 const DIALOGUE_MASK_CONTAINMENT_THRESHOLD: f32 = 0.9;
-// RF-DETR proposals far below its own bubble threshold still carry usable
-// masks for bubbles that the box-only bubble detector finds.
 const BUBBLE_MASK_CANDIDATE_THRESHOLD: f32 = 0.05;
 const BUBBLE_MASK_MIN_IOU: f32 = 0.5;
 const RFDETR_BUBBLE_LABEL_ID: usize = 2;
@@ -913,7 +911,7 @@ struct OutlinePaint {
     fill_color: [u8; 3],
     stroke_color: [u8; 3],
     stroke_width: f32,
-    score: u64,
+    score: f64,
 }
 
 fn infer_outline(
@@ -990,16 +988,16 @@ fn infer_outline(
             else {
                 continue;
             };
-            let inside_fill = enclosed_fill
-                .iter()
-                .filter(|pixel| pixel.inside_mask)
-                .count();
-            let evidence = enclosed_fill.len() + inside_fill;
+            // A real fill is almost entirely enclosed by its outline, while
+            // the outline color is enclosed only inside glyph counters. Both
+            // pairings enclose thousands of pixels on a high-resolution page,
+            // so the enclosed share separates them, not the raw count.
+            let enclosed = enclosed_fill.len() as f64;
             let candidate = OutlinePaint {
                 fill_color: normalized_fill,
                 stroke_color: normalized_stroke,
                 stroke_width,
-                score: u64::from(contrast) * evidence.min(4096) as u64,
+                score: f64::from(contrast) * enclosed * enclosed / fill_cluster.pixels.len() as f64,
             };
             if best.is_none_or(|current: OutlinePaint| candidate.score > current.score) {
                 best = Some(candidate);
@@ -1432,11 +1430,13 @@ fn color_distance_squared(left: [u8; 3], right: [u8; 3]) -> u32 {
         .sum()
 }
 
+// Antialiasing and JPEG noise pull pure black and white ink toward the
+// background, so near-neutral extremes snap back. Saturated ink such as red or
+// blue keeps its measured color however dark it is.
 fn normalize_text_color(color: [u8; 3]) -> [u8; 3] {
-    let luminance = color_luminance(color);
-    if luminance <= COLOR_SNAP_DARK_LUMINANCE {
+    if color.into_iter().max().unwrap() <= COLOR_SNAP_DARK {
         [0, 0, 0]
-    } else if luminance >= COLOR_SNAP_LIGHT_LUMINANCE {
+    } else if color.into_iter().min().unwrap() >= COLOR_SNAP_LIGHT {
         [u8::MAX; 3]
     } else {
         color
@@ -2849,10 +2849,11 @@ mod tests {
     }
 
     #[test]
-    fn text_colors_snap_only_at_luminance_extremes() {
+    fn text_colors_snap_only_near_black_or_white() {
         assert_eq!(normalize_text_color([20, 31, 24]), [0, 0, 0]);
         assert_eq!(normalize_text_color([230, 240, 250]), [255, 255, 255]);
-        assert_eq!(normalize_text_color([255, 0, 0]), [0, 0, 0]);
+        assert_eq!(normalize_text_color([255, 0, 0]), [255, 0, 0]);
+        assert_eq!(normalize_text_color([140, 20, 30]), [140, 20, 30]);
         assert_eq!(normalize_text_color([0, 255, 0]), [0, 255, 0]);
         assert_eq!(normalize_text_color([20, 115, 235]), [20, 115, 235]);
         assert_eq!(normalize_text_color([40, 70, 40]), [0, 0, 0]);
@@ -2892,6 +2893,50 @@ mod tests {
         assert_eq!(inferred.color, [0, 0, 0]);
         assert_eq!(inferred.stroke_color, None);
         assert_eq!(inferred.stroke_width, None);
+    }
+
+    #[test]
+    fn outlined_glyph_counters_do_not_invert_the_paint_at_high_resolution() {
+        // 6x5 glyphs, each a black ring with a white outline outside it and a
+        // white counter inside, the way a 600 dpi scan draws outlined kanji.
+        let [left, top] = [8, 8];
+        let (columns, rows, cell, stroke) = (6, 5, 40, 6);
+        let width = left * 2 + columns * cell;
+        let height = top * 2 + rows * cell;
+        let mut image = RgbImage::from_pixel(width, height, Rgb([90, 140, 60]));
+        for row in 0..rows {
+            for column in 0..columns {
+                let (x0, y0) = (left + column * cell, top + row * cell);
+                for y in 0..cell {
+                    for x in 0..cell {
+                        let edge = x.min(y).min(cell - 1 - x).min(cell - 1 - y);
+                        let black = (stroke..stroke * 2).contains(&edge);
+                        let color = if black { [0, 0, 0] } else { [255, 255, 255] };
+                        image.put_pixel(x0 + x, y0 + y, Rgb(color));
+                    }
+                }
+            }
+        }
+        let pixels = vec![u8::MAX; width as usize * height as usize];
+        let detection = KoharuLayoutDetection {
+            label_id: 0,
+            label: "text".to_owned(),
+            score: 1.0,
+            bbox: [0.0, 0.0, width as f32, height as f32],
+            area: width * height,
+            mask: KoharuLayoutMask {
+                x: 0,
+                y: 0,
+                width,
+                height,
+                pixels,
+            },
+        };
+
+        let inferred = infer_typography(&image, &detection).unwrap();
+
+        assert_eq!(inferred.color, [0, 0, 0]);
+        assert_eq!(inferred.stroke_color, Some([255, 255, 255]));
     }
 
     #[test]
