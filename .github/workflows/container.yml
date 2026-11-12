@@ -63,7 +63,7 @@ jobs:
             type=raw,value=latest,enable=${{ github.ref == 'refs/heads/master' }}
             type=ref,event=tag
             type=sha,format=long
-      - uses: docker/build-push-action@v6
+      - uses: docker/build-push-action@v7
         with:
           context: .
           file: ./Containerfile
@@ -75,7 +75,7 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
       - name: Export the Cargo cache
         if: steps.rust-cache.outputs.cache-hit != 'true'
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           file: ./Containerfile
