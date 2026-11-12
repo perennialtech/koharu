@@ -148,8 +148,7 @@ opt-level = 3
 [profile.dev.package.libwebp-sys]
 opt-level = 3
 
-# HTTP glue: the work it drives is compiled in other crates. Its only heavy
-# step, PNG-encoding the result, takes about 60 ms per page unoptimized
-# against seconds of inference, and the crate compiles last.
+# HTTP glue that compiles last: everything it drives, including PNG encoding,
+# is compiled in other crates.
 [profile.release.package.koharu-server]
 opt-level = 0

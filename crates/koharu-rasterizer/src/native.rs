@@ -81,6 +81,18 @@ pub struct Raster {
     pub top: i32,
 }
 
+impl Raster {
+    /// Encodes the image as PNG. The generic encoder is instantiated in this
+    /// optimized crate rather than in callers built without optimization.
+    pub fn encode_png(&self) -> Result<Vec<u8>> {
+        let mut png = std::io::Cursor::new(Vec::new());
+        self.image
+            .write_to(&mut png, image::ImageFormat::Png)
+            .map_err(Error::Png)?;
+        Ok(png.into_inner())
+    }
+}
+
 struct GpuState {
     device: wgpu::Device,
     queue: wgpu::Queue,
