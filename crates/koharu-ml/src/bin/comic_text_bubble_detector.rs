@@ -21,8 +21,8 @@ struct Cli {
 async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
     let cli = Cli::parse();
-    koharu_ml::init(&[koharu_ml::Feature::Torch]).await?;
-    let model = ComicTextBubbleDetector::load(koharu_ml::device(cli.cpu)).await?;
+    koharu_ml::init(&[koharu_ml::Feature::OnnxRuntime]).await?;
+    let mut model = ComicTextBubbleDetector::load(koharu_ml::device(cli.cpu)).await?;
     for path in &cli.input {
         let image = image::open(path)?;
         let detections = model.inference(&image, cli.threshold)?;

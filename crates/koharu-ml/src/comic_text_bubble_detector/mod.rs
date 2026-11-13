@@ -9,21 +9,19 @@ mod processor;
 
 use anyhow::{Context, Result};
 use image::DynamicImage;
-use koharu_torch::Device;
-
-use crate::backend::{TryIntoDevice, recover_torch_oom};
 
 pub use self::processor::{ComicTextBubbleDetection, ComicTextBubbleLabel};
 
 use self::model::Model;
 
-crate::model_repository!("ogkalu/comic-text-and-bubble-detector" @ "16e8a622f91fabc6b5b65c96d32d1183f8843546" {
-    WEIGHTS = "model.safetensors",
+// ONNX export of the checkpoint's model.safetensors; the repository holds the
+// export script.
+crate::model_repository!("perennialtech/koharu-onnx" @ "0000000000000000000000000000000000000000" {
+    MODEL = "comic-text-and-bubble-detector/comic-text-and-bubble-detector.onnx",
 });
 
 #[derive(Debug)]
 pub struct ComicTextBubbleDetector {
-    device: Device,
     model: Model,
 }
 
@@ -33,32 +31,24 @@ impl ComicTextBubbleDetector {
     pub const RECOMMENDED_BUBBLE_THRESHOLD: f32 = 0.5;
 
     pub async fn load(device: crate::Device) -> Result<Self> {
-        let device: Device = device.try_into_device()?;
-        let weights_path = WEIGHTS
+        let path = MODEL
             .resolve()
             .await
-            .context("failed to resolve comic text and bubble detector weights")?;
-        let model = recover_torch_oom(|| {
-            let mut model = Model::new(device);
-            model.load(&weights_path)?;
-            Ok(model)
-        })
-        .with_context(|| format!("failed to load {}", weights_path.display()))?;
-        Ok(Self { device, model })
+            .context("failed to resolve comic text and bubble detector model")?;
+        let model = tokio_rayon::spawn(move || Model::load(&device, &path))
+            .await
+            .context("failed to load comic text and bubble detector")?;
+        Ok(Self { model })
     }
 
     /// Returns every detection scoring above `threshold`, best first.
     pub fn inference(
-        &self,
+        &mut self,
         image: &DynamicImage,
         threshold: f32,
     ) -> Result<Vec<ComicTextBubbleDetection>> {
-        recover_torch_oom(|| {
-            koharu_torch::no_grad(|| {
-                let pixel_values = processor::preprocess(image, self.device)?;
-                let output = self.model.forward(&pixel_values);
-                processor::postprocess(&output, image.width(), image.height(), threshold)
-            })
-        })
+        let pixel_values = processor::preprocess(image)?;
+        let output = self.model.forward(&pixel_values)?;
+        processor::postprocess(&output, image.width(), image.height(), threshold)
     }
 }
