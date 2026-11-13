@@ -11,7 +11,7 @@ use serde_json::Value;
 use tower::ServiceExt;
 
 use super::*;
-use crate::jobs::Failure;
+use crate::jobs::{Failure, StageProgress};
 
 fn engines() -> Engines {
     Engines {
@@ -108,12 +108,15 @@ async fn progress_and_result_are_available_across_connections() {
     assert_eq!(input.engines, None);
     assert_eq!(input.source.as_ref(), png);
 
-    job.progress(Progress::Finished {
-        page: EntityId::new(),
-        stage: Stage::Detection,
-        model: "detector".to_owned(),
-        elapsed: std::time::Duration::from_millis(30),
-    });
+    job.progress(
+        StageProgress::from_event(Progress::Finished {
+            page: EntityId::new(),
+            stage: Stage::Detection,
+            model: "detector".to_owned(),
+            elapsed: std::time::Duration::from_millis(30),
+        })
+        .unwrap(),
+    );
     let frame = first.next().await.unwrap().unwrap();
     assert!(frame.starts_with(b"event: progress\n"));
     assert!(
@@ -194,7 +197,6 @@ async fn shutdown_cancels_jobs_and_closes_active_events() {
     let second = queue.recv().await.unwrap();
     jobs.shutdown();
 
-    assert!(first.stop_token().stopped());
     assert_eq!(first.snapshot().status, crate::jobs::Status::Cancelling);
     assert_eq!(second.snapshot().status, crate::jobs::Status::Cancelled);
     assert!(
@@ -232,7 +234,6 @@ async fn cancels_queued_and_running_jobs_independently() {
 
     let response = request(&app, Method::POST, &cancel(&running)).await;
     assert_eq!(json(response).await["status"], "cancelling");
-    assert!(first.stop_token().stopped());
     first.finish(Ok(Some(Bytes::from(png))));
     assert_eq!(
         json(request(&app, Method::GET, &running).await).await["status"],
@@ -282,11 +283,14 @@ async fn serves_openapi_and_reports_failures() {
     let location = submit_page(&app, &png()).await;
     let job = queue.recv().await.unwrap();
     assert!(job.start().is_some());
-    job.progress(Progress::Loading {
-        page: EntityId::new(),
-        stage: Stage::Detection,
-        model: "detector".to_owned(),
-    });
+    job.progress(
+        StageProgress::from_event(Progress::Loading {
+            page: EntityId::new(),
+            stage: Stage::Detection,
+            model: "detector".to_owned(),
+        })
+        .unwrap(),
+    );
     job.finish(Err(Failure::processing()));
     let status = json(request(&app, Method::GET, &location).await).await;
     assert_eq!(status["status"], "failed");

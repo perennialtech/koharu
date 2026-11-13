@@ -170,8 +170,8 @@ impl Upload {
         let decoded = image::load_from_memory_with_format(&self.image, format)
             .map_err(|_| ApiError::IMAGE)?;
         Ok(Input {
-            source: Arc::from(self.image.as_ref()),
-            media_type,
+            source: self.image,
+            media_type: media_type.to_owned(),
             width: decoded.width(),
             height: decoded.height(),
             language: self.target_language.unwrap_or(Language::English),
