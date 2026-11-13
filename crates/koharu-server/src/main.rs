@@ -10,8 +10,8 @@ use axum::body::Bytes;
 use clap::{Parser, ValueEnum};
 use koharu_config::Config;
 use koharu_pipeline::{
-    Committer, Flux2KleinConfig, InpaintingModel, Pipeline, PipelineConfig, PipelineError, Request,
-    RequestTranslation, RunStatus, Scope, StageOutput,
+    Committer, Flux2KleinConfig, InpaintingModel, Operation, Pipeline, PipelineConfig,
+    PipelineError, Request, RequestTranslation, RunStatus, Scope, StageOutput,
 };
 use koharu_rasterizer::{RasterOptions, Rasterizer};
 use koharu_renderer::Renderer;
@@ -128,6 +128,7 @@ impl Worker {
     }
 
     async fn translate(&self, input: Input, job: &Arc<Job>) -> Result<Option<Bytes>> {
+        let stages = input.stages();
         let Input {
             source,
             media_type,
@@ -136,6 +137,7 @@ impl Worker {
             language,
             instructions,
             engines,
+            scale,
         } = input;
         let mut session = Session::memory().await?;
         let mut page = None;
@@ -171,6 +173,7 @@ impl Worker {
             .execute(
                 snapshot,
                 Request {
+                    operation: Operation::Stages { stages },
                     scope: Scope::Pages(vec![page]),
                     translation: Some(RequestTranslation {
                         target_language: language,
@@ -194,7 +197,13 @@ impl Worker {
         let frame = frame.raster_frame()?;
         let rasterizer = self.rasterizer.clone();
         tokio::task::spawn_blocking(move || {
-            let raster = rasterizer.rasterize(&frame, RasterOptions::default())?;
+            let raster = rasterizer.rasterize(
+                &frame,
+                RasterOptions {
+                    output_scale: scale,
+                    ..RasterOptions::default()
+                },
+            )?;
             Ok(Some(Bytes::from(raster.encode_png()?)))
         })
         .await?
@@ -244,7 +253,11 @@ async fn serve() -> Result<()> {
     let handle = tokio::runtime::Handle::current();
     let mut startup = tokio::task::spawn_blocking(move || {
         handle.block_on(async move {
-            let mut features = vec![koharu_ml::Feature::Torch, koharu_ml::Feature::Llama];
+            let mut features = vec![
+                koharu_ml::Feature::Torch,
+                koharu_ml::Feature::Llama,
+                koharu_ml::Feature::OnnxRuntime,
+            ];
             if matches!(&pipeline_config.inpainting, InpaintingModel::Flux2Klein(_)) {
                 features.push(koharu_ml::Feature::Diffusion);
             }
