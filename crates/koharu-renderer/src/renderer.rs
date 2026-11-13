@@ -521,7 +521,31 @@ impl Renderer {
             diagnostics: Vec::new(),
         };
         traversal.dependencies.extend(flow_plan.dependencies);
-        if let Some(asset) = snapshot.asset(page, &source_role)? {
+        // An upscaled copy of the page replaces its source as the page image,
+        // so a scaled raster samples the upscaler's pixels instead of
+        // resampling the source. It must cover the page at one integer scale.
+        let upscaled = snapshot
+            .asset(page, &AssetRole::new("upscaled")?)?
+            .map(|asset| {
+                let size = asset.metadata.width.zip(asset.metadata.height);
+                let scale = size.map_or(0, |(asset_width, _)| asset_width / width);
+                let required = (width * scale, height * scale);
+                if scale == 0 || size != Some(required) {
+                    return Err(Error::invalid(format!(
+                        "upscaled page image {size:?} is not an integer scale of {width}x{height}"
+                    )));
+                }
+                Ok((asset, required))
+            })
+            .transpose()?;
+        let page_image = if upscaled.is_some() {
+            upscaled
+        } else {
+            snapshot
+                .asset(page, &source_role)?
+                .map(|asset| (asset, (width, height)))
+        };
+        if let Some((asset, size)) = page_image {
             let geometry = Geometry::rectangle(0.0, 0.0, f64::from(width), f64::from(height));
             let mut dependencies = BTreeSet::from([
                 RenderDependency::Entity(page),
@@ -536,7 +560,7 @@ impl Renderer {
             traversal.layers.push(image_draft(
                 page,
                 geometry,
-                ImageNodeDescriptor::from_asset(asset, Some((width, height))),
+                ImageNodeDescriptor::from_asset(asset, Some(size)),
                 ImageMetadata {
                     name: None,
                     kind: ImageKind::Source,
@@ -2152,6 +2176,44 @@ mod tests {
         let commit = session.commit(translation).await.unwrap();
         let compiled = renderer.compile(&commit.snapshot, page).unwrap();
         assert!(compiled.layers.iter().any(|layer| layer.entity == text));
+    }
+
+    #[tokio::test]
+    async fn upscaled_page_image_replaces_the_source_at_an_integer_scale() {
+        let mut session = Session::memory().await.unwrap();
+        let source = AssetRole::new("source").unwrap();
+        let upscaled = AssetRole::new("upscaled").unwrap();
+        let mut page = None;
+        let create = session
+            .snapshot()
+            .patch(|edit| {
+                let id = edit.add_page(PageDraft::new("page", 4.0, 3.0), At::End)?;
+                edit.set_asset(id, &source, asset(png(4, 3, [1, 2, 3, 255]), 4, 3))?;
+                edit.set_asset(id, &upscaled, asset(png(8, 6, [4, 5, 6, 255]), 8, 6))?;
+                page = Some(id);
+                Ok(())
+            })
+            .unwrap();
+        let snapshot = session.commit(create).await.unwrap().snapshot;
+        let page = page.unwrap();
+        let blob = snapshot.asset(page, &upscaled).unwrap().unwrap().blob;
+        let compiled = Renderer::default().compile(&snapshot, page).unwrap();
+        let page_image = compiled
+            .layers
+            .iter()
+            .find(|layer| layer.entity == page)
+            .unwrap();
+        assert!(matches!(
+            &page_image.descriptor,
+            NodeDescriptor::Image(image)
+                if image.blob == blob && image.require_size == Some((8, 6))
+        ));
+
+        let skewed = snapshot
+            .patch(|edit| edit.set_asset(page, &upscaled, asset(png(8, 3, [4, 5, 6, 255]), 8, 3)))
+            .unwrap();
+        let snapshot = session.commit(skewed).await.unwrap().snapshot;
+        assert!(Renderer::default().compile(&snapshot, page).is_err());
     }
 
     #[tokio::test]
