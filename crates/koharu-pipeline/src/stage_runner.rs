@@ -159,6 +159,9 @@ fn is_out_of_memory(error: &anyhow::Error) -> bool {
         message.contains("out of memory")
             || message.contains("cuda_error_out_of_memory")
             || message.contains("not enough memory")
+            // ONNX Runtime's CUDA arena swallows the cudaMalloc error and
+            // reports only this.
+            || message.contains("failed to allocate memory for requested buffer")
     })
 }
 
@@ -197,4 +200,19 @@ pub(crate) struct StageCompletion {
     pub(crate) model: String,
     pub(crate) elapsed: Duration,
     pub(crate) outcome: std::result::Result<StageOutcome, PipelineError>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn onnx_runtime_arena_exhaustion_is_out_of_memory() {
+        let error = anyhow::anyhow!(
+            "Non-zero status code returned while running Conv node. Status Message: \
+             bfc_arena.cc:359 Failed to allocate memory for requested buffer of size 268435456"
+        )
+        .context("waifu2x-cunet failed");
+        assert!(is_out_of_memory(&error));
+    }
 }
