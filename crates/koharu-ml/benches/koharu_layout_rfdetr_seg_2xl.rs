@@ -9,13 +9,13 @@ async fn main() -> Result<()> {
     let input =
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("benches/fixtures/object_detection/1.jpg");
 
-    koharu_ml::init(&[koharu_ml::Feature::Torch]).await?;
+    koharu_ml::init(&[koharu_ml::Feature::OnnxRuntime]).await?;
     let image = image::open(input)?;
     // Upscale the same manga page to stress page-sized mask allocations.
     let large_image = image.resize_exact(2738, 3840, image::imageops::FilterType::Triangle);
     let device = koharu_ml::device(false);
     println!("Benchmark device: {}", device.description);
-    let model = KoharuLayoutRFDetrSeg2XL::load(device).await?;
+    let mut model = KoharuLayoutRFDetrSeg2XL::load(device).await?;
 
     black_box(model.inference(&image)?);
     let large_warmup = model.inference(&large_image)?;
