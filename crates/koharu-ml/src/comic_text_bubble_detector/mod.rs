@@ -16,7 +16,7 @@ use self::model::Model;
 
 // ONNX export of the checkpoint's model.safetensors; the repository holds the
 // export script.
-crate::model_repository!("perennialtech/koharu-onnx" @ "0000000000000000000000000000000000000000" {
+crate::model_repository!("8q0sb/koharu-onnx" @ "fda0b1ad6a31da8887f86bbeaa77ab47da2aac70" {
     MODEL = "comic-text-and-bubble-detector/comic-text-and-bubble-detector.onnx",
 });
 
