@@ -144,7 +144,7 @@ impl Scheduler {
 
 const fn prerequisite(stage: Stage) -> Option<Stage> {
     match stage {
-        Stage::Detection => None,
+        Stage::Detection | Stage::Upscaling => None,
         Stage::Ocr | Stage::Inpainting => Some(Stage::Detection),
         Stage::Translation => Some(Stage::Ocr),
     }
@@ -161,7 +161,13 @@ mod tests {
     #[test]
     fn starts_pages_in_order_and_models_independently() {
         let pages = pages(2);
-        let mut scheduler = Scheduler::new(&pages, &Stage::ALL);
+        let stages = [
+            Stage::Detection,
+            Stage::Ocr,
+            Stage::Translation,
+            Stage::Inpainting,
+        ];
+        let mut scheduler = Scheduler::new(&pages, &stages);
         let mut busy = BTreeSet::new();
 
         let first = scheduler.start_next(&busy).unwrap();

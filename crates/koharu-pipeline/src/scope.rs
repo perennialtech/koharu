@@ -69,11 +69,14 @@ pub(crate) struct NormalizedScope {
 impl NormalizedScope {
     pub(crate) fn new(snapshot: &Snapshot, scope: &Scope, stages: &[Stage]) -> Result<Self> {
         if matches!(scope, Scope::Entities(_))
-            && stages
-                .iter()
-                .any(|stage| matches!(stage, Stage::Detection | Stage::Inpainting))
+            && stages.iter().any(|stage| {
+                matches!(
+                    stage,
+                    Stage::Detection | Stage::Inpainting | Stage::Upscaling
+                )
+            })
         {
-            bail!("detection and inpainting do not support entity-only scope");
+            bail!("detection, inpainting and upscaling do not support entity-only scope");
         }
 
         match scope {
