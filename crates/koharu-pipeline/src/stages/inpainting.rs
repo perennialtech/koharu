@@ -228,6 +228,7 @@ impl Model {
                             &prepared.text_mask,
                             &prepared.flat_fill_regions,
                             LAMA_TILE_CONTEXT,
+                            Some(LAMA_CROP_SIZE),
                             |image, mask| {
                                 Ok(DynamicImage::ImageRgb8(model.inference(
                                     image,
@@ -263,6 +264,7 @@ impl Model {
                             &prepared.text_mask,
                             &prepared.flat_fill_regions,
                             FLUX_TILE_CONTEXT,
+                            None,
                             |image, mask| {
                                 let filled =
                                     lama.inference(image, mask, &InpaintRequest::default())?;
@@ -520,6 +522,12 @@ const TILE_SIZE: u32 = 512;
 // painted unrelated objects into large free-text masks, and at 64 px it left
 // LaMa's smears in place.
 const LAMA_TILE_CONTEXT: u32 = 128;
+// Every LaMa crop has this size, the largest crop a tile can need, filled with
+// more page context where the tile needs less. ONNX Runtime's CUDA Conv keeps
+// a cuDNN plan only for the last input shape it saw, and rebuilding the plans
+// of LaMa's 222 convolutions costs about 270 ms on an RTX 3080, several times
+// the inference itself. One shape also keeps the memory arena from growing.
+const LAMA_CROP_SIZE: u32 = TILE_SIZE + 2 * LAMA_TILE_CONTEXT;
 const FLUX_TILE_CONTEXT: u32 = 96;
 const UNIFORM_BACKGROUND_MIN_PIXELS: usize = 16;
 const FLAT_FILL_EDGE_MARGIN: f32 = 3.0;
@@ -549,6 +557,7 @@ fn inpaint_tiled(
     text_mask: &GrayImage,
     flat_fill_regions: &[FlatFillRegion],
     context: u32,
+    fixed_crop: Option<u32>,
     mut inference: impl FnMut(&DynamicImage, &GrayImage) -> Result<DynamicImage>,
 ) -> Result<DynamicImage> {
     ensure!(
@@ -562,7 +571,12 @@ fn inpaint_tiled(
     let mut output = image.to_rgb8();
     let mut pending_mask = mask.clone();
     fill_uniform_regions(&mut output, &mut pending_mask, text_mask, flat_fill_regions);
-    let (component_labels, tiles) = inpaint_tiles(&pending_mask, context);
+    let (component_labels, mut tiles) = inpaint_tiles(&pending_mask, context);
+    if let Some(size) = fixed_crop {
+        for tile in &mut tiles {
+            tile.crop = fixed_size_crop(tile.crop, size, mask.width(), mask.height());
+        }
+    }
     for tile in &tiles {
         let [left, top, right, bottom] = tile.crop;
         let crop_width = right - left;
@@ -750,6 +764,23 @@ fn expand_bounds(
         right.saturating_add(context).min(width),
         bottom.saturating_add(context).min(height),
     ]
+}
+
+/// Grows `crop` to `size` on each axis, or to the whole page where the page is
+/// smaller, keeping it centred where the page allows. `crop` must fit in `size`.
+fn fixed_size_crop(crop: [u32; 4], size: u32, width: u32, height: u32) -> [u32; 4] {
+    let axis = |start: u32, end: u32, length: u32| {
+        if length <= size {
+            return (0, length);
+        }
+        let start = ((start + end) / 2)
+            .saturating_sub(size / 2)
+            .min(length - size);
+        (start, start + size)
+    };
+    let (left, right) = axis(crop[0], crop[2], width);
+    let (top, bottom) = axis(crop[1], crop[3], height);
+    [left, top, right, bottom]
 }
 
 fn component_bounds_in(
@@ -1149,6 +1180,7 @@ mod tests {
             &mask,
             &[rectangle_region([0, 0, 96, 96])],
             LAMA_TILE_CONTEXT,
+            None,
             |_, _| {
                 calls += 1;
                 Ok(DynamicImage::new_rgb8(1, 1))
@@ -1201,6 +1233,7 @@ mod tests {
                 rectangle_region([110, 10, 190, 90]),
             ],
             LAMA_TILE_CONTEXT,
+            None,
             |_, _| {
                 calls += 1;
                 Ok(DynamicImage::new_rgb8(1, 1))
@@ -1231,6 +1264,7 @@ mod tests {
             &mask,
             &[],
             LAMA_TILE_CONTEXT,
+            None,
             |tile, tile_mask| {
                 calls += 1;
                 assert_eq!(
@@ -1303,6 +1337,7 @@ mod tests {
             &mask,
             &[],
             LAMA_TILE_CONTEXT,
+            None,
             |tile, tile_mask| {
                 calls.push((
                     tile.to_rgb8(),
@@ -1347,6 +1382,7 @@ mod tests {
             &mask,
             &[],
             LAMA_TILE_CONTEXT,
+            None,
             |tile, _| {
                 calls += 1;
                 assert!(tile.width() <= LAMA_TILE_CONTEXT * 2 + 1);
@@ -1365,5 +1401,36 @@ mod tests {
         assert_eq!(output.get_pixel(10, 10), &Rgb([1, 2, 3]));
         assert_eq!(output.get_pixel(1100, 600), &Rgb([1, 2, 3]));
         assert_eq!(output.get_pixel(500, 300), original.get_pixel(500, 300));
+    }
+
+    #[test]
+    fn lama_crops_share_one_shape_and_keep_their_context() {
+        let mut mask = GrayImage::new(1700, 2400);
+        for (left, top, size) in [
+            (0, 0, 40),
+            (900, 1200, 300),
+            (1650, 2350, 50),
+            (400, 100, 700),
+        ] {
+            for y in top..(top + size).min(2400) {
+                for x in left..(left + size).min(1700) {
+                    mask.put_pixel(x, y, Luma([u8::MAX]));
+                }
+            }
+        }
+        let (_, tiles) = inpaint_tiles(&mask, LAMA_TILE_CONTEXT);
+        assert!(tiles.len() > 4);
+        for tile in &tiles {
+            let crop = fixed_size_crop(tile.crop, LAMA_CROP_SIZE, 1700, 2400);
+            assert_eq!(crop[2] - crop[0], LAMA_CROP_SIZE);
+            assert_eq!(crop[3] - crop[1], LAMA_CROP_SIZE);
+            assert!(crop[0] <= tile.crop[0] && crop[1] <= tile.crop[1]);
+            assert!(crop[2] >= tile.crop[2] && crop[3] >= tile.crop[3]);
+            assert!(crop[2] <= 1700 && crop[3] <= 2400);
+        }
+        assert_eq!(
+            fixed_size_crop([10, 20, 300, 400], LAMA_CROP_SIZE, 600, 2400),
+            [0, 0, 600, LAMA_CROP_SIZE]
+        );
     }
 }
