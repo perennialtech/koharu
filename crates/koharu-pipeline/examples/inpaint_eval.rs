@@ -41,7 +41,7 @@ async fn main() -> Result<()> {
         "flux2-klein" => InpaintingModel::Flux2Klein(Flux2KleinConfig::default()),
         other => anyhow::bail!("unknown inpainting model {other}"),
     };
-    let mut features = vec![koharu_ml::Feature::Torch];
+    let mut features = vec![koharu_ml::Feature::OnnxRuntime];
     if matches!(&config.inpainting, InpaintingModel::Flux2Klein(_)) {
         features.push(koharu_ml::Feature::Diffusion);
     }

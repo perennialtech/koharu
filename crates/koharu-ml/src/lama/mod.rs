@@ -6,46 +6,39 @@ mod processor;
 
 use anyhow::{Context, Result};
 use image::{DynamicImage, GrayImage, RgbImage};
-use koharu_torch::Device;
-
-use crate::backend::TryIntoDevice;
 
 pub use self::config::{HDStrategy, InpaintRequest};
-use self::{config::FFCResNetGeneratorConfig, model::Model, processor::InpaintModel};
+use self::model::Model;
 
-crate::model_repository!("mayocream/lama-manga" @ "f91c85b26913b3e83f9877867b4c336da3675238" {
-    WEIGHTS = "lama-manga.safetensors"
+// ONNX export of mayocream/lama-manga@f91c85b26913b3e83f9877867b4c336da3675238
+// (lama-manga.safetensors); the repository holds the export script.
+crate::model_repository!("perennialtech/koharu-onnx" @ "0000000000000000000000000000000000000000" {
+    MODEL = "lama-manga/lama-manga.onnx"
 });
 
 #[derive(Debug)]
 pub struct LaMa {
     model: Model,
-    processor: InpaintModel,
 }
 
 impl LaMa {
     pub async fn load(device: crate::Device) -> Result<Self> {
-        let device: Device = device.try_into_device()?;
-        let weights_path = WEIGHTS
+        let path = MODEL
             .resolve()
             .await
-            .context("failed to resolve LaMa weights")?;
-        let mut model = Model::new(&FFCResNetGeneratorConfig::default(), device);
-        model
-            .load(&weights_path)
-            .context("failed to load LaMa safetensors")?;
-        Ok(Self {
-            model,
-            processor: InpaintModel::new(device),
-        })
+            .context("failed to resolve LaMa model")?;
+        let model = tokio_rayon::spawn(move || Model::load(&device, &path))
+            .await
+            .context("failed to load LaMa")?;
+        Ok(Self { model })
     }
 
     pub fn inference(
-        &self,
+        &mut self,
         image: &DynamicImage,
         mask: &GrayImage,
         config: &InpaintRequest,
     ) -> Result<RgbImage> {
-        koharu_torch::no_grad(|| self.processor.call(&self.model, image, mask, config))
+        processor::inpaint(&mut self.model, image, mask, config)
     }
 }

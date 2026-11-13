@@ -26,9 +26,9 @@ async fn main() -> Result<()> {
     let image = image::open(&cli.input)?;
     let mask = image::open(&cli.mask)?.to_luma8();
 
-    koharu_ml::init(&[koharu_ml::Feature::Torch]).await?;
+    koharu_ml::init(&[koharu_ml::Feature::OnnxRuntime]).await?;
 
-    let model = LaMa::load(koharu_ml::device(cli.cpu)).await?;
+    let mut model = LaMa::load(koharu_ml::device(cli.cpu)).await?;
     let inpainted = model.inference(&image, &mask, &InpaintRequest::default())?;
     inpainted.save(cli.output)?;
 

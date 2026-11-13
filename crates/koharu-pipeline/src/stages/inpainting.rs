@@ -219,7 +219,7 @@ impl Model {
                 (
                     "lama",
                     tokio_rayon::spawn(move || -> Result<DynamicImage> {
-                        let model = model
+                        let mut model = model
                             .lock()
                             .map_err(|_| anyhow!("LaMa model lock is poisoned"))?;
                         inpaint_tiled(
@@ -251,7 +251,7 @@ impl Model {
                 (
                     "flux2-klein",
                     tokio_rayon::spawn(move || -> Result<DynamicImage> {
-                        let lama = lama
+                        let mut lama = lama
                             .lock()
                             .map_err(|_| anyhow!("LaMa model lock is poisoned"))?;
                         let model = model

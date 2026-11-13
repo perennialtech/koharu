@@ -79,8 +79,14 @@ impl RuntimePackage for OnnxRuntime {
 
     fn dependencies(self, _hardware: &Hardware) -> Result<Vec<Component>> {
         // The CUDA provider links cuBLAS, cuRAND and the CUDA runtime, and
-        // opens cuDNN by soname when a session first uses it.
-        let packages = [Cuda::Runtime13, Cuda::Blas13, Cuda::Rand10, Cuda::Dnn925];
+        // opens cuDNN and cuFFT by soname when a session first uses them.
+        let packages = [
+            Cuda::Runtime13,
+            Cuda::Blas13,
+            Cuda::Rand10,
+            Cuda::Dnn925,
+            Cuda::Fft12,
+        ];
         Ok(packages.into_iter().map(Component::Cuda).collect())
     }
 

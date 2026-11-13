@@ -11,140 +11,138 @@ use fast_image_resize::{
 };
 use image::{DynamicImage, GrayImage, RgbImage};
 use imageproc::contours::{BorderType, find_contours_with_threshold};
-use koharu_torch::{Device, Kind, Tensor};
 
 use super::{
     config::{HDStrategy, InpaintRequest},
     model::Model,
 };
 
-#[derive(Debug)]
-pub(super) struct InpaintModel {
-    device: Device,
-}
+pub(super) fn inpaint(
+    model: &mut Model,
+    image: &DynamicImage,
+    mask: &GrayImage,
+    config: &InpaintRequest,
+) -> Result<RgbImage> {
+    let image = image.to_rgb8();
+    ensure!(
+        image.dimensions() == mask.dimensions(),
+        "image and mask dimensions differ: image={:?}, mask={:?}",
+        image.dimensions(),
+        mask.dimensions()
+    );
+    ensure!(
+        image.width() > 0 && image.height() > 0,
+        "image dimensions must be non-zero"
+    );
 
-impl InpaintModel {
-    pub(super) fn new(device: Device) -> Self {
-        Self { device }
-    }
-
-    pub(super) fn call(
-        &self,
-        model: &Model,
-        image: &DynamicImage,
-        mask: &GrayImage,
-        config: &InpaintRequest,
-    ) -> Result<RgbImage> {
-        let image = image.to_rgb8();
-        ensure!(
-            image.dimensions() == mask.dimensions(),
-            "image and mask dimensions differ: image={:?}, mask={:?}",
-            image.dimensions(),
-            mask.dimensions()
-        );
-        ensure!(
-            image.width() > 0 && image.height() > 0,
-            "image dimensions must be non-zero"
-        );
-
-        match config.hd_strategy {
-            HDStrategy::Crop
-                if image.width().max(image.height()) > config.hd_strategy_crop_trigger_size =>
-            {
-                let boxes = boxes_from_mask(mask);
-                let mut crop_results = Vec::with_capacity(boxes.len());
-                for bounding_box in boxes {
-                    let crop_box = crop_box(
-                        image.width(),
-                        image.height(),
-                        bounding_box,
-                        config.hd_strategy_crop_margin,
-                    );
-                    let [left, top, right, bottom] = crop_box;
-                    let crop_image =
-                        image::imageops::crop_imm(&image, left, top, right - left, bottom - top)
-                            .to_image();
-                    let crop_mask =
-                        image::imageops::crop_imm(mask, left, top, right - left, bottom - top)
-                            .to_image();
-                    crop_results.push((
-                        self.pad_forward(model, &crop_image, &crop_mask, config)?,
-                        crop_box,
-                    ));
-                }
-
-                let mut result = image;
-                for (crop_result, [left, top, _, _]) in crop_results {
-                    image::imageops::replace(&mut result, &crop_result, left.into(), top.into());
-                }
-                Ok(result)
-            }
-            HDStrategy::Resize
-                if image.width().max(image.height()) > config.hd_strategy_resize_limit =>
-            {
-                let (width, height) = resize_dimensions(
+    match config.hd_strategy {
+        HDStrategy::Crop
+            if image.width().max(image.height()) > config.hd_strategy_crop_trigger_size =>
+        {
+            let boxes = boxes_from_mask(mask);
+            let mut crop_results = Vec::with_capacity(boxes.len());
+            for bounding_box in boxes {
+                let crop_box = crop_box(
                     image.width(),
                     image.height(),
-                    config.hd_strategy_resize_limit,
+                    bounding_box,
+                    config.hd_strategy_crop_margin,
                 );
-                let resized_image = resize_rgb(&image, width, height)?;
-                let resized_mask = resize_gray(mask, width, height)?;
-                let resized_result =
-                    self.pad_forward(model, &resized_image, &resized_mask, config)?;
-                let mut result = resize_rgb(&resized_result, image.width(), image.height())?;
-                for (index, value) in mask.as_raw().iter().enumerate() {
-                    if *value < 127 {
-                        let offset = index * 3;
-                        result.as_flat_samples_mut().samples[offset..offset + 3]
-                            .copy_from_slice(&image.as_raw()[offset..offset + 3]);
-                    }
-                }
-                Ok(result)
+                let [left, top, right, bottom] = crop_box;
+                let crop_image =
+                    image::imageops::crop_imm(&image, left, top, right - left, bottom - top)
+                        .to_image();
+                let crop_mask =
+                    image::imageops::crop_imm(mask, left, top, right - left, bottom - top)
+                        .to_image();
+                crop_results.push((
+                    pad_forward(model, &crop_image, &crop_mask, config)?,
+                    crop_box,
+                ));
             }
-            _ => self.pad_forward(model, &image, mask, config),
+
+            let mut result = image;
+            for (crop_result, [left, top, _, _]) in crop_results {
+                image::imageops::replace(&mut result, &crop_result, left.into(), top.into());
+            }
+            Ok(result)
+        }
+        HDStrategy::Resize
+            if image.width().max(image.height()) > config.hd_strategy_resize_limit =>
+        {
+            let (width, height) = resize_dimensions(
+                image.width(),
+                image.height(),
+                config.hd_strategy_resize_limit,
+            );
+            let resized_image = resize_rgb(&image, width, height)?;
+            let resized_mask = resize_gray(mask, width, height)?;
+            let resized_result = pad_forward(model, &resized_image, &resized_mask, config)?;
+            let mut result = resize_rgb(&resized_result, image.width(), image.height())?;
+            for (index, value) in mask.as_raw().iter().enumerate() {
+                if *value < 127 {
+                    let offset = index * 3;
+                    result.as_flat_samples_mut().samples[offset..offset + 3]
+                        .copy_from_slice(&image.as_raw()[offset..offset + 3]);
+                }
+            }
+            Ok(result)
+        }
+        _ => pad_forward(model, &image, mask, config),
+    }
+}
+
+fn pad_forward(
+    model: &mut Model,
+    image: &RgbImage,
+    mask: &GrayImage,
+    config: &InpaintRequest,
+) -> Result<RgbImage> {
+    let (width, height) = (image.width() as usize, image.height() as usize);
+    let padded_height = ceil_modulo(height, 8);
+    let padded_width = ceil_modulo(width, 8);
+    let rows = (0..padded_height)
+        .map(|y| symmetric_index(y, height))
+        .collect::<Vec<_>>();
+    let columns = (0..padded_width)
+        .map(|x| symmetric_index(x, width))
+        .collect::<Vec<_>>();
+    let plane = padded_height * padded_width;
+    let mut model_image = vec![0.0; 3 * plane];
+    let mut model_mask = vec![0.0; plane];
+    for (y, &source_y) in rows.iter().enumerate() {
+        for (x, &source_x) in columns.iter().enumerate() {
+            let source = source_y * width + source_x;
+            let target = y * padded_width + x;
+            for channel in 0..3 {
+                model_image[channel * plane + target] =
+                    f32::from(image.as_raw()[source * 3 + channel]) / 255.0;
+            }
+            model_mask[target] = if mask.as_raw()[source] > 0 { 1.0 } else { 0.0 };
         }
     }
 
-    fn pad_forward(
-        &self,
-        model: &Model,
-        image: &RgbImage,
-        mask: &GrayImage,
-        config: &InpaintRequest,
-    ) -> Result<RgbImage> {
-        let width = image.width();
-        let height = image.height();
-        let image_tensor = Tensor::from_slice(image.as_raw())
-            .view([i64::from(height), i64::from(width), 3])
-            .to_device(self.device)
-            .permute([2, 0, 1])
-            .unsqueeze(0)
-            .contiguous();
-        let mask_tensor = Tensor::from_slice(mask.as_raw())
-            .view([i64::from(height), i64::from(width)])
-            .to_device(self.device)
-            .unsqueeze(0)
-            .unsqueeze(0)
-            .contiguous();
-        let model_image = pad_img_to_modulo(image_tensor.to_kind(Kind::Float) / 255.0, 8);
-        let model_mask = pad_img_to_modulo(mask_tensor.gt(0.0).to_kind(Kind::Float), 8);
-        let output = model
-            .forward(&model_image, &model_mask)
-            .narrow(2, 0, i64::from(height))
-            .narrow(3, 0, i64::from(width))
-            .clamp(0.0, 1.0)
-            * 255.0;
-        let output = output.to_kind(Kind::Uint8);
-        let output = if config.sd_keep_unmasked_area {
-            let alpha = mask_tensor.to_kind(Kind::Float) / 255.0;
-            (output.to_kind(Kind::Float) * &alpha
-                + image_tensor.to_kind(Kind::Float) * (alpha.ones_like() - alpha))
-                .to_kind(Kind::Uint8)
-        } else {
-            output
-        };
-        post_process(&output, width, height)
+    let output = model.forward(&model_image, &model_mask, padded_height, padded_width)?;
+    let mut rgb = vec![0; height * width * 3];
+    for y in 0..height {
+        for x in 0..width {
+            let source = y * width + x;
+            for channel in 0..3 {
+                // Float to uint8 conversion truncates, as torch's `.to(torch.uint8)` does.
+                let generated =
+                    (output[channel * plane + y * padded_width + x].clamp(0.0, 1.0) * 255.0) as u8;
+                rgb[source * 3 + channel] = if config.sd_keep_unmasked_area {
+                    let alpha = f32::from(mask.as_raw()[source]) / 255.0;
+                    let known = f32::from(image.as_raw()[source * 3 + channel]);
+                    (f32::from(generated) * alpha + known * (1.0 - alpha)) as u8
+                } else {
+                    generated
+                };
+            }
+        }
     }
+    RgbImage::from_raw(width as u32, height as u32, rgb)
+        .context("failed to convert LaMa output to an RGB image")
 }
 
 fn resize_dimensions(width: u32, height: u32, size_limit: u32) -> (u32, u32) {
@@ -283,52 +281,12 @@ fn crop_box(
     ]
 }
 
-fn post_process(tensor: &Tensor, width: u32, height: u32) -> Result<RgbImage> {
-    let tensor = tensor
-        .squeeze_dim(0)
-        .permute([1, 2, 0])
-        .contiguous()
-        .to_device(Device::Cpu)
-        .view([-1]);
-    let rgb = Vec::<u8>::try_from(&tensor)?;
-    RgbImage::from_raw(width, height, rgb).context("failed to convert LaMa tensor to RGB image")
+fn ceil_modulo(value: usize, modulo: usize) -> usize {
+    value.div_ceil(modulo) * modulo
 }
 
-fn pad_img_to_modulo(tensor: Tensor, modulo: u32) -> Tensor {
-    let height = tensor.size()[2] as u32;
-    let width = tensor.size()[3] as u32;
-    let out_height = ceil_modulo(height, modulo);
-    let out_width = ceil_modulo(width, modulo);
-    let height_indices = symmetric_indices(height, out_height, tensor.device());
-    let width_indices = symmetric_indices(width, out_width, tensor.device());
-    tensor
-        .index_select(2, &height_indices)
-        .index_select(3, &width_indices)
-}
-
-fn ceil_modulo(value: u32, modulo: u32) -> u32 {
-    if value.is_multiple_of(modulo) {
-        value
-    } else {
-        (value / modulo + 1) * modulo
-    }
-}
-
-fn symmetric_indices(length: u32, output_length: u32, device: Device) -> Tensor {
-    if !device.is_cuda() {
-        let indices = (0..output_length)
-            .map(|index| i64::from(symmetric_index(index, length)))
-            .collect::<Vec<_>>();
-        return Tensor::from_slice(&indices).to_device(device);
-    }
-    let length = i64::from(length);
-    let period = length * 2;
-    let indices = Tensor::arange(i64::from(output_length), (Kind::Int64, device));
-    let indices = &indices - indices.floor_divide_scalar(period) * period;
-    indices.where_self(&indices.lt(length), &(period - &indices - 1))
-}
-
-fn symmetric_index(index: u32, length: u32) -> u32 {
+/// `numpy.pad(mode="symmetric")` source index, as IOPaint's `pad_img_to_modulo`.
+fn symmetric_index(index: usize, length: usize) -> usize {
     let index = index % (length * 2);
     if index < length {
         index
