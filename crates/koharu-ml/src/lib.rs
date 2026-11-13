@@ -1,5 +1,6 @@
 use anyhow::{Context, ensure};
 use koharu_llama::llama_backend::LlamaBackend;
+use koharu_runtime::OnnxRuntime;
 use koharu_runtime::{Hardware, Runtime};
 use tokio::sync::OnceCell;
 
@@ -11,6 +12,7 @@ pub mod koharu_layout_rfdetr_seg_2xl;
 pub mod lama;
 pub mod llm;
 pub mod paddle_ocr_vl_quantized;
+pub mod waifu2x;
 
 pub use koharu_diffusion as diffusion;
 pub use koharu_llama as llama;
@@ -19,6 +21,7 @@ pub use koharu_torch as torch;
 
 static LLAMA: OnceCell<LlamaBackend> = OnceCell::const_new();
 static DIFFUSION: OnceCell<()> = OnceCell::const_new();
+static ONNX: OnceCell<ort::environment::Environment> = OnceCell::const_new();
 struct Initialized {
     device: Device,
     features: Vec<Feature>,
@@ -57,6 +60,18 @@ pub async fn init(features: &[Feature]) -> anyhow::Result<()> {
                     })
                     .await?;
             }
+            if features.contains(&Feature::OnnxRuntime) {
+                ONNX.get_or_try_init(|| async {
+                    let library = OnnxRuntime::Cuda13.library().await?;
+                    ort::init_from(&library)
+                        .with_context(|| format!("failed to load {}", library.display()))?
+                        .with_name("koharu")
+                        .with_telemetry(false)
+                        .build()
+                        .context("failed to initialize ONNX Runtime")
+                })
+                .await?;
+            }
             Ok::<Initialized, anyhow::Error>(Initialized {
                 device,
                 features: features.to_vec(),
@@ -85,6 +100,12 @@ pub fn device(cpu: bool) -> Device {
         tracing::warn!("GPU is not available, falling back to CPU");
         Device::cpu()
     }
+}
+
+/// Returns the process-wide ONNX Runtime environment.
+pub(crate) fn onnx_environment() -> anyhow::Result<&'static ort::environment::Environment> {
+    ONNX.get()
+        .context("ONNX Runtime was not included in process initialization")
 }
 
 /// Returns the initialized process-wide llama.cpp backend.

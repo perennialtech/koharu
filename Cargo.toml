@@ -45,6 +45,8 @@ anyhow = "1.0.104"
 async-trait = "0.1.92"
 backon = { version = "1.6.0", default-features = false, features = ["std", "tokio-sleep"] }
 imageproc = "0.27.0"
+# Loads the managed ONNX Runtime library at runtime; never downloads or links it.
+ort = { version = "=2.0.0-rc.15", default-features = false, features = ["std", "load-dynamic", "cuda", "api-31", "tracing"] }
 ab_glyph = "0.2.32"
 clap = { version = "4.6.7", features = ["derive", "env"] }
 serde = { version = "1.0.229", features = ["derive"] }

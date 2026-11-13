@@ -10,7 +10,7 @@ use crate::{
     Device, Hardware,
     runtime::{
         DiscoverablePackage, RuntimePackage,
-        packages::{Cuda, Diffusion, Llama, Torch},
+        packages::{Cuda, Diffusion, Llama, OnnxRuntime, Torch},
     },
 };
 
@@ -20,6 +20,7 @@ pub(crate) enum Component {
     Torch(Torch),
     Llama(Llama),
     Diffusion(Diffusion),
+    OnnxRuntime(OnnxRuntime),
 }
 
 impl Component {
@@ -29,6 +30,7 @@ impl Component {
             Self::Torch(package) => package.dependencies(hardware),
             Self::Llama(package) => package.dependencies(hardware),
             Self::Diffusion(package) => package.dependencies(hardware),
+            Self::OnnxRuntime(package) => package.dependencies(hardware),
         }
     }
 
@@ -38,6 +40,7 @@ impl Component {
             Self::Torch(package) => activate(package).await,
             Self::Llama(package) => activate(package).await,
             Self::Diffusion(package) => activate(package).await,
+            Self::OnnxRuntime(package) => activate(package).await,
         }
     }
 
@@ -47,6 +50,7 @@ impl Component {
             Self::Torch(package) => package.label(),
             Self::Llama(package) => package.label(),
             Self::Diffusion(package) => package.label(),
+            Self::OnnxRuntime(package) => package.label(),
         }
     }
 }
@@ -79,6 +83,12 @@ impl From<Llama> for Component {
 impl From<Diffusion> for Component {
     fn from(value: Diffusion) -> Self {
         Self::Diffusion(value)
+    }
+}
+
+impl From<OnnxRuntime> for Component {
+    fn from(value: OnnxRuntime) -> Self {
+        Self::OnnxRuntime(value)
     }
 }
 
