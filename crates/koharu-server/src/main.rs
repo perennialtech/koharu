@@ -341,31 +341,33 @@ async fn serve_http(
     grace: Duration,
 ) -> Result<()> {
     let (draining, drained) = tokio::sync::oneshot::channel();
+    let signal_jobs = shutdown_jobs.clone();
     let server = async move {
-        axum::serve(listener, app)
+        let result = axum::serve(listener, app)
             .with_graceful_shutdown(async move {
                 shutdown.await;
-                shutdown_jobs.shutdown();
+                signal_jobs.shutdown();
                 let _ = draining.send(());
             })
-            .await
+            .await;
+        // Stops the worker when serving fails without a shutdown signal.
+        shutdown_jobs.shutdown();
+        result
     };
-    tokio::pin!(server);
+    // The deadline starts when shutdown begins or serving fails, which drops
+    // `draining`.
+    let deadline = async {
+        let _ = drained.await;
+        tokio::time::sleep(grace).await;
+    };
     tokio::select! {
-        result = &mut server => result?,
-        _ = drained => match tokio::time::timeout(grace, async {
-            tokio::join!(&mut server, worker)
-        })
-        .await
-        {
-            Ok((result, worker)) => {
-                if let Err(error) = worker {
-                    tracing::error!(error = ?error, "translation worker failed");
-                }
-                result?
+        (result, worker) = async { tokio::join!(server, worker) } => {
+            if let Err(error) = worker {
+                tracing::error!(error = ?error, "translation worker failed");
             }
-            Err(_) => tracing::warn!("shutdown did not finish before its deadline"),
-        },
+            result?;
+        }
+        () = deadline => tracing::warn!("shutdown did not finish before its deadline"),
     }
     Ok(())
 }
