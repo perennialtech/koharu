@@ -25,6 +25,8 @@ async fn main() -> Result<()> {
     koharu_ml::init(&[koharu_ml::Feature::OnnxRuntime]).await?;
 
     let mut model = Waifu2x::load(koharu_ml::device(cli.cpu)).await?;
+    // Every tile has one shape, so a single tile warms the provider.
+    model.inference(&image::RgbImage::new(1, 1))?;
     let started = std::time::Instant::now();
     let upscaled = model.inference(&image)?;
     tracing::info!(elapsed = ?started.elapsed(), "upscaled");
