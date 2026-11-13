@@ -5,36 +5,36 @@
 
 use anyhow::{Result, ensure};
 use image::DynamicImage;
-use koharu_torch::{Device, IndexOp, Kind, Tensor};
 use serde::Serialize;
 
 use super::{
     config::{KoharuLayoutRFDetrSeg2XLConfig, KoharuLayoutThresholds},
-    model::{Model, Output},
+    model::{MASK_RESOLUTION, Model, NUM_CLASSES_WITH_BACKGROUND, NUM_QUERIES, Output, RESOLUTION},
 };
 
-// Amortize CUDA reductions without retaining too many page-sized masks.
-const MAX_MASK_BATCH_SIZE: usize = 6;
+const MEAN: [f32; 3] = [0.485, 0.456, 0.406];
+const STD: [f32; 3] = [0.229, 0.224, 0.225];
 
 #[derive(Debug, Clone)]
 pub struct KoharuLayoutRFDetrImageProcessor {
-    resolution: i64,
-    num_select: i64,
+    num_select: usize,
     class_names: Vec<String>,
     recommended_thresholds: KoharuLayoutThresholds,
 }
 
 impl KoharuLayoutRFDetrImageProcessor {
     pub fn new(config: &KoharuLayoutRFDetrSeg2XLConfig) -> Result<Self> {
-        ensure!(config.resolution > 0, "RF-DETR resolution must be positive");
         ensure!(
-            config.resolution % 24 == 0,
-            "RF-DETR resolution must be divisible by patch_size * num_windows"
+            config.resolution == RESOLUTION as i64,
+            "the RF-DETR export takes {RESOLUTION} px input, not {}",
+            config.resolution
         );
-        ensure!(config.num_select > 0, "RF-DETR num_select must be positive");
+        ensure!(
+            (1..=(NUM_QUERIES * NUM_CLASSES_WITH_BACKGROUND) as i64).contains(&config.num_select),
+            "RF-DETR num_select must be between 1 and the number of query/class pairs"
+        );
         Ok(Self {
-            resolution: config.resolution,
-            num_select: config.num_select,
+            num_select: config.num_select as usize,
             class_names: config.class_names(),
             recommended_thresholds: config.recommended_thresholds,
         })
@@ -44,75 +44,63 @@ impl KoharuLayoutRFDetrImageProcessor {
         self.recommended_thresholds
     }
 
-    pub(super) fn preprocess(&self, image: &DynamicImage, device: Device) -> Result<Tensor> {
+    /// Rescales to `[0, 1]`, resizes to the model resolution with bilinear
+    /// interpolation, then normalizes, as planar RGB. Latest upstream disables
+    /// antialiasing to match the bilinear Albumentations resize used during
+    /// training.
+    pub(super) fn preprocess(&self, image: &DynamicImage) -> Result<Vec<f32>> {
         ensure!(
             image.width() > 0 && image.height() > 0,
             "cannot segment an empty image"
         );
         let image = image.to_rgb8();
-        let mut pixel_values = Tensor::from_slice(image.as_raw())
-            .view([1, i64::from(image.height()), i64::from(image.width()), 3])
-            .permute([0, 3, 1, 2])
-            .to_device(device)
-            .to_kind(Kind::Float)
-            / 255.0;
-        if image.width() != self.resolution as u32 || image.height() != self.resolution as u32 {
-            // Latest upstream disables antialiasing to match the bilinear
-            // Albumentations resize used during training.
-            pixel_values = pixel_values.upsample_bilinear2d(
-                [self.resolution, self.resolution],
-                false,
-                None,
-                None,
-            );
+        let (width, height) = (image.width() as usize, image.height() as usize);
+        let rows = bilinear_taps(height, RESOLUTION);
+        let columns = bilinear_taps(width, RESOLUTION);
+        let source = |y: usize, x: usize, channel: usize| {
+            f32::from(image.as_raw()[(y * width + x) * 3 + channel]) / 255.0
+        };
+        let plane = RESOLUTION * RESOLUTION;
+        let mut pixel_values = vec![0.0; 3 * plane];
+        for (y, row) in rows.iter().enumerate() {
+            for (x, column) in columns.iter().enumerate() {
+                for channel in 0..3 {
+                    let value = row.interpolate(|source_y| {
+                        column.interpolate(|source_x| source(source_y, source_x, channel))
+                    });
+                    pixel_values[channel * plane + y * RESOLUTION + x] =
+                        (value - MEAN[channel]) / STD[channel];
+                }
+            }
         }
-        let mean = Tensor::from_slice(&[0.485f32, 0.456, 0.406])
-            .view([1, 3, 1, 1])
-            .to_device(device);
-        let std = Tensor::from_slice(&[0.229f32, 0.224, 0.225])
-            .view([1, 3, 1, 1])
-            .to_device(device);
-        Ok((pixel_values - mean) / std)
+        Ok(pixel_values)
     }
 
     pub(super) fn postprocess(
         &self,
-        model: &Model,
+        model: &mut Model,
         output: &Output,
         image_width: u32,
         image_height: u32,
         thresholds: KoharuLayoutThresholds,
     ) -> Result<KoharuLayoutDetections> {
         validate_thresholds(thresholds)?;
-        let logits_size = output.pred_logits.size();
-        ensure!(
-            logits_size == [1, 300, 5],
-            "unexpected RF-DETR logits shape {logits_size:?}"
-        );
-        ensure!(
-            output.pred_boxes.size() == [1, 300, 4],
-            "unexpected RF-DETR box shape {:?}",
-            output.pred_boxes.size()
-        );
         // PostProcess ranks every query/class pair, including the checkpoint's
         // fifth background logit slot, before applying the caller threshold.
-        let (scores, indexes) =
-            output
-                .pred_logits
-                .sigmoid()
-                .view([1, -1])
-                .topk(self.num_select, 1, true, true);
-        let scores = scores.i(0);
-        let indexes = indexes.i(0);
-        let query_indexes = indexes.floor_divide_scalar(5);
-        let labels = indexes.remainder(5);
-        let thresholds = Tensor::from_slice(&thresholds.with_background())
-            .to_device(scores.device())
-            .index_select(0, &labels);
-        let keep = scores.gt_tensor(&thresholds);
-        let selected = keep.nonzero().view([-1]);
-
-        if selected.size()[0] == 0 {
+        let scores = output
+            .pred_logits
+            .iter()
+            .map(|&logit| 1.0 / (1.0 + (-logit).exp()))
+            .collect::<Vec<f32>>();
+        let mut ranked = (0..scores.len()).collect::<Vec<_>>();
+        ranked.sort_by(|&left, &right| scores[right].total_cmp(&scores[left]));
+        ranked.truncate(self.num_select);
+        let thresholds = thresholds.with_background();
+        let selected = ranked
+            .into_iter()
+            .filter(|&index| scores[index] > thresholds[index % NUM_CLASSES_WITH_BACKGROUND])
+            .collect::<Vec<_>>();
+        if selected.is_empty() {
             return Ok(KoharuLayoutDetections {
                 image_width,
                 image_height,
@@ -120,115 +108,52 @@ impl KoharuLayoutRFDetrImageProcessor {
             });
         }
 
-        let scores = scores.index_select(0, &selected);
-        let labels = labels.index_select(0, &selected);
-        let query_indexes = query_indexes.index_select(0, &selected);
-        let boxes = output.pred_boxes.i(0).index_select(0, &query_indexes);
-        let center = boxes.i((.., 0..2));
-        let half_size = boxes.i((.., 2..4)) / 2.0;
-        let boxes = Tensor::cat(&[&center - &half_size, &center + &half_size], 1)
-            * Tensor::from_slice(&[
-                image_width as f32,
-                image_height as f32,
-                image_width as f32,
-                image_height as f32,
-            ])
-            .to_device(output.pred_boxes.device());
-
-        // Each selected query has the same mask as when projecting all queries.
-        let masks = model.masks(output, &query_indexes).i(0);
-
-        let floats = Tensor::cat(&[scores.unsqueeze(1), boxes], 1);
-        let floats = tensor_to_vec_f32(&floats)?;
-        let labels = tensor_to_vec_i64(&labels)?;
-
-        let mut detections = Vec::with_capacity(labels.len());
-        // Bound temporary mask pixels by the native model image area while
-        // batching smaller pages to amortize CUDA reductions.
-        let page_pixels = u64::from(image_width) * u64::from(image_height);
-        let native_pixels = (self.resolution * self.resolution) as u64;
-        let batch_size = (native_pixels * MAX_MASK_BATCH_SIZE as u64 / page_pixels)
-            .clamp(1, MAX_MASK_BATCH_SIZE as u64) as usize;
-        for batch_start in (0..labels.len()).step_by(batch_size) {
-            let batch_end = (batch_start + batch_size).min(labels.len());
-            let batch = masks
-                .i(batch_start as i64..batch_end as i64)
-                .unsqueeze(1)
-                .upsample_bilinear2d(
-                    [i64::from(image_height), i64::from(image_width)],
-                    false,
-                    None,
-                    None,
-                )
-                .gt(0.0)
-                .to_kind(Kind::Uint8);
-            let rows = batch
-                .count_nonzero_dim_intlist(&[1i64, 3][..])
-                .gt(0)
-                .to_kind(Kind::Int64);
-            let columns = batch
-                .count_nonzero_dim_intlist(&[1i64, 2][..])
-                .gt(0)
-                .to_kind(Kind::Int64);
-            let occupied = Tensor::stack(
-                &[
-                    batch.count_nonzero_dim_intlist(&[1i64, 2, 3][..]),
-                    columns.argmax(1, false),
-                    rows.argmax(1, false),
-                    i64::from(image_width) - columns.flip([1]).argmax(1, false),
-                    i64::from(image_height) - rows.flip([1]).argmax(1, false),
-                ],
-                1,
-            );
-            let occupied = tensor_to_vec_i64(&occupied)?;
-            for (local_index, &label) in labels[batch_start..batch_end].iter().enumerate() {
-                let index = batch_start + local_index;
-                let area = occupied[local_index * 5].clamp(0, i64::from(u32::MAX)) as u32;
-                let (x, y, right, bottom) = if area == 0 {
-                    (0, 0, 0, 0)
-                } else {
-                    (
-                        occupied[local_index * 5 + 1] as u32,
-                        occupied[local_index * 5 + 2] as u32,
-                        occupied[local_index * 5 + 3] as u32,
-                        occupied[local_index * 5 + 4] as u32,
-                    )
-                };
-                let width = right.saturating_sub(x);
-                let height = bottom.saturating_sub(y);
-                let pixels = if width == 0 || height == 0 {
-                    Vec::new()
-                } else {
-                    tensor_to_vec_u8(
-                        &(batch.i((
-                            local_index as i64,
-                            0,
-                            i64::from(y)..i64::from(bottom),
-                            i64::from(x)..i64::from(right),
-                        )) * 255),
-                    )?
-                };
-                let label_id = label as usize;
-                detections.push(KoharuLayoutDetection {
+        let queries = selected
+            .iter()
+            .map(|index| index / NUM_CLASSES_WITH_BACKGROUND)
+            .collect::<Vec<_>>();
+        let masks = model.masks(output, &queries)?;
+        let rows = bilinear_taps(MASK_RESOLUTION, image_height as usize);
+        let columns = bilinear_taps(MASK_RESOLUTION, image_width as usize);
+        let size = [
+            image_width as f32,
+            image_height as f32,
+            image_width as f32,
+            image_height as f32,
+        ];
+        let detections = selected
+            .iter()
+            .zip(&queries)
+            .zip(masks.as_chunks::<{ MASK_RESOLUTION * MASK_RESOLUTION }>().0)
+            .map(|((&index, &query), logits)| {
+                let label_id = index % NUM_CLASSES_WITH_BACKGROUND;
+                let [center_x, center_y, width, height]: [f32; 4] = output.pred_boxes
+                    [query * 4..query * 4 + 4]
+                    .try_into()
+                    .expect("box has four coordinates");
+                let half_width = width / 2.0;
+                let half_height = height / 2.0;
+                let corners = [
+                    center_x - half_width,
+                    center_y - half_height,
+                    center_x + half_width,
+                    center_y + half_height,
+                ];
+                let (area, mask) = page_mask(logits, &rows, &columns);
+                KoharuLayoutDetection {
                     label_id,
                     label: self
                         .class_names
                         .get(label_id)
                         .cloned()
                         .unwrap_or_else(|| "__background__".to_owned()),
-                    score: floats[index * 5],
-                    bbox: floats[index * 5 + 1..index * 5 + 5].try_into().unwrap(),
+                    score: scores[index],
+                    bbox: std::array::from_fn(|axis| corners[axis] * size[axis]),
                     area,
-                    mask: KoharuLayoutMask {
-                        x,
-                        y,
-                        width,
-                        height,
-                        pixels,
-                    },
-                });
-            }
-        }
+                    mask,
+                }
+            })
+            .collect();
 
         Ok(KoharuLayoutDetections {
             image_width,
@@ -236,6 +161,133 @@ impl KoharuLayoutRFDetrImageProcessor {
             detections,
         })
     }
+}
+
+/// One output coordinate of PyTorch's `upsample_bilinear2d` with
+/// `align_corners=False` and no explicit scale.
+#[derive(Debug, Clone, Copy)]
+struct BilinearTap {
+    low: usize,
+    high: usize,
+    low_weight: f32,
+    high_weight: f32,
+}
+
+impl BilinearTap {
+    fn interpolate(self, value: impl Fn(usize) -> f32) -> f32 {
+        self.low_weight * value(self.low) + self.high_weight * value(self.high)
+    }
+}
+
+fn bilinear_taps(input: usize, output: usize) -> Vec<BilinearTap> {
+    let scale = input as f32 / output as f32;
+    (0..output)
+        .map(|index| {
+            let source = ((index as f32 + 0.5) * scale - 0.5).max(0.0);
+            let low = (source as usize).min(input - 1);
+            let high = (low + 1).min(input - 1);
+            let high_weight = source - low as f32;
+            BilinearTap {
+                low,
+                high,
+                low_weight: 1.0 - high_weight,
+                high_weight,
+            }
+        })
+        .collect()
+}
+
+/// Upsamples one query's mask logits to the page and keeps positive pixels,
+/// returning the pixel count and the mask cropped to its occupied bounds.
+fn page_mask(
+    logits: &[f32],
+    rows: &[BilinearTap],
+    columns: &[BilinearTap],
+) -> (u32, KoharuLayoutMask) {
+    let empty = KoharuLayoutMask {
+        x: 0,
+        y: 0,
+        width: 0,
+        height: 0,
+        pixels: Vec::new(),
+    };
+    // An interpolated value is a convex combination of its taps, so a page
+    // pixel can be positive only if a tap lies inside the bounds of the
+    // positive mask logits. Skipping the rest is exact.
+    let mut bounds: Option<[usize; 4]> = None;
+    for (y, row) in logits.as_chunks::<MASK_RESOLUTION>().0.iter().enumerate() {
+        for (x, &value) in row.iter().enumerate() {
+            if value > 0.0 {
+                let [left, top, right, bottom] = bounds.get_or_insert([x, y, x, y]);
+                *left = (*left).min(x);
+                *top = (*top).min(y);
+                *right = (*right).max(x);
+                *bottom = (*bottom).max(y);
+            }
+        }
+    }
+    let Some([left, top, right, bottom]) = bounds else {
+        return (0, empty);
+    };
+    let touches = |tap: &BilinearTap, low: usize, high: usize| tap.high >= low && tap.low <= high;
+    let Some(first_row) = rows.iter().position(|tap| touches(tap, top, bottom)) else {
+        return (0, empty);
+    };
+    let last_row = rows
+        .iter()
+        .rposition(|tap| touches(tap, top, bottom))
+        .unwrap();
+    let first_column = columns
+        .iter()
+        .position(|tap| touches(tap, left, right))
+        .unwrap();
+    let last_column = columns
+        .iter()
+        .rposition(|tap| touches(tap, left, right))
+        .unwrap();
+
+    let window_width = last_column - first_column + 1;
+    let mut window = vec![false; (last_row - first_row + 1) * window_width];
+    let (mut area, mut occupied) = (0_u32, None::<[usize; 4]>);
+    for (y, row) in rows[first_row..=last_row].iter().enumerate() {
+        let low = &logits[row.low * MASK_RESOLUTION..][..MASK_RESOLUTION];
+        let high = &logits[row.high * MASK_RESOLUTION..][..MASK_RESOLUTION];
+        for (x, column) in columns[first_column..=last_column].iter().enumerate() {
+            let value = row.low_weight * column.interpolate(|source| low[source])
+                + row.high_weight * column.interpolate(|source| high[source]);
+            if value > 0.0 {
+                window[y * window_width + x] = true;
+                area += 1;
+                let [left, top, right, bottom] = occupied.get_or_insert([x, y, x, y]);
+                *left = (*left).min(x);
+                *top = (*top).min(y);
+                *right = (*right).max(x);
+                *bottom = (*bottom).max(y);
+            }
+        }
+    }
+    let Some([left, top, right, bottom]) = occupied else {
+        return (0, empty);
+    };
+    let width = right - left + 1;
+    let mut pixels = Vec::with_capacity(width * (bottom - top + 1));
+    for y in top..=bottom {
+        pixels.extend(
+            window[y * window_width + left..][..width]
+                .iter()
+                .map(|&set| if set { u8::MAX } else { 0 }),
+        );
+    }
+    (
+        area,
+        KoharuLayoutMask {
+            x: (first_column + left) as u32,
+            y: (first_row + top) as u32,
+            width: width as u32,
+            height: (bottom - top + 1) as u32,
+            pixels,
+        },
+    )
 }
 
 fn validate_thresholds(thresholds: KoharuLayoutThresholds) -> Result<()> {
@@ -298,42 +350,11 @@ impl KoharuLayoutMask {
     }
 }
 
-fn tensor_to_vec_f32(tensor: &Tensor) -> Result<Vec<f32>> {
-    let tensor = tensor
-        .to_device(Device::Cpu)
-        .to_kind(Kind::Float)
-        .contiguous();
-    let length = tensor.numel();
-    let mut values = vec![0.0; length];
-    tensor.f_copy_data(&mut values, length)?;
-    Ok(values)
-}
-
-fn tensor_to_vec_i64(tensor: &Tensor) -> Result<Vec<i64>> {
-    let tensor = tensor
-        .to_device(Device::Cpu)
-        .to_kind(Kind::Int64)
-        .contiguous();
-    let length = tensor.numel();
-    let mut values = vec![0; length];
-    tensor.f_copy_data(&mut values, length)?;
-    Ok(values)
-}
-
-fn tensor_to_vec_u8(tensor: &Tensor) -> Result<Vec<u8>> {
-    let tensor = tensor
-        .to_device(Device::Cpu)
-        .to_kind(Kind::Uint8)
-        .contiguous();
-    let length = tensor.numel();
-    let mut values = vec![0; length];
-    tensor.f_copy_data(&mut values, length)?;
-    Ok(values)
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{KoharuLayoutThresholds, validate_thresholds};
+    use super::{
+        KoharuLayoutThresholds, MASK_RESOLUTION, bilinear_taps, page_mask, validate_thresholds,
+    };
 
     #[test]
     fn class_thresholds_must_be_probabilities() {
@@ -346,5 +367,59 @@ mod tests {
 
         let error = validate_thresholds(thresholds).unwrap_err();
         assert!(error.to_string().contains("onomatopoeia"));
+    }
+
+    #[test]
+    fn page_mask_matches_upsampling_the_whole_page() {
+        // A blob, a single positive cell on the grid edge, and negative
+        // values elsewhere, upsampled to a page that is not a multiple of the
+        // mask grid on either axis.
+        let mut logits = vec![-1.0_f32; MASK_RESOLUTION * MASK_RESOLUTION];
+        for y in 100..140 {
+            for x in 200..260 {
+                logits[y * MASK_RESOLUTION + x] = ((x + y) % 7) as f32 - 2.5;
+            }
+        }
+        logits[MASK_RESOLUTION - 1] = 0.3;
+        let (width, height) = (1013, 1517);
+        let rows = bilinear_taps(MASK_RESOLUTION, height);
+        let columns = bilinear_taps(MASK_RESOLUTION, width);
+
+        let mut expected = vec![false; width * height];
+        for (y, row) in rows.iter().enumerate() {
+            for (x, column) in columns.iter().enumerate() {
+                let value = row.interpolate(|source_y| {
+                    column.interpolate(|source_x| logits[source_y * MASK_RESOLUTION + source_x])
+                });
+                expected[y * width + x] = value > 0.0;
+            }
+        }
+        let (area, mask) = page_mask(&logits, &rows, &columns);
+
+        assert_eq!(area as usize, expected.iter().filter(|&&set| set).count());
+        for y in 0..height {
+            for x in 0..width {
+                assert_eq!(
+                    mask.contains(x as u32, y as u32),
+                    expected[y * width + x],
+                    "pixel {x}, {y}"
+                );
+            }
+        }
+        let occupied = |coordinate: &dyn Fn(usize) -> usize| {
+            let set = (0..expected.len()).filter(|&index| expected[index]);
+            (
+                set.clone().map(coordinate).min().unwrap(),
+                set.map(coordinate).max().unwrap(),
+            )
+        };
+        assert_eq!(
+            occupied(&|index| index % width),
+            (mask.x as usize, (mask.x + mask.width - 1) as usize)
+        );
+        assert_eq!(
+            occupied(&|index| index / width),
+            (mask.y as usize, (mask.y + mask.height - 1) as usize)
+        );
     }
 }
