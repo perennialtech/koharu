@@ -74,6 +74,10 @@ struct Upload {
     /// engines use the model the server configures.
     #[schema(value_type = Option<Vec<String>>, example = json!(["google-web", "microsoft-edge"]))]
     translator: Vec<Provider>,
+    /// Result pixels per source pixel: 1 or 2. Defaults to 1. At 2 the page
+    /// is upscaled before the translation is drawn over it.
+    #[schema(example = 2)]
+    scale: Option<u32>,
 }
 
 impl Upload {
@@ -82,6 +86,7 @@ impl Upload {
         let mut target_language = None;
         let mut instructions = None;
         let mut translator = Vec::new();
+        let mut scale = None;
         while let Some(field) = multipart
             .next_field()
             .await
@@ -115,6 +120,19 @@ impl Upload {
                         )
                     })?);
                 }
+                Some("scale") if scale.is_none() => {
+                    let value = field.text().await.map_err(|_| ApiError::MULTIPART)?;
+                    scale = Some(match value.trim() {
+                        "1" => 1,
+                        "2" => 2,
+                        _ => {
+                            return Err(ApiError::new(
+                                StatusCode::BAD_REQUEST,
+                                "Scale must be 1 or 2",
+                            ));
+                        }
+                    });
+                }
                 _ => {
                     return Err(ApiError::new(
                         StatusCode::BAD_REQUEST,
@@ -131,6 +149,7 @@ impl Upload {
             target_language,
             instructions,
             translator,
+            scale,
         })
     }
 
@@ -158,6 +177,7 @@ impl Upload {
             language: self.target_language.unwrap_or(Language::English),
             instructions: self.instructions,
             engines: (!self.translator.is_empty()).then_some(self.translator),
+            scale: self.scale.unwrap_or(1),
         })
     }
 }

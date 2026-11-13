@@ -10,7 +10,7 @@ use crate::{Device, Hardware};
 use graph::{Component, Plan};
 use packages::{Diffusion, Llama};
 
-pub use packages::Torch;
+pub use packages::{OnnxRuntime, Torch};
 
 mod sealed {
     pub trait Sealed {}
@@ -46,6 +46,7 @@ pub enum Feature {
     Torch,
     Llama,
     Diffusion,
+    OnnxRuntime,
 }
 
 /// A discovered, dependency-ordered runtime plan.
@@ -79,6 +80,7 @@ impl Runtime {
                 Feature::Torch => plan.require::<Torch>(hardware)?,
                 Feature::Llama => plan.require::<Llama>(hardware)?,
                 Feature::Diffusion => plan.require::<Diffusion>(hardware)?,
+                Feature::OnnxRuntime => plan.require::<OnnxRuntime>(hardware)?,
             }) else {
                 return Ok(None);
             };

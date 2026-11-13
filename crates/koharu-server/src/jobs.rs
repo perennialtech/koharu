@@ -22,6 +22,17 @@ pub(crate) struct Input {
     pub(crate) language: Language,
     pub(crate) instructions: Option<String>,
     pub(crate) engines: Option<Vec<Provider>>,
+    /// Result pixels per source pixel.
+    pub(crate) scale: u32,
+}
+
+impl Input {
+    pub(crate) fn stages(&self) -> Vec<Stage> {
+        Stage::ALL
+            .into_iter()
+            .filter(|&stage| stage != Stage::Upscaling || self.scale > 1)
+            .collect()
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, ToSchema)]
@@ -166,6 +177,7 @@ pub(crate) struct Job {
 
 impl Job {
     fn new(id: Uuid, input: Input) -> Self {
+        let stages = input.stages();
         Self {
             stop: StopToken::default(),
             state: watch::Sender::new(JobState {
@@ -173,8 +185,8 @@ impl Job {
                     id,
                     status: Status::Queued,
                     completed: 0,
-                    total: Stage::ALL.len(),
-                    stages: Stage::ALL
+                    total: stages.len(),
+                    stages: stages
                         .into_iter()
                         .map(|stage| StageProgress {
                             stage,

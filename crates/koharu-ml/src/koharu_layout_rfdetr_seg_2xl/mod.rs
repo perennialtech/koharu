@@ -11,9 +11,6 @@ mod processor;
 
 use anyhow::{Context, Result};
 use image::DynamicImage;
-use koharu_torch::Device;
-
-use crate::backend::{TryIntoDevice, recover_torch_oom};
 
 pub use self::{
     config::{KoharuLayoutRFDetrSeg2XLConfig, KoharuLayoutThresholds},
@@ -27,64 +24,61 @@ use self::model::Model;
 
 crate::model_repository!("mayocream/koharu-layout-highres" @ "68077eb09401a46e548190ff2786bd405113ea8b" {
     CONFIG = "config.json",
-    WEIGHTS = "model.safetensors",
+});
+
+// ONNX export of the checkpoint above (model.safetensors); the repository holds
+// the export script.
+crate::model_repository!("8q0sb/koharu-onnx" @ "fda0b1ad6a31da8887f86bbeaa77ab47da2aac70" {
+    NETWORK = "koharu-layout-highres/koharu-layout-highres.onnx",
+    MASK_HEAD = "koharu-layout-highres/koharu-layout-highres-mask-head.onnx",
 });
 
 #[derive(Debug)]
 pub struct KoharuLayoutRFDetrSeg2XL {
-    device: Device,
     model: Model,
     processor: KoharuLayoutRFDetrImageProcessor,
 }
 
 impl KoharuLayoutRFDetrSeg2XL {
     pub async fn load(device: crate::Device) -> Result<Self> {
-        let device: Device = device.try_into_device()?;
         let config_path = CONFIG
             .resolve()
             .await
             .context("failed to resolve KoharuLayout RF-DETR inference config")?;
-        let weights_path = WEIGHTS
+        let network = NETWORK
             .resolve()
             .await
-            .context("failed to resolve KoharuLayout RF-DETR weights")?;
+            .context("failed to resolve KoharuLayout RF-DETR network")?;
+        let mask_head = MASK_HEAD
+            .resolve()
+            .await
+            .context("failed to resolve KoharuLayout RF-DETR mask head")?;
         let config = KoharuLayoutRFDetrSeg2XLConfig::from_file(&config_path)?;
         let processor = KoharuLayoutRFDetrImageProcessor::new(&config)?;
-        let model = recover_torch_oom(|| {
-            let mut model = Model::new(device);
-            model.load(&weights_path)?;
-            Ok(model)
-        })
-        .with_context(|| format!("failed to load {}", weights_path.display()))?;
-        Ok(Self {
-            device,
-            model,
-            processor,
-        })
+        let model = tokio_rayon::spawn(move || Model::load(&device, &network, &mask_head))
+            .await
+            .context("failed to load KoharuLayout RF-DETR")?;
+        Ok(Self { model, processor })
     }
 
-    pub fn inference(&self, image: &DynamicImage) -> Result<KoharuLayoutDetections> {
+    pub fn inference(&mut self, image: &DynamicImage) -> Result<KoharuLayoutDetections> {
         self.inference_with_thresholds(image, self.processor.recommended_thresholds())
     }
 
     pub fn inference_with_thresholds(
-        &self,
+        &mut self,
         image: &DynamicImage,
         thresholds: KoharuLayoutThresholds,
     ) -> Result<KoharuLayoutDetections> {
-        recover_torch_oom(|| {
-            koharu_torch::no_grad(|| {
-                let pixel_values = self.processor.preprocess(image, self.device)?;
-                let output = self.model.forward(&pixel_values);
-                self.processor.postprocess(
-                    &self.model,
-                    &output,
-                    image.width(),
-                    image.height(),
-                    thresholds,
-                )
-            })
-        })
+        let pixel_values = self.processor.preprocess(image)?;
+        let output = self.model.forward(&pixel_values)?;
+        self.processor.postprocess(
+            &mut self.model,
+            &output,
+            image.width(),
+            image.height(),
+            thresholds,
+        )
     }
 
     pub fn recommended_thresholds(&self) -> KoharuLayoutThresholds {
@@ -103,16 +97,16 @@ mod tests {
     #[tokio::test]
     #[ignore = "downloads the checkpoint and takes minutes on CPU"]
     async fn checkpoint_matches_rfdetr_upstream_structured_output() -> Result<()> {
-        crate::init(&[crate::Feature::Torch]).await?;
+        crate::init(&[crate::Feature::OnnxRuntime]).await?;
         let image = image::open(
             PathBuf::from(env!("CARGO_MANIFEST_DIR"))
                 .join("benches/fixtures/object_detection/1.jpg"),
         )?;
-        let model = KoharuLayoutRFDetrSeg2XL::load(crate::Device::cpu()).await?;
+        let mut model = KoharuLayoutRFDetrSeg2XL::load(crate::Device::cpu()).await?;
         let result = model.inference(&image)?;
 
         // rfdetr 1.7.0, CPU FP32, shape=(1920, 1920), the checkpoint loaded strictly.
-        // Both sides run FP32 on CPU. Kernels still vary across LibTorch releases, so compare
+        // Both sides run FP32 on CPU. Kernels vary across runtimes and releases, so compare
         // structured geometry and mask area with bounded confidence differences.
         let best = &result.detections[0];
         assert_eq!(best.label, "bubble");

@@ -47,6 +47,9 @@ impl From<DownsampleFilter> for ResizeAlg {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RasterOptions {
+    /// Output pixels per frame unit.
+    pub output_scale: u32,
+    /// Render passes at this multiple of the output and downsample to it.
     pub supersampling_factor: u32,
     pub downsample_filter: DownsampleFilter,
 }
@@ -60,14 +63,45 @@ impl RasterOptions {
         }
     }
 
-    fn scale(self) -> u32 {
-        self.supersampling_factor.clamp(1, MAX_SUPERSAMPLING_FACTOR)
+    fn surface(self, width: u32, height: u32) -> AnyResult<Surface> {
+        checked_surface(width, height)?;
+        if self.output_scale == 0 {
+            bail!("invalid raster output scale 0");
+        }
+        let supersampling = self.supersampling_factor.clamp(1, MAX_SUPERSAMPLING_FACTOR);
+        let scale = self
+            .output_scale
+            .checked_mul(supersampling)
+            .context("raster scale overflow")?;
+        let size = |length: u32, scale: u32| {
+            length
+                .checked_mul(scale)
+                .context("render surface size overflow")
+        };
+        Ok(Surface {
+            scale,
+            width: size(width, self.output_scale)?,
+            height: size(height, self.output_scale)?,
+            raster_width: size(width, scale)?,
+            raster_height: size(height, scale)?,
+        })
     }
+}
+
+/// Output size and the render surface that is downsampled to it.
+#[derive(Clone, Copy)]
+struct Surface {
+    scale: u32,
+    width: u32,
+    height: u32,
+    raster_width: u32,
+    raster_height: u32,
 }
 
 impl Default for RasterOptions {
     fn default() -> Self {
         Self {
+            output_scale: 1,
             supersampling_factor: 1,
             downsample_filter: DownsampleFilter::Lanczos3,
         }
@@ -158,17 +192,12 @@ impl Rasterizer {
         height: u32,
         options: RasterOptions,
     ) -> AnyResult<RgbaImage> {
-        checked_surface(width, height)?;
-        let scale = options.scale();
-        let raster_width = width
-            .checked_mul(scale)
-            .context("supersampled render surface width overflow")?;
-        let raster_height = height
-            .checked_mul(scale)
-            .context("supersampled render surface height overflow")?;
+        let surface = options.surface(width, height)?;
+        let scale = surface.scale;
         let commands = frame.composition_commands(scale);
-        let pixels = self.readback_commands(&commands, raster_width, raster_height)?;
-        finish_raster(pixels, raster_width, raster_height, width, height, options)
+        let pixels =
+            self.readback_commands(&commands, surface.raster_width, surface.raster_height)?;
+        finish_raster(pixels, surface, options.downsample_filter)
     }
 
     pub fn rasterize_commands(
@@ -189,14 +218,8 @@ impl Rasterizer {
         height: u32,
         options: RasterOptions,
     ) -> AnyResult<RgbaImage> {
-        checked_surface(width, height)?;
-        let scale = options.scale();
-        let raster_width = width
-            .checked_mul(scale)
-            .context("supersampled render surface width overflow")?;
-        let raster_height = height
-            .checked_mul(scale)
-            .context("supersampled render surface height overflow")?;
+        let surface = options.surface(width, height)?;
+        let scale = surface.scale;
         let scaled;
         let commands = if scale == 1 {
             commands
@@ -220,8 +243,9 @@ impl Rasterizer {
                 .collect::<Vec<_>>();
             &scaled
         };
-        let pixels = self.readback_commands(commands, raster_width, raster_height)?;
-        finish_raster(pixels, raster_width, raster_height, width, height, options)
+        let pixels =
+            self.readback_commands(commands, surface.raster_width, surface.raster_height)?;
+        finish_raster(pixels, surface, options.downsample_filter)
     }
 
     pub fn rasterize_scene(
@@ -244,14 +268,8 @@ impl Rasterizer {
         background: [u8; 4],
         options: RasterOptions,
     ) -> AnyResult<RgbaImage> {
-        checked_surface(width, height)?;
-        let scale = options.scale();
-        let raster_width = width
-            .checked_mul(scale)
-            .context("supersampled render surface width overflow")?;
-        let raster_height = height
-            .checked_mul(scale)
-            .context("supersampled render surface height overflow")?;
+        let surface = options.surface(width, height)?;
+        let scale = surface.scale;
         let scaled;
         let scene = if scale == 1 {
             scene
@@ -263,8 +281,13 @@ impl Rasterizer {
             };
             &scaled
         };
-        let pixels = self.readback_scene(scene, raster_width, raster_height, background)?;
-        finish_raster(pixels, raster_width, raster_height, width, height, options)
+        let pixels = self.readback_scene(
+            scene,
+            surface.raster_width,
+            surface.raster_height,
+            background,
+        )?;
+        finish_raster(pixels, surface, options.downsample_filter)
     }
 
     fn readback_commands(
@@ -553,20 +576,17 @@ impl RenderTarget {
 
 fn finish_raster(
     pixels: Vec<u8>,
-    raster_width: u32,
-    raster_height: u32,
-    width: u32,
-    height: u32,
-    options: RasterOptions,
+    surface: Surface,
+    filter: DownsampleFilter,
 ) -> AnyResult<RgbaImage> {
-    let image = RgbaImage::from_raw(raster_width, raster_height, pixels)
+    let image = RgbaImage::from_raw(surface.raster_width, surface.raster_height, pixels)
         .context("WGPU returned an invalid RGBA buffer")?;
-    if options.scale() == 1 {
+    if surface.raster_width == surface.width {
         return Ok(image);
     }
-    let mut downsampled = RgbaImage::new(width, height);
+    let mut downsampled = RgbaImage::new(surface.width, surface.height);
     let resize_options = ResizeOptions::new()
-        .resize_alg(options.downsample_filter.into())
+        .resize_alg(filter.into())
         .use_alpha(true);
     // `resize_typed` instantiates the resampler for one pixel type; the untyped
     // `resize` monomorphizes all of them into this crate at opt-level 3.
