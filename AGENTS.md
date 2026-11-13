@@ -37,7 +37,7 @@ Document only durable, repository-specific constraints here. Do not record curre
 - Separate network ownership and weight loading from preprocessing, postprocessing, slicing, and public result types.
 - Avoid pass-through types and layers that do not own a real responsibility.
 - Accept a device abstraction at the model boundary, convert it once, and avoid unnecessary transfers or synchronization.
-- Use the established runtime and variable-store loading paths unless they are proven insufficient.
+- Which inference runtime a model uses is the maintainer's decision. When adding a model or changing how one runs, stop and ask which runtime to use instead of defaulting to the existing loading path or replacing it.
 - Disable gradient tracking during inference.
 - Create generated token IDs and index tensors on the model device. A CPU tensor used against accelerator embeddings is a defect, not a later optimization.
 - Invalid model JSON fails closed. Do not add a silent repair layer that can change meaning.
