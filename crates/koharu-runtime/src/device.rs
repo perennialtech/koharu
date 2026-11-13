@@ -17,7 +17,7 @@ pub enum DeviceType {
     IntegratedGpu,
 }
 
-/// The process-wide device selected for Torch, llama.cpp, and stable-diffusion.cpp.
+/// The process-wide device selected for ONNX Runtime, llama.cpp, and stable-diffusion.cpp.
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq, Hash, Serialize)]
 pub struct Device {
     pub index: usize,

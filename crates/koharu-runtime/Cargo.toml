@@ -8,7 +8,7 @@ authors.workspace = true
 readme.workspace = true
 homepage.workspace = true
 repository.workspace = true
-keywords = ["koharu", "runtime", "cuda", "libtorch", "machine-learning"]
+keywords = ["koharu", "runtime", "cuda", "onnxruntime", "machine-learning"]
 categories = ["development-tools", "science"]
 publish = true
 

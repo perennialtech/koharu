@@ -220,15 +220,6 @@ impl Committer for SessionCommitter<'_> {
 }
 
 fn main() -> Result<()> {
-    // Torch never returns cached CUDA blocks to the driver while llama.cpp
-    // models share the device, and page-sized detection buffers and
-    // variable-size inpainting tiles fragment its cache. Expandable segments
-    // keep that cache close to what is in use; torch reads the setting when its
-    // allocator starts, so it is set before any thread can read the environment.
-    if std::env::var_os("PYTORCH_CUDA_ALLOC_CONF").is_none() {
-        // SAFETY: no other thread exists yet.
-        unsafe { std::env::set_var("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True") };
-    }
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
@@ -253,11 +244,7 @@ async fn serve() -> Result<()> {
     let handle = tokio::runtime::Handle::current();
     let mut startup = tokio::task::spawn_blocking(move || {
         handle.block_on(async move {
-            let mut features = vec![
-                koharu_ml::Feature::Torch,
-                koharu_ml::Feature::Llama,
-                koharu_ml::Feature::OnnxRuntime,
-            ];
+            let mut features = vec![koharu_ml::Feature::OnnxRuntime, koharu_ml::Feature::Llama];
             if matches!(&pipeline_config.inpainting, InpaintingModel::Flux2Klein(_)) {
                 features.push(koharu_ml::Feature::Diffusion);
             }

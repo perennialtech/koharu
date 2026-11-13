@@ -17,7 +17,6 @@ pub mod waifu2x;
 pub use koharu_diffusion as diffusion;
 pub use koharu_llama as llama;
 pub use koharu_runtime::{Backend, Device, DeviceType, Feature};
-pub use koharu_torch as torch;
 
 static LLAMA: OnceCell<LlamaBackend> = OnceCell::const_new();
 static DIFFUSION: OnceCell<()> = OnceCell::const_new();

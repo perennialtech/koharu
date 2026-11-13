@@ -27,8 +27,6 @@ koharu-diffusion-sys = { path = "crates/koharu-diffusion-sys" }
 koharu-llama = { path = "crates/koharu-llama" }
 koharu-llama-sys = { path = "crates/koharu-llama-sys" }
 koharu-runtime = { path = "crates/koharu-runtime" }
-koharu-torch = { path = "crates/koharu-torch" }
-koharu-torch-sys = { path = "crates/koharu-torch-sys" }
 koharu-ml = { path = "crates/koharu-ml" }
 koharu-translator = { path = "crates/koharu-translator" }
 koharu-renderer = { path = "crates/koharu-renderer" }

@@ -15,7 +15,6 @@ publish.workspace = true
 koharu-diffusion = { workspace = true }
 koharu-llama = { workspace = true }
 koharu-runtime = { workspace = true }
-koharu-torch = { workspace = true }
 ab_glyph = { workspace = true }
 anyhow = { workspace = true }
 clap = { workspace = true }

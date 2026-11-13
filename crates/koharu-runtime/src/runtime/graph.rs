@@ -10,14 +10,13 @@ use crate::{
     Device, Hardware,
     runtime::{
         DiscoverablePackage, RuntimePackage,
-        packages::{Cuda, Diffusion, Llama, OnnxRuntime, Torch},
+        packages::{Cuda, Diffusion, Llama, OnnxRuntime},
     },
 };
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(crate) enum Component {
     Cuda(Cuda),
-    Torch(Torch),
     Llama(Llama),
     Diffusion(Diffusion),
     OnnxRuntime(OnnxRuntime),
@@ -27,7 +26,6 @@ impl Component {
     fn dependencies(self, hardware: &Hardware) -> Result<Vec<Self>> {
         match self {
             Self::Cuda(package) => package.dependencies(hardware),
-            Self::Torch(package) => package.dependencies(hardware),
             Self::Llama(package) => package.dependencies(hardware),
             Self::Diffusion(package) => package.dependencies(hardware),
             Self::OnnxRuntime(package) => package.dependencies(hardware),
@@ -37,7 +35,6 @@ impl Component {
     async fn activate(self) -> Result<()> {
         match self {
             Self::Cuda(package) => activate(package).await,
-            Self::Torch(package) => activate(package).await,
             Self::Llama(package) => activate(package).await,
             Self::Diffusion(package) => activate(package).await,
             Self::OnnxRuntime(package) => activate(package).await,
@@ -47,7 +44,6 @@ impl Component {
     fn label(self) -> String {
         match self {
             Self::Cuda(package) => package.label(),
-            Self::Torch(package) => package.label(),
             Self::Llama(package) => package.label(),
             Self::Diffusion(package) => package.label(),
             Self::OnnxRuntime(package) => package.label(),
@@ -65,12 +61,6 @@ async fn activate<P: RuntimePackage>(package: P) -> Result<()> {
 impl From<Cuda> for Component {
     fn from(value: Cuda) -> Self {
         Self::Cuda(value)
-    }
-}
-
-impl From<Torch> for Component {
-    fn from(value: Torch) -> Self {
-        Self::Torch(value)
     }
 }
 
@@ -185,8 +175,8 @@ mod tests {
             );
         }
 
-        let torch = plan.insert(Torch::Cuda.into(), &hardware).unwrap();
-        plan.sequence(diffusion, torch);
+        let onnx = plan.insert(OnnxRuntime::Cuda13.into(), &hardware).unwrap();
+        plan.sequence(diffusion, onnx);
         let order = toposort(&plan.graph, None).unwrap();
         let position = |component| {
             order

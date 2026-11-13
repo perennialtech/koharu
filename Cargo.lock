@@ -1822,8 +1822,6 @@ dependencies = [
  "allocator-api2",
  "equivalent",
  "foldhash 0.2.0",
- "serde",
- "serde_core",
 ]
 
 [[package]]
@@ -2624,7 +2622,6 @@ dependencies = [
  "koharu-diffusion",
  "koharu-llama",
  "koharu-runtime",
- "koharu-torch",
  "minijinja",
  "minijinja-contrib",
  "ort",
@@ -2817,30 +2814,6 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
-]
-
-[[package]]
-name = "koharu-torch"
-version = "0.83.5"
-dependencies = [
- "half",
- "koharu-torch-sys",
- "lazy_static",
- "libc",
- "ndarray",
- "safetensors",
- "thiserror 2.0.21",
- "zip",
-]
-
-[[package]]
-name = "koharu-torch-sys"
-version = "0.83.5"
-dependencies = [
- "anyhow",
- "koharu-bindgen",
- "libc",
- "libloading 0.9.0",
 ]
 
 [[package]]
@@ -4806,19 +4779,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "42c6efa15875e6ecb39ca61fb0b0c1a40b84fac5a5ffe71eef7d1000c8eb3f5f"
 dependencies = [
  "bytemuck",
-]
-
-[[package]]
-name = "safetensors"
-version = "0.8.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "79b079b829cb27a1c3c374341345ed2e8b2c0c839034522cee576c140bd7f846"
-dependencies = [
- "hashbrown 0.16.1",
- "libc",
- "serde",
- "serde_json",
- "tempfile",
 ]
 
 [[package]]

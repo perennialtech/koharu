@@ -56,19 +56,6 @@ pub(crate) enum Cuda {
         props(project = "nvidia-nvjitlink/13.3.33", libraries = "libnvJitLink.so.13")
     )]
     JitLink13,
-    #[strum(
-        serialize = "cusparse-12",
-        props(project = "nvidia-cusparse/12.8.2.51", libraries = "libcusparse.so.12")
-    )]
-    Sparse12,
-    #[strum(
-        serialize = "cusolver-12",
-        props(
-            project = "nvidia-cusolver/12.2.6.9",
-            libraries = "libcusolver.so.12,libcusolverMg.so.12"
-        )
-    )]
-    Solver12,
 }
 
 impl Cuda {
@@ -127,8 +114,7 @@ impl RuntimePackage for Cuda {
     fn dependencies(self, _hardware: &Hardware) -> Result<Vec<Component>> {
         let packages = match self {
             Self::Blas13 => vec![Self::Rtc13],
-            Self::Fft12 | Self::Sparse12 => vec![Self::JitLink13],
-            Self::Solver12 => vec![Self::JitLink13, Self::Blas13, Self::Sparse12],
+            Self::Fft12 => vec![Self::JitLink13],
             Self::Dnn925 => vec![Self::Blas13],
             Self::Runtime13 | Self::Rand10 | Self::Rtc13 | Self::JitLink13 => Vec::new(),
         };
