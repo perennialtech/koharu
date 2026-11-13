@@ -1,28 +1,22 @@
-//! A single-process HTTP interface to Koharu's headless translation pipeline.
+//! An HTTP interface to Koharu's headless translation pipeline. The server
+//! process handles HTTP and jobs; a worker process it starts runs the models.
 
 mod api;
 mod jobs;
+mod supervisor;
+mod wire;
+mod worker;
 
-use std::{
-    collections::BTreeMap, future::Future, io::Write, net::SocketAddr, sync::Arc, time::Duration,
-};
+use std::{future::Future, net::SocketAddr, time::Duration};
 
 use anyhow::{Context, Result};
-use axum::body::Bytes;
 use clap::{Parser, ValueEnum};
-use koharu_config::Config;
-use koharu_pipeline::{
-    Committer, Flux2KleinConfig, InpaintingModel, Operation, Pipeline, PipelineConfig,
-    PipelineError, Request, RequestTranslation, RunStatus, Scope, StageOutput,
-};
-use koharu_rasterizer::{RasterOptions, Rasterizer};
-use koharu_renderer::Renderer;
-use koharu_scene::{AssetInput, AssetMetadata, AssetRole, At, PageDraft, Session};
+use koharu_pipeline::{Flux2KleinConfig, InpaintingModel, PipelineConfig};
 use koharu_translator::{Provider, ProvidersConfig};
 use tracing_subscriber::EnvFilter;
 use url::Url;
 
-use jobs::{Failure, Input, Job, Jobs};
+use jobs::Jobs;
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
 enum InpaintingChoice {
@@ -74,6 +68,10 @@ struct Arguments {
     /// Inpainting model used to erase original text.
     #[arg(long, env = "KOHARU_INPAINTING", value_enum, default_value = "lama")]
     inpainting: InpaintingChoice,
+
+    /// Run as the model worker. The server starts it with this flag.
+    #[arg(long, hide = true)]
+    worker: bool,
 }
 
 impl Arguments {
@@ -104,288 +102,99 @@ impl Arguments {
     }
 }
 
-struct Worker {
-    pipeline: Pipeline,
-    renderer: Renderer,
-    rasterizer: Arc<Rasterizer>,
-}
-
-impl Worker {
-    /// Runs queued jobs until shutdown. Returning drops the models and GPU
-    /// devices on this task, so shutdown awaits it before the process exits.
-    async fn run(
-        self,
-        mut queue: tokio::sync::mpsc::UnboundedReceiver<Arc<Job>>,
-        mut shutdown: tokio::sync::watch::Receiver<bool>,
-    ) {
-        loop {
-            // Connections that outlive the drain still hold queue senders, so
-            // the queue alone does not end this loop.
-            let job = tokio::select! {
-                biased;
-                _ = shutdown.wait_for(|stopping| *stopping) => break,
-                job = queue.recv() => job,
-            };
-            let Some(job) = job else {
-                break;
-            };
-            let Some(input) = job.start() else {
-                continue;
-            };
-            let result = self.translate(input, &job).await.map_err(|error| {
-                match error.downcast::<PipelineError>() {
-                    Ok(error) => Failure::from(error),
-                    Err(error) => {
-                        tracing::error!(error = ?error, "image translation failed");
-                        Failure::processing()
-                    }
-                }
-            });
-            job.finish(result);
-        }
-    }
-
-    async fn translate(&self, input: Input, job: &Arc<Job>) -> Result<Option<Bytes>> {
-        let stages = input.stages();
-        let Input {
-            source,
-            media_type,
-            width,
-            height,
-            language,
-            instructions,
-            engines,
-            scale,
-        } = input;
-        let mut session = Session::memory().await?;
-        let mut page = None;
-        let patch = session.snapshot().patch(|edit| {
-            let id = edit.add_page(
-                PageDraft::new("page", f64::from(width), f64::from(height)),
-                At::End,
-            )?;
-            edit.set_asset(
-                id,
-                &AssetRole::new("source")?,
-                AssetInput::new(
-                    source,
-                    media_type,
-                    AssetMetadata {
-                        width: Some(width),
-                        height: Some(height),
-                        attributes: BTreeMap::new(),
-                    },
-                ),
-            )?;
-            page = Some(id);
-            Ok(())
-        })?;
-        session.commit(patch).await?;
-        let page = page.context("page ID was not assigned")?;
-        let snapshot = session.snapshot();
-        let mut committer = SessionCommitter(&mut session);
-        let stop = job.stop_token();
-        let progress = job.clone();
-        let report = self
-            .pipeline
-            .execute(
-                snapshot,
-                Request {
-                    operation: Operation::Stages { stages },
-                    scope: Scope::Pages(vec![page]),
-                    translation: Some(RequestTranslation {
-                        target_language: language,
-                        instructions,
-                        engines,
-                    }),
-                    stop: stop.clone(),
-                    progress: Some(Arc::new(move |event| progress.progress(event))),
-                    ..Request::default()
-                },
-                &mut committer,
-            )
-            .await?;
-        if report.status == RunStatus::Stopped || stop.stopped() {
-            return Ok(None);
-        }
-        let frame = self.renderer.render(&session.snapshot(), page).await?;
-        if stop.stopped() {
-            return Ok(None);
-        }
-        let frame = frame.raster_frame()?;
-        let rasterizer = self.rasterizer.clone();
-        tokio::task::spawn_blocking(move || {
-            let raster = rasterizer.rasterize(
-                &frame,
-                RasterOptions {
-                    output_scale: scale,
-                    ..RasterOptions::default()
-                },
-            )?;
-            Ok(Some(Bytes::from(raster.encode_png()?)))
-        })
-        .await?
-    }
-}
-
-struct SessionCommitter<'a>(&'a mut Session);
-
-#[async_trait::async_trait]
-impl Committer for SessionCommitter<'_> {
-    async fn commit(&mut self, output: StageOutput) -> Result<koharu_scene::Snapshot> {
-        Ok(self.0.commit(output.patch).await?.snapshot)
-    }
-}
-
 fn main() {
-    // Torch never returns cached CUDA blocks to the driver while llama.cpp
-    // models share the device, and page-sized detection buffers and
-    // variable-size inpainting tiles fragment its cache. Expandable segments
-    // keep that cache close to what is in use; torch reads the setting when its
-    // allocator starts, so it is set before any thread can read the environment.
-    if std::env::var_os("PYTORCH_CUDA_ALLOC_CONF").is_none() {
-        // SAFETY: no other thread exists yet.
-        unsafe { std::env::set_var("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True") };
-    }
-    let result = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .map_err(anyhow::Error::from)
-        .and_then(|runtime| {
-            let result = runtime.block_on(serve());
-            // The pipeline has already been dropped. What remains are
-            // connections that missed the drain deadline and blocking calls;
-            // this bounds the wait inside Docker's 10-second stop window.
-            runtime.shutdown_timeout(Duration::from_secs(1));
-            result
-        });
-    let code = match result {
-        Ok(()) => 0,
-        Err(error) => {
-            eprintln!("Error: {error:?}");
-            1
-        }
-    };
-    let _ = std::io::stdout().flush();
-    let _ = std::io::stderr().flush();
-    // Returning from main would run libc atexit handlers and the C++ static
-    // destructors of libtorch, ggml-cuda and the NVIDIA Vulkan driver while
-    // other threads can still call into those libraries, which crashes the
-    // process with SIGSEGV. The kernel and driver reclaim device memory when
-    // the process exits, so skip that teardown.
-    // SAFETY: nothing after this point needs to run.
-    unsafe { libc::_exit(code) }
-}
-
-async fn serve() -> Result<()> {
+    let arguments = Arguments::parse();
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
         )
         .init();
-    let arguments = Arguments::parse();
+    if arguments.worker {
+        worker::main(&arguments);
+    }
+    let result = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(anyhow::Error::from)
+        .and_then(|runtime| runtime.block_on(serve(arguments)));
+    if let Err(error) = result {
+        eprintln!("Error: {error:?}");
+        std::process::exit(1);
+    }
+}
+
+async fn serve(arguments: Arguments) -> Result<()> {
     let (pipeline_config, provider_config) = arguments.configs()?;
     let engines = api::Engines {
-        providers: provider_config.clone(),
-        default: pipeline_config.translation.engines.clone(),
+        providers: provider_config,
+        default: pipeline_config.translation.engines,
     };
-    let mut shutdown = Box::pin(shutdown_signal()?);
-    let handle = tokio::runtime::Handle::current();
-    let mut startup = tokio::task::spawn_blocking(move || {
-        handle.block_on(async move {
-            let mut features = vec![
-                koharu_ml::Feature::Torch,
-                koharu_ml::Feature::Llama,
-                koharu_ml::Feature::OnnxRuntime,
-            ];
-            if matches!(&pipeline_config.inpainting, InpaintingModel::Flux2Klein(_)) {
-                features.push(koharu_ml::Feature::Diffusion);
-            }
-            koharu_ml::init(&features)
-                .await
-                .context("cannot initialize model runtimes")?;
-            let pipeline = Pipeline::from_config(
-                Config::memory(pipeline_config),
-                Config::memory(provider_config),
-                koharu_ml::device(false),
-            )?;
-            let worker = Worker {
-                pipeline,
-                renderer: Renderer::new()?,
-                rasterizer: Arc::new(Rasterizer::new()?),
-            };
-            let (jobs, queue) = Jobs::new();
-            let worker = tokio::spawn(worker.run(queue, jobs.subscribe_shutdown()));
-            let shutdown_jobs = jobs.clone();
-            let app = api::router(jobs, engines);
-            let listener = tokio::net::TcpListener::bind(arguments.listen).await?;
-            tracing::info!(address = %listener.local_addr()?, "Koharu HTTP server listening");
-            Ok::<_, anyhow::Error>((listener, app, shutdown_jobs, worker))
-        })
-    });
-    let (listener, app, shutdown_jobs, worker) = tokio::select! {
-        biased;
-        _ = &mut shutdown => {
-            startup.abort();
-            return Ok(());
-        },
-        started = &mut startup => started.context("server startup task failed")??,
-    };
+    let shutdown = shutdown_signal()?;
+    let executable = std::env::current_exe().context("cannot find own executable")?;
+    let (jobs, queue) = Jobs::new();
+    let supervisor = supervisor::run(
+        move || supervisor::worker_command(&executable),
+        queue,
+        jobs.subscribe_shutdown(),
+    );
+    let listener = tokio::net::TcpListener::bind(arguments.listen).await?;
+    tracing::info!(address = %listener.local_addr()?, "Koharu HTTP server listening");
     // Docker waits 10 seconds before SIGKILL by default.
     serve_http(
         listener,
-        app,
-        shutdown_jobs,
-        worker,
+        api::router(jobs.clone(), engines),
+        jobs,
+        supervisor,
         shutdown,
         Duration::from_secs(8),
     )
     .await
 }
 
-/// Serves until `shutdown`, then gives HTTP connections and `worker` `grace`
-/// to finish.
+/// Serves until `shutdown` or until `supervisor` or the server ends, then
+/// gives HTTP connections `grace` to finish.
 async fn serve_http(
     listener: tokio::net::TcpListener,
     app: axum::Router,
-    shutdown_jobs: Jobs,
-    worker: tokio::task::JoinHandle<()>,
+    jobs: Jobs,
+    supervisor: impl Future<Output = Result<()>>,
     shutdown: impl Future<Output = ()> + Send + 'static,
     grace: Duration,
 ) -> Result<()> {
-    let (draining, drained) = tokio::sync::oneshot::channel();
-    let signal_jobs = shutdown_jobs.clone();
-    let server = async move {
-        let result = axum::serve(listener, app)
-            .with_graceful_shutdown(async move {
-                shutdown.await;
-                signal_jobs.shutdown();
-                let _ = draining.send(());
-            })
-            .await;
-        // Stops the worker when serving fails without a shutdown signal.
-        shutdown_jobs.shutdown();
+    let mut stopping = jobs.subscribe_shutdown();
+    let signal_jobs = jobs.clone();
+    let server = axum::serve(listener, app).with_graceful_shutdown(async move {
+        tokio::select! {
+            () = shutdown => {}
+            _ = stopping.wait_for(|stopping| *stopping) => {}
+        }
+        signal_jobs.shutdown();
+    });
+    let mut stopped = jobs.subscribe_shutdown();
+    let server = async {
+        let result = tokio::select! {
+            result = server => result.map_err(anyhow::Error::from),
+            _ = async {
+                let _ = stopped.wait_for(|stopping| *stopping).await;
+                tokio::time::sleep(grace).await;
+            } => {
+                tracing::warn!("HTTP connections did not finish before the shutdown deadline");
+                Ok(())
+            }
+        };
+        jobs.shutdown();
         result
     };
-    // The deadline starts when shutdown begins or serving fails, which drops
-    // `draining`.
-    let deadline = async {
-        let _ = drained.await;
-        tokio::time::sleep(grace).await;
+    let supervisor = async {
+        let result = supervisor.await;
+        jobs.shutdown();
+        result
     };
-    tokio::select! {
-        (result, worker) = async { tokio::join!(server, worker) } => {
-            if let Err(error) = worker {
-                tracing::error!(error = ?error, "translation worker failed");
-            }
-            result?;
-        }
-        () = deadline => tracing::warn!("shutdown did not finish before its deadline"),
-    }
-    Ok(())
+    let (server, supervisor) = tokio::join!(server, supervisor);
+    supervisor?;
+    server
 }
 
-#[cfg(unix)]
 fn shutdown_signal() -> Result<impl Future<Output = ()>> {
     let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
         .context("failed to register SIGINT handler")?;
@@ -396,15 +205,6 @@ fn shutdown_signal() -> Result<impl Future<Output = ()>> {
             _ = sigint.recv() => {}
             _ = sigterm.recv() => {}
         }
-    })
-}
-
-#[cfg(not(unix))]
-fn shutdown_signal() -> Result<impl Future<Output = ()>> {
-    Ok(async {
-        tokio::signal::ctrl_c()
-            .await
-            .expect("failed to register SIGINT handler");
     })
 }
 
@@ -437,11 +237,15 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+        let mut stopping = jobs.subscribe_shutdown();
         let server = tokio::spawn(serve_http(
             listener,
             app,
             jobs,
-            tokio::spawn(async {}),
+            async move {
+                let _ = stopping.wait_for(|stopping| *stopping).await;
+                Ok(())
+            },
             async move {
                 let _ = stop_rx.await;
             },
@@ -466,16 +270,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn shutdown_returns_after_the_worker_drops_its_state() {
+    async fn a_failed_supervisor_stops_the_server_with_its_error() {
         let (jobs, _queue) = Jobs::new();
-        let mut stopping = jobs.subscribe_shutdown();
-        let state = Arc::new(());
-        let held = state.clone();
-        let worker = tokio::spawn(async move {
-            let _ = stopping.wait_for(|stopping| *stopping).await;
-            tokio::time::sleep(Duration::from_millis(50)).await;
-            drop(held);
-        });
         let app = api::router(
             jobs.clone(),
             api::Engines {
@@ -484,21 +280,20 @@ mod tests {
             },
         );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        serve_http(
-            listener,
-            app,
-            jobs,
-            worker,
-            async {},
+        let result = tokio::time::timeout(
             Duration::from_secs(1),
+            serve_http(
+                listener,
+                app,
+                jobs,
+                async { anyhow::bail!("worker failed") },
+                std::future::pending(),
+                Duration::from_secs(1),
+            ),
         )
         .await
-        .unwrap();
-        assert_eq!(
-            Arc::strong_count(&state),
-            1,
-            "serve_http returned before the worker dropped its state"
-        );
+        .expect("server kept running after the supervisor failed");
+        assert_eq!(result.unwrap_err().to_string(), "worker failed");
     }
 
     fn configs(arguments: &[&str]) -> Result<(PipelineConfig, ProvidersConfig)> {

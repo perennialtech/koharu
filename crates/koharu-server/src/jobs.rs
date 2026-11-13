@@ -5,18 +5,21 @@ use std::{
 };
 
 use axum::body::Bytes;
-use koharu_pipeline::{ErrorKind, PipelineError, Progress, Stage, StopToken};
+use koharu_pipeline::{ErrorKind, PipelineError, Progress, Stage};
 use koharu_translator::{Language, Provider};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, watch};
 use utoipa::ToSchema;
 use uuid::Uuid;
 
 const RESULT_RETENTION: Duration = Duration::from_secs(60 * 60);
 
+#[derive(Serialize, Deserialize)]
 pub(crate) struct Input {
-    pub(crate) source: Arc<[u8]>,
-    pub(crate) media_type: &'static str,
+    /// Sent as the message body rather than in the JSON header.
+    #[serde(skip)]
+    pub(crate) source: Bytes,
+    pub(crate) media_type: String,
     pub(crate) width: u32,
     pub(crate) height: u32,
     pub(crate) language: Language,
@@ -57,7 +60,7 @@ impl Status {
     }
 }
 
-#[derive(Clone, Copy, Serialize, ToSchema)]
+#[derive(Clone, Copy, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
 enum StageStatus {
     Pending,
@@ -69,8 +72,8 @@ enum StageStatus {
     Cancelled,
 }
 
-#[derive(Clone, Serialize, ToSchema)]
-struct StageProgress {
+#[derive(Clone, Serialize, Deserialize, ToSchema)]
+pub(crate) struct StageProgress {
     /// Pipeline stage name.
     #[schema(value_type = String, example = "ocr")]
     stage: Stage,
@@ -79,14 +82,47 @@ struct StageProgress {
     elapsed_ms: Option<u64>,
 }
 
-#[derive(Clone, Copy, Serialize, ToSchema)]
+impl StageProgress {
+    /// The stage update a pipeline event reports, if any.
+    pub(crate) fn from_event(progress: Progress) -> Option<Self> {
+        let (stage, status, model, elapsed_ms) = match progress {
+            Progress::Started { .. } => return None,
+            Progress::Loading { stage, model, .. } => {
+                (stage, StageStatus::Loading, Some(model), None)
+            }
+            Progress::Running { stage, model, .. } => {
+                (stage, StageStatus::Running, Some(model), None)
+            }
+            Progress::Finished {
+                stage,
+                model,
+                elapsed,
+                ..
+            } => (
+                stage,
+                StageStatus::Completed,
+                Some(model),
+                Some(millis(elapsed)),
+            ),
+            Progress::Skipped { stage, .. } => (stage, StageStatus::Skipped, None, None),
+        };
+        Some(Self {
+            stage,
+            status,
+            model,
+            elapsed_ms,
+        })
+    }
+}
+
+#[derive(Clone, Copy, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum FailureCode {
     ModelLoadFailed,
     ProcessingFailed,
 }
 
-#[derive(Clone, Copy, Serialize, ToSchema)]
+#[derive(Clone, Copy, Serialize, Deserialize, ToSchema)]
 pub(crate) struct Failure {
     code: FailureCode,
     #[schema(value_type = Option<String>, example = "ocr")]
@@ -171,7 +207,6 @@ fn millis(duration: Duration) -> u64 {
 }
 
 pub(crate) struct Job {
-    stop: StopToken,
     state: watch::Sender<JobState>,
 }
 
@@ -179,7 +214,6 @@ impl Job {
     fn new(id: Uuid, input: Input) -> Self {
         let stages = input.stages();
         Self {
-            stop: StopToken::default(),
             state: watch::Sender::new(JobState {
                 view: Translation {
                     id,
@@ -235,8 +269,8 @@ impl Job {
         input
     }
 
-    pub(crate) fn stop_token(&self) -> StopToken {
-        self.stop.clone()
+    pub(crate) fn status(&self) -> Status {
+        self.state.borrow().view.status
     }
 
     pub(crate) fn cancel(&self) -> Option<Translation> {
@@ -250,7 +284,6 @@ impl Job {
                     true
                 }
                 Status::Running => {
-                    self.stop.stop();
                     state.view.status = Status::Cancelling;
                     true
                 }
@@ -263,28 +296,7 @@ impl Job {
         snapshot
     }
 
-    pub(crate) fn progress(&self, progress: Progress) {
-        let (stage, status, model, elapsed_ms) = match progress {
-            Progress::Started { .. } => return,
-            Progress::Loading { stage, model, .. } => {
-                (stage, StageStatus::Loading, Some(model), None)
-            }
-            Progress::Running { stage, model, .. } => {
-                (stage, StageStatus::Running, Some(model), None)
-            }
-            Progress::Finished {
-                stage,
-                model,
-                elapsed,
-                ..
-            } => (
-                stage,
-                StageStatus::Completed,
-                Some(model),
-                Some(millis(elapsed)),
-            ),
-            Progress::Skipped { stage, .. } => (stage, StageStatus::Skipped, None, None),
-        };
+    pub(crate) fn progress(&self, progress: StageProgress) {
         self.state.send_if_modified(|state| {
             if state.view.status != Status::Running {
                 return false;
@@ -293,17 +305,15 @@ impl Job {
                 .view
                 .stages
                 .iter_mut()
-                .find(|entry| entry.stage == stage)
+                .find(|entry| entry.stage == progress.stage)
             {
-                *entry = StageProgress {
-                    stage,
-                    status,
-                    model,
-                    elapsed_ms,
-                };
-                if matches!(status, StageStatus::Completed | StageStatus::Skipped) {
+                if matches!(
+                    progress.status,
+                    StageStatus::Completed | StageStatus::Skipped
+                ) {
                     state.view.completed += 1;
                 }
+                *entry = progress;
             }
             true
         });
