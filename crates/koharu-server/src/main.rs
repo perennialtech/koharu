@@ -3,7 +3,9 @@
 mod api;
 mod jobs;
 
-use std::{collections::BTreeMap, future::Future, net::SocketAddr, sync::Arc, time::Duration};
+use std::{
+    collections::BTreeMap, future::Future, io::Write, net::SocketAddr, sync::Arc, time::Duration,
+};
 
 use anyhow::{Context, Result};
 use axum::body::Bytes;
@@ -109,8 +111,24 @@ struct Worker {
 }
 
 impl Worker {
-    async fn run(self, mut queue: tokio::sync::mpsc::UnboundedReceiver<Arc<Job>>) {
-        while let Some(job) = queue.recv().await {
+    /// Runs queued jobs until shutdown. Returning drops the models and GPU
+    /// devices on this task, so shutdown awaits it before the process exits.
+    async fn run(
+        self,
+        mut queue: tokio::sync::mpsc::UnboundedReceiver<Arc<Job>>,
+        mut shutdown: tokio::sync::watch::Receiver<bool>,
+    ) {
+        loop {
+            // Connections that outlive the drain still hold queue senders, so
+            // the queue alone does not end this loop.
+            let job = tokio::select! {
+                biased;
+                _ = shutdown.wait_for(|stopping| *stopping) => break,
+                job = queue.recv() => job,
+            };
+            let Some(job) = job else {
+                break;
+            };
             let Some(input) = job.start() else {
                 continue;
             };
@@ -210,7 +228,7 @@ impl Committer for SessionCommitter<'_> {
     }
 }
 
-fn main() -> Result<()> {
+fn main() {
     // Torch never returns cached CUDA blocks to the driver while llama.cpp
     // models share the device, and page-sized detection buffers and
     // variable-size inpainting tiles fragment its cache. Expandable segments
@@ -220,12 +238,34 @@ fn main() -> Result<()> {
         // SAFETY: no other thread exists yet.
         unsafe { std::env::set_var("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True") };
     }
-    let runtime = tokio::runtime::Builder::new_multi_thread()
+    let result = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
-        .build()?;
-    let result = runtime.block_on(serve());
-    runtime.shutdown_background();
-    result
+        .build()
+        .map_err(anyhow::Error::from)
+        .and_then(|runtime| {
+            let result = runtime.block_on(serve());
+            // The pipeline has already been dropped. What remains are
+            // connections that missed the drain deadline and blocking calls;
+            // this bounds the wait inside Docker's 10-second stop window.
+            runtime.shutdown_timeout(Duration::from_secs(1));
+            result
+        });
+    let code = match result {
+        Ok(()) => 0,
+        Err(error) => {
+            eprintln!("Error: {error:?}");
+            1
+        }
+    };
+    let _ = std::io::stdout().flush();
+    let _ = std::io::stderr().flush();
+    // Returning from main would run libc atexit handlers and the C++ static
+    // destructors of libtorch, ggml-cuda and the NVIDIA Vulkan driver while
+    // other threads can still call into those libraries, which crashes the
+    // process with SIGSEGV. The kernel and driver reclaim device memory when
+    // the process exits, so skip that teardown.
+    // SAFETY: nothing after this point needs to run.
+    unsafe { libc::_exit(code) }
 }
 
 async fn serve() -> Result<()> {
@@ -262,15 +302,15 @@ async fn serve() -> Result<()> {
                 rasterizer: Arc::new(Rasterizer::new()?),
             };
             let (jobs, queue) = Jobs::new();
-            tokio::spawn(worker.run(queue));
+            let worker = tokio::spawn(worker.run(queue, jobs.subscribe_shutdown()));
             let shutdown_jobs = jobs.clone();
             let app = api::router(jobs, engines);
             let listener = tokio::net::TcpListener::bind(arguments.listen).await?;
             tracing::info!(address = %listener.local_addr()?, "Koharu HTTP server listening");
-            Ok::<_, anyhow::Error>((listener, app, shutdown_jobs))
+            Ok::<_, anyhow::Error>((listener, app, shutdown_jobs, worker))
         })
     });
-    let (listener, app, shutdown_jobs) = tokio::select! {
+    let (listener, app, shutdown_jobs, worker) = tokio::select! {
         biased;
         _ = &mut shutdown => {
             startup.abort();
@@ -283,16 +323,20 @@ async fn serve() -> Result<()> {
         listener,
         app,
         shutdown_jobs,
+        worker,
         shutdown,
         Duration::from_secs(8),
     )
     .await
 }
 
+/// Serves until `shutdown`, then gives HTTP connections and `worker` `grace`
+/// to finish.
 async fn serve_http(
     listener: tokio::net::TcpListener,
     app: axum::Router,
     shutdown_jobs: Jobs,
+    worker: tokio::task::JoinHandle<()>,
     shutdown: impl Future<Output = ()> + Send + 'static,
     grace: Duration,
 ) -> Result<()> {
@@ -309,9 +353,18 @@ async fn serve_http(
     tokio::pin!(server);
     tokio::select! {
         result = &mut server => result?,
-        _ = drained => match tokio::time::timeout(grace, &mut server).await {
-            Ok(result) => result?,
-            Err(_) => tracing::warn!("HTTP connections did not drain before shutdown deadline"),
+        _ = drained => match tokio::time::timeout(grace, async {
+            tokio::join!(&mut server, worker)
+        })
+        .await
+        {
+            Ok((result, worker)) => {
+                if let Err(error) = worker {
+                    tracing::error!(error = ?error, "translation worker failed");
+                }
+                result?
+            }
+            Err(_) => tracing::warn!("shutdown did not finish before its deadline"),
         },
     }
     Ok(())
@@ -373,6 +426,7 @@ mod tests {
             listener,
             app,
             jobs,
+            tokio::spawn(async {}),
             async move {
                 let _ = stop_rx.await;
             },
@@ -394,6 +448,42 @@ mod tests {
             .expect("server did not finish draining the stalled upload")
             .unwrap()
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn shutdown_returns_after_the_worker_drops_its_state() {
+        let (jobs, _queue) = Jobs::new();
+        let mut stopping = jobs.subscribe_shutdown();
+        let state = Arc::new(());
+        let held = state.clone();
+        let worker = tokio::spawn(async move {
+            let _ = stopping.wait_for(|stopping| *stopping).await;
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            drop(held);
+        });
+        let app = api::router(
+            jobs.clone(),
+            api::Engines {
+                providers: ProvidersConfig::default(),
+                default: PipelineConfig::default().translation.engines,
+            },
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        serve_http(
+            listener,
+            app,
+            jobs,
+            worker,
+            async {},
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            Arc::strong_count(&state),
+            1,
+            "serve_http returned before the worker dropped its state"
+        );
     }
 
     fn configs(arguments: &[&str]) -> Result<(PipelineConfig, ProvidersConfig)> {
