@@ -25,6 +25,7 @@ koharu-rasterizer = { workspace = true, features = ["native"] }
 koharu-renderer = { workspace = true }
 koharu-scene = { workspace = true }
 koharu-translator = { workspace = true }
+libc = { workspace = true }
 serde = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
