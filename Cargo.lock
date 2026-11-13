@@ -2785,6 +2785,7 @@ dependencies = [
  "koharu-renderer",
  "koharu-scene",
  "koharu-translator",
+ "libc",
  "serde",
  "serde_json",
  "tokio",
