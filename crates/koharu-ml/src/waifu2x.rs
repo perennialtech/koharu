@@ -35,7 +35,7 @@ impl Waifu2x {
             .resolve()
             .await
             .context("failed to resolve waifu2x model")?;
-        let session = tokio_rayon::spawn(move || onnx_session(&device, &model))
+        let session = tokio_rayon::spawn(move || onnx_session(&device, &model, true))
             .await
             .context("failed to load waifu2x")?;
         Ok(Self { session })
