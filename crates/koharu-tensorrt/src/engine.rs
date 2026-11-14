@@ -58,13 +58,48 @@ pub struct TensorInfo {
     pub shape: Vec<i64>,
 }
 
+/// The extents a dynamic engine input may take. Every run's shape must lie
+/// between `min` and `max`; kernels are tuned for `opt`.
+#[derive(Clone, Copy, Debug)]
+pub struct ShapeRange<'a> {
+    pub name: &'a str,
+    pub min: &'a [i64],
+    pub opt: &'a [i64],
+    pub max: &'a [i64],
+}
+
 /// Serializes `onnx` into an engine. TensorRT-RTX builds without a GPU and
-/// takes precision from the graph's types.
-pub(crate) fn build(onnx: &Path) -> Result<Vec<u8>> {
+/// takes precision from the graph's types. Each dynamic input needs one of
+/// `ranges`.
+pub(crate) fn build(onnx: &Path, ranges: &[ShapeRange<'_>]) -> Result<Vec<u8>> {
     crate::cudart()?;
     let path = CString::new(onnx.to_str().context("ONNX path is not UTF-8")?)?;
-    // SAFETY: the shim is initialized and `path` is NUL-terminated.
-    let blob = Blob(unsafe { sys::ktrt_build_onnx(path.as_ptr()) });
+    let names = ranges
+        .iter()
+        .map(|range| CString::new(range.name))
+        .collect::<Result<Vec<_>, _>>()?;
+    let raw = ranges
+        .iter()
+        .zip(&names)
+        .map(|(range, name)| {
+            let rank = range.min.len();
+            if range.opt.len() != rank || range.max.len() != rank {
+                bail!("shape range for {} mixes ranks", range.name);
+            }
+            Ok(sys::ktrt_shape_range {
+                name: name.as_ptr(),
+                rank: i32::try_from(rank)?,
+                min: range.min.as_ptr(),
+                opt: range.opt.as_ptr(),
+                max: range.max.as_ptr(),
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    // SAFETY: the shim is initialized; `path`, `names` and the extents `raw`
+    // points into outlive the call.
+    let blob = Blob(unsafe {
+        sys::ktrt_build_onnx(path.as_ptr(), raw.as_ptr(), i32::try_from(raw.len())?)
+    });
     if blob.0.is_null() {
         return Err(crate::shim_error(&format!(
             "failed to build a TensorRT-RTX engine from {}",

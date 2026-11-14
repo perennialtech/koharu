@@ -19,7 +19,7 @@ use koharu_tensorrt_sys as sys;
 
 pub use self::{
     cuda::{DeviceBuffer, Stream},
-    engine::{DataType, TensorInfo},
+    engine::{DataType, ShapeRange, TensorInfo},
     session::{Binding, Session},
 };
 
