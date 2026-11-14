@@ -2628,6 +2628,7 @@ dependencies = [
  "minijinja",
  "minijinja-contrib",
  "ort",
+ "rayon",
  "serde",
  "serde_json",
  "tempfile",

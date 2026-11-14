@@ -3,8 +3,11 @@
 //! https://github.com/roboflow/rf-detr/blob/4ab7c18729de9d02ffd0495795d0831b5630f01b/src/rfdetr/detr.py
 //! https://github.com/roboflow/rf-detr/blob/4ab7c18729de9d02ffd0495795d0831b5630f01b/src/rfdetr/models/postprocess.py
 
+use std::borrow::Cow;
+
 use anyhow::{Result, ensure};
 use image::DynamicImage;
+use rayon::prelude::*;
 use serde::Serialize;
 
 use super::{
@@ -53,26 +56,49 @@ impl KoharuLayoutRFDetrImageProcessor {
             image.width() > 0 && image.height() > 0,
             "cannot segment an empty image"
         );
-        let image = image.to_rgb8();
+        let (samples, stride) = rgb_samples(image);
         let (width, height) = (image.width() as usize, image.height() as usize);
         let rows = bilinear_taps(height, RESOLUTION);
         let columns = bilinear_taps(width, RESOLUTION);
-        let source = |y: usize, x: usize, channel: usize| {
-            f32::from(image.as_raw()[(y * width + x) * 3 + channel]) / 255.0
+        let unit: [f32; 256] = std::array::from_fn(|value| f32::from(value as u8) / 255.0);
+        // Interpolating each source row along x, then blending two of those
+        // rows, is the same arithmetic in the same order as interpolating
+        // every pixel from its four taps.
+        let interpolate_row = |y: usize, row: &mut [[f32; 3]]| {
+            let source = &samples[y * width * stride..][..width * stride];
+            for (sample, column) in row.iter_mut().zip(&columns) {
+                let low = &source[column.low * stride..][..3];
+                let high = &source[column.high * stride..][..3];
+                *sample = std::array::from_fn(|channel| {
+                    column.low_weight * unit[usize::from(low[channel])]
+                        + column.high_weight * unit[usize::from(high[channel])]
+                });
+            }
         };
         let plane = RESOLUTION * RESOLUTION;
         let mut pixel_values = vec![0.0; 3 * plane];
-        for (y, row) in rows.iter().enumerate() {
-            for (x, column) in columns.iter().enumerate() {
-                for channel in 0..3 {
-                    let value = row.interpolate(|source_y| {
-                        column.interpolate(|source_x| source(source_y, source_x, channel))
-                    });
-                    pixel_values[channel * plane + y * RESOLUTION + x] =
-                        (value - MEAN[channel]) / STD[channel];
-                }
-            }
-        }
+        let (red, rest) = pixel_values.split_at_mut(plane);
+        let (green, blue) = rest.split_at_mut(plane);
+        red.par_chunks_exact_mut(RESOLUTION)
+            .zip(green.par_chunks_exact_mut(RESOLUTION))
+            .zip(blue.par_chunks_exact_mut(RESOLUTION))
+            .zip(&rows)
+            .for_each_init(
+                || (vec![[0.0; 3]; RESOLUTION], vec![[0.0; 3]; RESOLUTION]),
+                |(low, high), (((red, green), blue), row)| {
+                    interpolate_row(row.low, low);
+                    interpolate_row(row.high, high);
+                    for (x, (low, high)) in low.iter().zip(high.iter()).enumerate() {
+                        for (channel, plane) in
+                            [&mut *red, &mut *green, &mut *blue].into_iter().enumerate()
+                        {
+                            let value =
+                                row.low_weight * low[channel] + row.high_weight * high[channel];
+                            plane[x] = (value - MEAN[channel]) / STD[channel];
+                        }
+                    }
+                },
+            );
         Ok(pixel_values)
     }
 
@@ -122,9 +148,9 @@ impl KoharuLayoutRFDetrImageProcessor {
             image_height as f32,
         ];
         let detections = selected
-            .iter()
+            .par_iter()
             .zip(&queries)
-            .zip(masks.as_chunks::<{ MASK_RESOLUTION * MASK_RESOLUTION }>().0)
+            .zip(masks.par_chunks_exact(MASK_RESOLUTION * MASK_RESOLUTION))
             .map(|((&index, &query), logits)| {
                 let label_id = index % NUM_CLASSES_WITH_BACKGROUND;
                 let [center_x, center_y, width, height]: [f32; 4] = output.pred_boxes
@@ -160,6 +186,16 @@ impl KoharuLayoutRFDetrImageProcessor {
             image_height,
             detections,
         })
+    }
+}
+
+/// Interleaved 8-bit RGB samples of `image` and the bytes per pixel. 8-bit RGB
+/// and RGBA buffers are borrowed; alpha is ignored, as `to_rgb8` drops it.
+fn rgb_samples(image: &DynamicImage) -> (Cow<'_, [u8]>, usize) {
+    match image {
+        DynamicImage::ImageRgb8(image) => (Cow::Borrowed(image.as_raw()), 3),
+        DynamicImage::ImageRgba8(image) => (Cow::Borrowed(image.as_raw()), 4),
+        image => (Cow::Owned(image.to_rgb8().into_raw()), 3),
     }
 }
 
@@ -246,37 +282,60 @@ fn page_mask(
         .rposition(|tap| touches(tap, left, right))
         .unwrap();
 
-    let window_width = last_column - first_column + 1;
-    let mut window = vec![false; (last_row - first_row + 1) * window_width];
-    let (mut area, mut occupied) = (0_u32, None::<[usize; 4]>);
-    for (y, row) in rows[first_row..=last_row].iter().enumerate() {
-        let low = &logits[row.low * MASK_RESOLUTION..][..MASK_RESOLUTION];
-        let high = &logits[row.high * MASK_RESOLUTION..][..MASK_RESOLUTION];
-        for (x, column) in columns[first_column..=last_column].iter().enumerate() {
-            let value = row.low_weight * column.interpolate(|source| low[source])
-                + row.high_weight * column.interpolate(|source| high[source]);
-            if value > 0.0 {
-                window[y * window_width + x] = true;
-                area += 1;
-                let [left, top, right, bottom] = occupied.get_or_insert([x, y, x, y]);
-                *left = (*left).min(x);
-                *top = (*top).min(y);
-                *right = (*right).max(x);
-                *bottom = (*bottom).max(y);
+    let window_rows = &rows[first_row..=last_row];
+    let window_columns = &columns[first_column..=last_column];
+    let window_width = window_columns.len();
+    // Each logit row the window reads is interpolated along x once. Blending
+    // two of those rows per page row is the same arithmetic in the same order
+    // as interpolating every pixel from its four taps.
+    let source_top = window_rows[0].low;
+    let source_bottom = window_rows[window_rows.len() - 1].high;
+    let mut horizontal = vec![0.0_f32; (source_bottom - source_top + 1) * window_width];
+    horizontal
+        .par_chunks_exact_mut(window_width)
+        .zip(source_top..source_bottom + 1)
+        .for_each(|(values, source)| {
+            let source = &logits[source * MASK_RESOLUTION..][..MASK_RESOLUTION];
+            for (value, column) in values.iter_mut().zip(window_columns) {
+                *value = column.interpolate(|x| source[x]);
             }
-        }
-    }
-    let Some([left, top, right, bottom]) = occupied else {
+        });
+    let mut window = vec![0_u8; window_rows.len() * window_width];
+    // Per page row: the positive pixel count and the first and last positive
+    // column.
+    let extents = window
+        .par_chunks_exact_mut(window_width)
+        .zip(window_rows)
+        .map(|(pixels, row)| {
+            let low = &horizontal[(row.low - source_top) * window_width..][..window_width];
+            let high = &horizontal[(row.high - source_top) * window_width..][..window_width];
+            let mut count = 0_u32;
+            for ((pixel, &low), &high) in pixels.iter_mut().zip(low).zip(high) {
+                let positive = row.low_weight * low + row.high_weight * high > 0.0;
+                *pixel = if positive { u8::MAX } else { 0 };
+                count += u32::from(positive);
+            }
+            (count > 0).then(|| {
+                let first = pixels.iter().position(|&pixel| pixel != 0).unwrap();
+                let last = pixels.iter().rposition(|&pixel| pixel != 0).unwrap();
+                (count, first, last)
+            })
+        })
+        .collect::<Vec<_>>();
+    let Some(top) = extents.iter().position(Option::is_some) else {
         return (0, empty);
     };
+    let bottom = extents.iter().rposition(Option::is_some).unwrap();
+    let (area, left, right) = extents.iter().flatten().fold(
+        (0, usize::MAX, 0),
+        |(area, left, right), &(count, first, last)| {
+            (area + count, left.min(first), right.max(last))
+        },
+    );
     let width = right - left + 1;
     let mut pixels = Vec::with_capacity(width * (bottom - top + 1));
-    for y in top..=bottom {
-        pixels.extend(
-            window[y * window_width + left..][..width]
-                .iter()
-                .map(|&set| if set { u8::MAX } else { 0 }),
-        );
+    for row in window.chunks_exact(window_width).take(bottom + 1).skip(top) {
+        pixels.extend_from_slice(&row[left..][..width]);
     }
     (
         area,
@@ -352,9 +411,68 @@ impl KoharuLayoutMask {
 
 #[cfg(test)]
 mod tests {
+    use image::{DynamicImage, Rgba, RgbaImage};
+
     use super::{
-        KoharuLayoutThresholds, MASK_RESOLUTION, bilinear_taps, page_mask, validate_thresholds,
+        KoharuLayoutRFDetrImageProcessor, KoharuLayoutThresholds, MASK_RESOLUTION, MEAN,
+        RESOLUTION, STD, bilinear_taps, page_mask, validate_thresholds,
     };
+
+    #[test]
+    fn preprocess_matches_per_pixel_interpolation() {
+        let processor = KoharuLayoutRFDetrImageProcessor {
+            num_select: 1,
+            class_names: Vec::new(),
+            recommended_thresholds: KoharuLayoutThresholds {
+                text: 0.5,
+                onomatopoeia: 0.5,
+                bubble: 0.5,
+                panel: 0.5,
+            },
+        };
+        // Upsampled along x and downsampled along y, with alpha that must be
+        // ignored.
+        let (width, height) = (301, 2203);
+        let rgba = DynamicImage::ImageRgba8(RgbaImage::from_fn(width, height, |x, y| {
+            Rgba([
+                (x * 7 + y * 3) as u8,
+                (x * y) as u8,
+                (x ^ y) as u8,
+                (x + y) as u8,
+            ])
+        }));
+        let rgb = rgba.to_rgb8();
+        let rows = bilinear_taps(height as usize, RESOLUTION);
+        let columns = bilinear_taps(width as usize, RESOLUTION);
+        let source = |y: usize, x: usize, channel: usize| {
+            f32::from(rgb.as_raw()[(y * width as usize + x) * 3 + channel]) / 255.0
+        };
+        let plane = RESOLUTION * RESOLUTION;
+        let mut expected = vec![0.0_f32; 3 * plane];
+        for (y, row) in rows.iter().enumerate() {
+            for (x, column) in columns.iter().enumerate() {
+                for channel in 0..3 {
+                    let value = row.interpolate(|source_y| {
+                        column.interpolate(|source_x| source(source_y, source_x, channel))
+                    });
+                    expected[channel * plane + y * RESOLUTION + x] =
+                        (value - MEAN[channel]) / STD[channel];
+                }
+            }
+        }
+
+        for image in [rgba, DynamicImage::ImageRgb8(rgb.clone())] {
+            let actual = processor.preprocess(&image).unwrap();
+            assert!(
+                actual
+                    .iter()
+                    .zip(&expected)
+                    .all(|(actual, expected)| actual.to_bits() == expected.to_bits()),
+                "{:?} input differs from per-pixel interpolation",
+                image.color()
+            );
+        }
+    }
 
     #[test]
     fn class_thresholds_must_be_probabilities() {
@@ -372,8 +490,9 @@ mod tests {
     #[test]
     fn page_mask_matches_upsampling_the_whole_page() {
         // A blob, a single positive cell on the grid edge, and negative
-        // values elsewhere, upsampled to a page that is not a multiple of the
-        // mask grid on either axis.
+        // values elsewhere, upsampled to pages that are not a multiple of the
+        // mask grid on either axis. The smaller pages skip grid rows or
+        // columns between output pixels.
         let mut logits = vec![-1.0_f32; MASK_RESOLUTION * MASK_RESOLUTION];
         for y in 100..140 {
             for x in 200..260 {
@@ -381,45 +500,52 @@ mod tests {
             }
         }
         logits[MASK_RESOLUTION - 1] = 0.3;
-        let (width, height) = (1013, 1517);
-        let rows = bilinear_taps(MASK_RESOLUTION, height);
-        let columns = bilinear_taps(MASK_RESOLUTION, width);
+        for (width, height) in [(1013, 1517), (301, 700), (700, 301)] {
+            let rows = bilinear_taps(MASK_RESOLUTION, height);
+            let columns = bilinear_taps(MASK_RESOLUTION, width);
 
-        let mut expected = vec![false; width * height];
-        for (y, row) in rows.iter().enumerate() {
-            for (x, column) in columns.iter().enumerate() {
-                let value = row.interpolate(|source_y| {
-                    column.interpolate(|source_x| logits[source_y * MASK_RESOLUTION + source_x])
-                });
-                expected[y * width + x] = value > 0.0;
+            let mut expected = vec![false; width * height];
+            for (y, row) in rows.iter().enumerate() {
+                for (x, column) in columns.iter().enumerate() {
+                    let value = row.interpolate(|source_y| {
+                        column.interpolate(|source_x| logits[source_y * MASK_RESOLUTION + source_x])
+                    });
+                    expected[y * width + x] = value > 0.0;
+                }
             }
-        }
-        let (area, mask) = page_mask(&logits, &rows, &columns);
+            let (area, mask) = page_mask(&logits, &rows, &columns);
 
-        assert_eq!(area as usize, expected.iter().filter(|&&set| set).count());
-        for y in 0..height {
-            for x in 0..width {
-                assert_eq!(
-                    mask.contains(x as u32, y as u32),
-                    expected[y * width + x],
-                    "pixel {x}, {y}"
-                );
+            assert_eq!(
+                area as usize,
+                expected.iter().filter(|&&set| set).count(),
+                "{width}x{height}"
+            );
+            for y in 0..height {
+                for x in 0..width {
+                    assert_eq!(
+                        mask.contains(x as u32, y as u32),
+                        expected[y * width + x],
+                        "{width}x{height} pixel {x}, {y}"
+                    );
+                }
             }
+            let occupied = |coordinate: &dyn Fn(usize) -> usize| {
+                let set = (0..expected.len()).filter(|&index| expected[index]);
+                (
+                    set.clone().map(coordinate).min().unwrap(),
+                    set.map(coordinate).max().unwrap(),
+                )
+            };
+            assert_eq!(
+                occupied(&|index| index % width),
+                (mask.x as usize, (mask.x + mask.width - 1) as usize),
+                "{width}x{height}"
+            );
+            assert_eq!(
+                occupied(&|index| index / width),
+                (mask.y as usize, (mask.y + mask.height - 1) as usize),
+                "{width}x{height}"
+            );
         }
-        let occupied = |coordinate: &dyn Fn(usize) -> usize| {
-            let set = (0..expected.len()).filter(|&index| expected[index]);
-            (
-                set.clone().map(coordinate).min().unwrap(),
-                set.map(coordinate).max().unwrap(),
-            )
-        };
-        assert_eq!(
-            occupied(&|index| index % width),
-            (mask.x as usize, (mask.x + mask.width - 1) as usize)
-        );
-        assert_eq!(
-            occupied(&|index| index / width),
-            (mask.y as usize, (mask.y + mask.height - 1) as usize)
-        );
     }
 }

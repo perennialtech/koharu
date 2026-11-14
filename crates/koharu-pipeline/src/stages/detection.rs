@@ -15,7 +15,6 @@ use imageproc::{
     contours::{BorderType, find_contours_with_threshold},
     distance_transform::{Norm, distance_transform},
     geometry::convex_hull,
-    morphology::{close, dilate},
 };
 use koharu_ml::{
     comic_text_bubble_detector::{
@@ -600,8 +599,15 @@ async fn write_page(
     join_split_bubbles(&mut detections);
     sort_by_layout(&mut detections);
 
-    let image = image.to_rgb8();
-    let regions = write_regions(&input.scene, edit, page, &image, &detections, generation)
+    let converted;
+    let image = match image {
+        DynamicImage::ImageRgb8(image) => image,
+        image => {
+            converted = image.to_rgb8();
+            &converted
+        }
+    };
+    let regions = write_regions(&input.scene, edit, page, image, &detections, generation)
         .context("failed to write detected regions")?;
     link_dialogue_regions(edit, &regions, generation)
         .context("failed to associate detected text with dialogue regions")?;
@@ -1843,18 +1849,107 @@ fn closed_mask_for(
             for &index in &group {
                 stamp_mask(&mut local, masks[index], left, top);
             }
-            let local = close(&dilate(&local, Norm::L2, radius), Norm::L2, radius);
+            // `close(&dilate(&local, Norm::L2, radius), Norm::L2, radius)`.
+            euclidean_morphology(&mut local, radius, false);
+            euclidean_morphology(&mut local, radius, false);
+            euclidean_morphology(&mut local, radius, true);
             Some((left, top, local))
         })
         .collect::<Vec<_>>();
+    let page_width = size.width as usize;
+    let pixels: &mut [u8] = &mut output;
     for (left, top, local) in local_masks {
-        for (x, y, pixel) in local.enumerate_pixels() {
-            if pixel.0[0] != 0 {
-                output.put_pixel(left + x, top + y, Luma([u8::MAX]));
+        let (left, top) = (left as usize, top as usize);
+        for (y, row) in local
+            .as_raw()
+            .chunks_exact(local.width() as usize)
+            .enumerate()
+        {
+            let target = &mut pixels[(top + y) * page_width + left..][..row.len()];
+            for (target, &value) in target.iter_mut().zip(row) {
+                if value != 0 {
+                    *target = u8::MAX;
+                }
             }
         }
     }
     output
+}
+
+/// imageproc's `dilate(image, Norm::L2, radius)`, or with `erode` its
+/// `erode(image, Norm::L2, radius)`, in place.
+///
+/// imageproc keeps a pixel when `ceil(sqrt(d²)) <= radius`, which for an
+/// integer radius is `d² <= radius²`, so only that threshold is computed
+/// instead of the distance transform: per column the distance to the nearest
+/// set pixel, then per row the union of the spans those pixels reach.
+/// Erosion is the dilation of the inverted image, inverted. Both saturate
+/// distances at 255, as imageproc does.
+fn euclidean_morphology(image: &mut GrayImage, radius: u8, erode: bool) {
+    let (width, height) = (image.width() as usize, image.height() as usize);
+    if width == 0 || height == 0 {
+        return;
+    }
+    let set = |value: u8| (value != 0) != erode;
+    let output = if erode { [u8::MAX, 0] } else { [0, u8::MAX] };
+    if radius == u8::MAX {
+        image.fill(output[1]);
+        return;
+    }
+    let radius = usize::from(radius);
+    let beyond = radius as u16 + 1;
+    let mut vertical = vec![beyond; width * height];
+    for (y, source) in image.as_raw().chunks_exact(width).enumerate() {
+        let (above, row) = vertical.split_at_mut(y * width);
+        let row = &mut row[..width];
+        match above.len().checked_sub(width) {
+            Some(start) => {
+                for ((distance, &value), &above) in row.iter_mut().zip(source).zip(&above[start..])
+                {
+                    *distance = if set(value) {
+                        0
+                    } else {
+                        (above + 1).min(beyond)
+                    };
+                }
+            }
+            None => {
+                for (distance, &value) in row.iter_mut().zip(source) {
+                    *distance = if set(value) { 0 } else { beyond };
+                }
+            }
+        }
+    }
+    for y in (0..height - 1).rev() {
+        let (row, below) = vertical[y * width..].split_at_mut(width);
+        for (distance, &below) in row.iter_mut().zip(&below[..width]) {
+            *distance = (*distance).min(below + 1);
+        }
+    }
+    // A column whose nearest set pixel is g rows away reaches every column
+    // within floor(sqrt(radius² - g²)) of it.
+    let reach = (0..=radius)
+        .map(|g| (radius * radius - g * g).isqrt().min(width) as isize)
+        .collect::<Vec<_>>();
+    (**image)
+        .par_chunks_exact_mut(width)
+        .zip(vertical.par_chunks_exact(width))
+        .for_each(|(row, vertical)| {
+            let mut rightmost = -1_isize;
+            for (x, (pixel, &rows)) in row.iter_mut().zip(vertical).enumerate() {
+                if let Some(&reach) = reach.get(usize::from(rows)) {
+                    rightmost = rightmost.max(x as isize + reach);
+                }
+                *pixel = u8::from(rightmost >= x as isize);
+            }
+            let mut leftmost = isize::MAX;
+            for (x, (pixel, &rows)) in row.iter_mut().zip(vertical).enumerate().rev() {
+                if let Some(&reach) = reach.get(usize::from(rows)) {
+                    leftmost = leftmost.min(x as isize - reach);
+                }
+                *pixel = output[usize::from(*pixel != 0 || leftmost <= x as isize)];
+            }
+        });
 }
 
 fn valid_mask(mask: &KoharuLayoutMask) -> bool {
@@ -2349,7 +2444,7 @@ fn area(bounds: [f32; 4]) -> f32 {
 
 #[cfg(test)]
 mod tests {
-    use image::{Rgb, RgbImage};
+    use image::{GrayImage, Luma, Rgb, RgbImage};
     use imageproc::{
         distance_transform::Norm,
         morphology::{close, dilate},
@@ -2363,9 +2458,10 @@ mod tests {
     use super::{
         DIALOGUE_MASK_CONTAINMENT_THRESHOLD, DetectedRegion, DetectedText, DetectionModel,
         ImageSize, KoharuLayoutRFDetrSeg2XLConfig, MaskPixel, PageRegions, Processor, RegionOutput,
-        StageInput, StageProcessor, closed_mask_for, color_palette, generation, infer_typography,
-        layout_order, link_dialogue_regions, mask_containment, mask_for, mask_geometry,
-        non_maximum_suppression, normalize_text_color, with_comic_detections, write_region,
+        StageInput, StageProcessor, closed_mask_for, color_palette, euclidean_morphology,
+        generation, infer_typography, layout_order, link_dialogue_regions, mask_containment,
+        mask_for, mask_geometry, non_maximum_suppression, normalize_text_color,
+        with_comic_detections, write_region,
     };
     use koharu_ml::{
         comic_text_bubble_detector::{ComicTextBubbleDetection, ComicTextBubbleLabel},
@@ -3345,6 +3441,47 @@ mod tests {
                 expected,
                 "case {case}, radius {radius}"
             );
+        }
+    }
+
+    #[test]
+    fn euclidean_morphology_matches_imageproc() {
+        let mut state = 0x2545_f491_u32;
+        let mut next = || {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            state >> 8
+        };
+        for case in 0..120 {
+            let width = next() % 70 + 1;
+            let height = next() % 70 + 1;
+            // Empty, sparse, dense and full images.
+            let density = [0, 2, 30, 300, 900, 1000][case % 6];
+            let radius = match case % 4 {
+                0 => (next() % 4 + 1) as u8,
+                1 => (next() % 60 + 1) as u8,
+                2 => (next() % 256) as u8,
+                _ => u8::MAX,
+            };
+            let image = GrayImage::from_fn(width, height, |_, _| {
+                Luma([if next() % 1000 < density {
+                    (next() % 255 + 1) as u8
+                } else {
+                    0
+                }])
+            });
+            for erode in [false, true] {
+                let expected = if erode {
+                    imageproc::morphology::erode(&image, Norm::L2, radius)
+                } else {
+                    dilate(&image, Norm::L2, radius)
+                };
+                let mut actual = image.clone();
+                euclidean_morphology(&mut actual, radius, erode);
+                assert_eq!(
+                    actual, expected,
+                    "case {case}, {width}x{height}, radius {radius}, erode {erode}"
+                );
+            }
         }
     }
 
