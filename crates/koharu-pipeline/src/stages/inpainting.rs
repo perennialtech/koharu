@@ -554,7 +554,7 @@ fn inpaint_tiled(
     text_mask: &GrayImage,
     flat_fill_regions: &[FlatFillRegion],
     context: u32,
-    crop_size: impl Fn(u32, u32) -> Option<u32>,
+    crop_size: impl Fn(u32, u32) -> Option<(u32, u32)>,
     mut inference: impl FnMut(&DynamicImage, &GrayImage) -> Result<DynamicImage>,
 ) -> Result<DynamicImage> {
     ensure!(
@@ -764,10 +764,11 @@ fn expand_bounds(
     ]
 }
 
-/// Grows `crop` to `size` on each axis, or to the whole page where the page is
-/// smaller, keeping it centred where the page allows. `crop` must fit in `size`.
-fn fixed_size_crop(crop: [u32; 4], size: u32, width: u32, height: u32) -> [u32; 4] {
-    let axis = |start: u32, end: u32, length: u32| {
+/// Grows `crop` to `size` (width, height), or to the whole page where the page
+/// is smaller, keeping it centred where the page allows. `crop` must fit in
+/// `size`.
+fn fixed_size_crop(crop: [u32; 4], size: (u32, u32), width: u32, height: u32) -> [u32; 4] {
+    let axis = |start: u32, end: u32, length: u32, size: u32| {
         if length <= size {
             return (0, length);
         }
@@ -776,8 +777,8 @@ fn fixed_size_crop(crop: [u32; 4], size: u32, width: u32, height: u32) -> [u32; 
             .min(length - size);
         (start, start + size)
     };
-    let (left, right) = axis(crop[0], crop[2], width);
-    let (top, bottom) = axis(crop[1], crop[3], height);
+    let (left, right) = axis(crop[0], crop[2], width, size.0);
+    let (top, bottom) = axis(crop[1], crop[3], height, size.1);
     [left, top, right, bottom]
 }
 
@@ -1421,7 +1422,7 @@ mod tests {
         let (_, tiles) = inpaint_tiles(&mask, LAMA_TILE_CONTEXT);
         assert!(tiles.len() > 4);
         for tile in &tiles {
-            let crop = fixed_size_crop(tile.crop, size, 1700, 2400);
+            let crop = fixed_size_crop(tile.crop, (size, size), 1700, 2400);
             assert_eq!(crop[2] - crop[0], size);
             assert_eq!(crop[3] - crop[1], size);
             assert!(crop[0] <= tile.crop[0] && crop[1] <= tile.crop[1]);
@@ -1429,8 +1430,8 @@ mod tests {
             assert!(crop[2] <= 1700 && crop[3] <= 2400);
         }
         assert_eq!(
-            fixed_size_crop([10, 20, 300, 400], size, 600, 2400),
-            [0, 0, 600, size]
+            fixed_size_crop([10, 20, 300, 400], (size, 512), 600, 2400),
+            [0, 0, 600, 512]
         );
     }
 }

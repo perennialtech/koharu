@@ -34,7 +34,7 @@ pub struct LaMa {
 #[derive(Debug)]
 enum Network {
     Torch {
-        model: Model,
+        model: Box<Model>,
         processor: InpaintModel,
     },
     TensorRt(tensorrt::Network),
@@ -64,16 +64,16 @@ impl LaMa {
             .context("failed to load LaMa safetensors")?;
         Ok(Self {
             network: Network::Torch {
-                model,
+                model: Box::new(model),
                 processor: InpaintModel::new(device),
             },
         })
     }
 
-    /// The crop size the network runs at for a `width` x `height` crop, when
-    /// it runs at fixed sizes. A caller with more image around the crop can
-    /// grow the crop to it; otherwise the crop is mirrored out to it.
-    pub fn crop_size(&self, width: u32, height: u32) -> Option<u32> {
+    /// The (width, height) the network runs a `width` x `height` crop at,
+    /// when it runs at fixed shapes. A caller with more image around the crop
+    /// can grow the crop to it; otherwise the crop is mirrored out to it.
+    pub fn crop_size(&self, width: u32, height: u32) -> Option<(u32, u32)> {
         match &self.network {
             Network::Torch { .. } => None,
             Network::TensorRt(_) => tensorrt::crop_size(width, height),
