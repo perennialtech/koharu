@@ -1,4 +1,5 @@
-//! RF-DETR Seg 2XL for the KoharuLayout checkpoint as ONNX Runtime sessions.
+//! RF-DETR Seg 2XL for the KoharuLayout checkpoint as ONNX Runtime sessions,
+//! or on TensorRT-RTX (see `tensorrt`).
 //!
 //! The graphs follow RF-DETR upstream's export path (`LWDETR.forward_export`
 //! and `SegmentationHead.forward_export`) at 1920x1920:
@@ -18,6 +19,7 @@ use ort::{
     value::{Tensor, TensorRef},
 };
 
+use super::tensorrt::Network;
 use crate::{
     Backend, Device,
     backend::{Shapes, onnx_session},
@@ -27,8 +29,8 @@ pub(super) const RESOLUTION: usize = 1920;
 pub(super) const MASK_RESOLUTION: usize = RESOLUTION / 4;
 pub(super) const NUM_QUERIES: usize = 300;
 pub(super) const NUM_CLASSES_WITH_BACKGROUND: usize = 5;
-const HIDDEN_DIM: usize = 256;
-const SPATIAL_RESOLUTION: usize = RESOLUTION / 12;
+pub(super) const HIDDEN_DIM: usize = 256;
+pub(super) const SPATIAL_RESOLUTION: usize = RESOLUTION / 12;
 
 #[derive(Debug)]
 pub(super) struct Output {
@@ -37,13 +39,19 @@ pub(super) struct Output {
     /// Normalized `cx, cy, w, h`, `[NUM_QUERIES, 4]`.
     pub pred_boxes: Vec<f32>,
     /// Backbone level-0 features, `[1, HIDDEN_DIM, SPATIAL_RESOLUTION, SPATIAL_RESOLUTION]`,
-    /// in device memory on CUDA.
-    spatial_features: Tensor<f32>,
+    /// in device memory on CUDA. TensorRT keeps them in its own device buffer
+    /// until the next `forward` instead.
+    spatial_features: Option<Tensor<f32>>,
     /// Final decoder layer query features, `[NUM_QUERIES, HIDDEN_DIM]`.
     query_features: Vec<f32>,
 }
 
-pub(super) struct Model {
+pub(super) enum Model {
+    Onnx(Onnx),
+    TensorRt(Box<Network>),
+}
+
+pub(super) struct Onnx {
     // Declared before the sessions so the device buffer it holds is released
     // before the session that allocated it.
     network_options: RunOptions<HasSelectedOutputs>,
@@ -53,16 +61,60 @@ pub(super) struct Model {
 
 impl std::fmt::Debug for Model {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("Model")
-            .field("network", &self.network)
-            .field("mask_head", &self.mask_head)
-            .finish_non_exhaustive()
+        match self {
+            Self::Onnx(onnx) => formatter
+                .debug_struct("Model")
+                .field("network", &onnx.network)
+                .field("mask_head", &onnx.mask_head)
+                .finish_non_exhaustive(),
+            Self::TensorRt(_) => formatter.debug_struct("Model").finish_non_exhaustive(),
+        }
     }
 }
 
 impl Model {
     pub(super) fn load(device: &Device, network: &Path, mask_head: &Path) -> Result<Self> {
+        Onnx::load(device, network, mask_head).map(Self::Onnx)
+    }
+
+    pub(super) fn load_tensorrt(device: u32, network: &Path, mask_head: &Path) -> Result<Self> {
+        Network::load(device, network, mask_head).map(|network| Self::TensorRt(Box::new(network)))
+    }
+
+    /// Runs the detector on normalized planar `[1, 3, RESOLUTION, RESOLUTION]` RGB.
+    pub(super) fn forward(&mut self, pixel_values: &[f32]) -> Result<Output> {
+        match self {
+            Self::Onnx(onnx) => onnx.forward(pixel_values),
+            Self::TensorRt(network) => {
+                let outputs = network.forward(pixel_values)?;
+                Ok(Output {
+                    pred_logits: outputs.pred_logits,
+                    pred_boxes: outputs.pred_boxes,
+                    spatial_features: None,
+                    query_features: outputs.query_features,
+                })
+            }
+        }
+    }
+
+    /// Mask logits `[queries.len(), MASK_RESOLUTION, MASK_RESOLUTION]` for the
+    /// given queries, in order. Each equals that query's mask when all
+    /// queries are projected.
+    pub(super) fn masks(&mut self, output: &Output, queries: &[usize]) -> Result<Vec<f32>> {
+        let mut query_features = Vec::with_capacity(queries.len() * HIDDEN_DIM);
+        for &query in queries {
+            query_features
+                .extend_from_slice(&output.query_features[query * HIDDEN_DIM..][..HIDDEN_DIM]);
+        }
+        match self {
+            Self::Onnx(onnx) => onnx.masks(output, &query_features, queries.len()),
+            Self::TensorRt(network) => network.masks(&query_features),
+        }
+    }
+}
+
+impl Onnx {
+    fn load(device: &Device, network: &Path, mask_head: &Path) -> Result<Self> {
         // The network graph computes attention in FP16 and everything else in
         // FP32, which takes it from about 1 s to 0.3 s on an RTX 3080. Across
         // the 27 hard pages FP16 attention changes fewer detections than an
@@ -101,8 +153,7 @@ impl Model {
         })
     }
 
-    /// Runs the detector on normalized planar `[1, 3, RESOLUTION, RESOLUTION]` RGB.
-    pub(super) fn forward(&mut self, pixel_values: &[f32]) -> Result<Output> {
+    fn forward(&mut self, pixel_values: &[f32]) -> Result<Output> {
         let input = TensorRef::from_array_view(([1, 3, RESOLUTION, RESOLUTION], pixel_values))?;
         let mut outputs = self
             .network
@@ -132,24 +183,25 @@ impl Model {
         Ok(Output {
             pred_logits,
             pred_boxes,
-            spatial_features,
+            spatial_features: Some(spatial_features),
             query_features,
         })
     }
 
-    /// Mask logits `[queries.len(), MASK_RESOLUTION, MASK_RESOLUTION]` for the
-    /// given queries, in order. Each equals that query's mask when all
-    /// queries are projected.
-    pub(super) fn masks(&mut self, output: &Output, queries: &[usize]) -> Result<Vec<f32>> {
-        let mut query_features = Vec::with_capacity(queries.len() * HIDDEN_DIM);
-        for &query in queries {
-            query_features
-                .extend_from_slice(&output.query_features[query * HIDDEN_DIM..][..HIDDEN_DIM]);
-        }
+    fn masks(
+        &mut self,
+        output: &Output,
+        query_features: &[f32],
+        queries: usize,
+    ) -> Result<Vec<f32>> {
+        let spatial_features = output
+            .spatial_features
+            .as_ref()
+            .expect("ONNX Runtime outputs carry their spatial features");
         let query_features =
-            TensorRef::from_array_view(([1, queries.len(), HIDDEN_DIM], &*query_features))?;
+            TensorRef::from_array_view(([1, queries, HIDDEN_DIM], query_features))?;
         let outputs = self.mask_head.run(ort::inputs![
-            "spatial_features" => &output.spatial_features,
+            "spatial_features" => spatial_features,
             "query_features" => query_features,
         ])?;
         let (shape, masks) = outputs[0].try_extract_tensor::<f32>()?;
@@ -157,7 +209,7 @@ impl Model {
             shape.as_ref()
                 == [
                     1,
-                    queries.len() as i64,
+                    queries as i64,
                     MASK_RESOLUTION as i64,
                     MASK_RESOLUTION as i64
                 ],

@@ -29,6 +29,8 @@ koharu-llama-sys = { path = "crates/koharu-llama-sys" }
 koharu-runtime = { path = "crates/koharu-runtime" }
 koharu-torch = { path = "crates/koharu-torch" }
 koharu-torch-sys = { path = "crates/koharu-torch-sys" }
+koharu-tensorrt = { path = "crates/koharu-tensorrt" }
+koharu-tensorrt-sys = { path = "crates/koharu-tensorrt-sys" }
 koharu-ml = { path = "crates/koharu-ml" }
 koharu-translator = { path = "crates/koharu-translator" }
 koharu-renderer = { path = "crates/koharu-renderer" }
@@ -84,6 +86,7 @@ revision = { version = "0.30.0", features = ["uuid"] }
 flate2 = "1.1.10"
 tempfile = "3.27.0"
 libloading = "0.9.0"
+cc = "1.5.1"
 nvml-wrapper = "0.13.0"
 minijinja = "3.0.0"
 minijinja-contrib = { version = "3.0.0", features = ["pycompat"] }

@@ -1,5 +1,5 @@
-//! Runs detection and inpainting on every page in a directory and reports the
-//! inpainting stage time per page. Cleaned pages are written as PNG.
+//! Runs detection and inpainting on every page in a directory and reports
+//! each stage's time per page. Cleaned pages are written as PNG.
 
 use std::{collections::BTreeMap, path::PathBuf, sync::Arc, time::Duration};
 
@@ -41,7 +41,11 @@ async fn main() -> Result<()> {
         "flux2-klein" => InpaintingModel::Flux2Klein(Flux2KleinConfig::default()),
         other => anyhow::bail!("unknown inpainting model {other}"),
     };
-    let mut features = vec![koharu_ml::Feature::Torch];
+    let mut features = vec![
+        koharu_ml::Feature::Torch,
+        koharu_ml::Feature::OnnxRuntime,
+        koharu_ml::Feature::TensorRt,
+    ];
     if matches!(&config.inpainting, InpaintingModel::Flux2Klein(_)) {
         features.push(koharu_ml::Feature::Diffusion);
     }
@@ -58,7 +62,7 @@ async fn main() -> Result<()> {
         .map(|entry| entry.map(|entry| entry.path()))
         .collect::<Result<Vec<_>, _>>()?;
     files.sort();
-    let mut total = Duration::ZERO;
+    let (mut detection_total, mut inpainting_total) = (Duration::ZERO, Duration::ZERO);
     for (index, file) in files.iter().enumerate() {
         let bytes = std::fs::read(file)?;
         let image = image::load_from_memory(&bytes)?;
@@ -91,7 +95,7 @@ async fn main() -> Result<()> {
         })?;
         session.commit(patch).await?;
         let page = page.context("page ID was not assigned")?;
-        let elapsed = Arc::new(std::sync::Mutex::new(Duration::ZERO));
+        let elapsed = Arc::new(std::sync::Mutex::new([Duration::ZERO; 2]));
         let sink = elapsed.clone();
         let snapshot = session.snapshot();
         pipeline
@@ -103,13 +107,13 @@ async fn main() -> Result<()> {
                     },
                     scope: Scope::Pages(vec![page]),
                     progress: Some(Arc::new(move |event| {
-                        if let Progress::Finished {
-                            stage: Stage::Inpainting,
-                            elapsed,
-                            ..
-                        } = event
-                        {
-                            *sink.lock().unwrap() = elapsed;
+                        if let Progress::Finished { stage, elapsed, .. } = event {
+                            let slot = match stage {
+                                Stage::Detection => 0,
+                                Stage::Inpainting => 1,
+                                _ => return,
+                            };
+                            sink.lock().unwrap()[slot] = elapsed;
                         }
                     })),
                     ..Request::default()
@@ -117,12 +121,17 @@ async fn main() -> Result<()> {
                 &mut SessionCommitter(&mut session),
             )
             .await?;
-        let elapsed = *elapsed.lock().unwrap();
+        let [detection, inpainting] = *elapsed.lock().unwrap();
         if index > 0 {
-            total += elapsed;
+            detection_total += detection;
+            inpainting_total += inpainting;
         }
         let name = file.file_stem().unwrap().to_string_lossy();
-        println!("{name} inpainting={:.3}", elapsed.as_secs_f64());
+        println!(
+            "{name} detection={:.3} inpainting={:.3}",
+            detection.as_secs_f64(),
+            inpainting.as_secs_f64()
+        );
         let frame = renderer.render(&session.snapshot(), page).await?;
         let raster = rasterizer.rasterize(&frame.raster_frame()?, RasterOptions::default())?;
         image::DynamicImage::ImageRgba8(raster.image)
@@ -130,8 +139,9 @@ async fn main() -> Result<()> {
             .save(out.join(format!("{name}.png")))?;
     }
     println!(
-        "total_excluding_first={:.3} pages={}",
-        total.as_secs_f64(),
+        "total_excluding_first detection={:.3} inpainting={:.3} pages={}",
+        detection_total.as_secs_f64(),
+        inpainting_total.as_secs_f64(),
         files.len().saturating_sub(1)
     );
     Ok(())

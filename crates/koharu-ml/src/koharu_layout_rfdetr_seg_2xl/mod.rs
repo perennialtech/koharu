@@ -8,9 +8,11 @@
 mod config;
 mod model;
 mod processor;
+mod tensorrt;
 
 use anyhow::{Context, Result};
 use image::DynamicImage;
+use koharu_runtime::Backend;
 
 pub use self::{
     config::{KoharuLayoutRFDetrSeg2XLConfig, KoharuLayoutThresholds},
@@ -27,9 +29,11 @@ crate::model_repository!("mayocream/koharu-layout-highres" @ "68077eb09401a46e54
 });
 
 // ONNX export of the checkpoint above (model.safetensors); the repository holds
-// the export script.
-crate::model_repository!("8q0sb/koharu-onnx" @ "26af0c10ce9ced0774a2afbc8750493bf0cd42cd" {
+// the export scripts. TENSORRT_NETWORK is NETWORK with standard ONNX Attention
+// nodes in place of ONNX Runtime's MultiHeadAttention.
+crate::model_repository!("8q0sb/koharu-onnx" @ "86d109e3410b5d7d528e845eb966512e58bb17bd" {
     NETWORK = "koharu-layout-highres/koharu-layout-highres.onnx",
+    TENSORRT_NETWORK = "koharu-layout-highres/koharu-layout-highres-tensorrt.onnx",
     MASK_HEAD = "koharu-layout-highres/koharu-layout-highres-mask-head.onnx",
 });
 
@@ -45,19 +49,34 @@ impl KoharuLayoutRFDetrSeg2XL {
             .resolve()
             .await
             .context("failed to resolve KoharuLayout RF-DETR inference config")?;
-        let network = NETWORK
-            .resolve()
-            .await
-            .context("failed to resolve KoharuLayout RF-DETR network")?;
         let mask_head = MASK_HEAD
             .resolve()
             .await
             .context("failed to resolve KoharuLayout RF-DETR mask head")?;
         let config = KoharuLayoutRFDetrSeg2XLConfig::from_file(&config_path)?;
         let processor = KoharuLayoutRFDetrImageProcessor::new(&config)?;
-        let model = tokio_rayon::spawn(move || Model::load(&device, &network, &mask_head))
-            .await
-            .context("failed to load KoharuLayout RF-DETR")?;
+        // TensorRT-RTX runs on Turing and newer, in processes that initialized it.
+        let model = if device.backend == Backend::Cuda
+            && device.compute_capability() >= 75
+            && crate::initialized(crate::Feature::TensorRt)
+        {
+            let network = TENSORRT_NETWORK
+                .resolve()
+                .await
+                .context("failed to resolve KoharuLayout RF-DETR TensorRT network")?;
+            let index = u32::try_from(device.index)?;
+            tokio_rayon::spawn(move || Model::load_tensorrt(index, &network, &mask_head))
+                .await
+                .context("failed to load KoharuLayout RF-DETR on TensorRT-RTX")?
+        } else {
+            let network = NETWORK
+                .resolve()
+                .await
+                .context("failed to resolve KoharuLayout RF-DETR network")?;
+            tokio_rayon::spawn(move || Model::load(&device, &network, &mask_head))
+                .await
+                .context("failed to load KoharuLayout RF-DETR")?
+        };
         Ok(Self { model, processor })
     }
 
@@ -70,15 +89,25 @@ impl KoharuLayoutRFDetrSeg2XL {
         image: &DynamicImage,
         thresholds: KoharuLayoutThresholds,
     ) -> Result<KoharuLayoutDetections> {
+        let start = std::time::Instant::now();
         let pixel_values = self.processor.preprocess(image)?;
+        let preprocessed = start.elapsed();
         let output = self.model.forward(&pixel_values)?;
-        self.processor.postprocess(
+        let forwarded = start.elapsed();
+        let detections = self.processor.postprocess(
             &mut self.model,
             &output,
             image.width(),
             image.height(),
             thresholds,
-        )
+        );
+        tracing::debug!(
+            pre_ms = preprocessed.as_secs_f64() * 1e3,
+            net_ms = (forwarded - preprocessed).as_secs_f64() * 1e3,
+            post_ms = (start.elapsed() - forwarded).as_secs_f64() * 1e3,
+            "rfdetr_split"
+        );
+        detections
     }
 
     pub fn recommended_thresholds(&self) -> KoharuLayoutThresholds {
