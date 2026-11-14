@@ -1,4 +1,8 @@
-use std::{collections::BTreeMap, io::Cursor, sync::Arc};
+use std::{
+    collections::BTreeMap,
+    io::Cursor,
+    sync::{Arc, LazyLock},
+};
 
 use koharu_rasterizer::{PREPARED_RASTER_TILE_DIMENSION, RasterOptions, Rasterizer};
 use koharu_renderer::{ImageKind, LayerKind, Renderer};
@@ -6,6 +10,15 @@ use koharu_scene::{
     AssetInput, AssetMetadata, AssetRole, At, Origin, PageDraft, RasterLayer, RasterLayerKind,
     Session,
 };
+
+/// One rasterizer for the whole test binary, as each server worker process
+/// has. When parallel tests each create and drop their own wgpu device, NVIDIA
+/// driver 615.71.09 can deadlock inside `vkDestroyDevice`; a static is never
+/// dropped.
+fn rasterizer() -> &'static Rasterizer {
+    static RASTERIZER: LazyLock<Rasterizer> = LazyLock::new(|| Rasterizer::new().unwrap());
+    &RASTERIZER
+}
 
 fn png(width: u32, height: u32, color: [u8; 4]) -> Arc<[u8]> {
     let image = image::RgbaImage::from_pixel(width, height, image::Rgba(color));
@@ -98,8 +111,7 @@ async fn native_rasterization_preserves_pixels_across_prepared_tile_edges() {
     };
     assert_eq!(prepared.tiles.len(), 2);
 
-    let raster = Rasterizer::new()
-        .unwrap()
+    let raster = rasterizer()
         .rasterize(&frame.raster_frame().unwrap(), RasterOptions::default())
         .unwrap();
 
@@ -141,8 +153,7 @@ async fn discarded_image_nodes_are_rebuilt_for_a_reopened_presentation() {
     renderer.render(&snapshot, page).await.unwrap();
     renderer.discard_retained_nodes();
     let reopened = renderer.render(&snapshot, page).await.unwrap();
-    let raster = Rasterizer::new()
-        .unwrap()
+    let raster = rasterizer()
         .rasterize(&reopened.raster_frame().unwrap(), RasterOptions::default())
         .unwrap();
 
@@ -203,8 +214,7 @@ async fn rasterized_png_contains_source_and_cleanup_pixels() {
     let snapshot = session.commit(patch).await.unwrap().snapshot;
     let renderer = Renderer::new().unwrap();
     let frame = renderer.render(&snapshot, page.unwrap()).await.unwrap();
-    let raster = Rasterizer::new()
-        .unwrap()
+    let raster = rasterizer()
         .rasterize(&frame.raster_frame().unwrap(), RasterOptions::default())
         .unwrap();
 

@@ -1,6 +1,9 @@
 #![cfg(feature = "native")]
 
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::HashMap,
+    sync::{Arc, LazyLock},
+};
 
 use koharu_rasterizer::{
     Bounds, LayerId, LayerKind, Point, PreparedContent, PreparedFrame, PreparedFrameBundle,
@@ -8,6 +11,15 @@ use koharu_rasterizer::{
     RasterOptions, Rasterizer, Revision,
 };
 use vello::Scene;
+
+/// One rasterizer for the whole test binary, as each server worker process
+/// has. When parallel tests each create and drop their own wgpu device, NVIDIA
+/// driver 615.71.09 can deadlock inside `vkDestroyDevice`; a static is never
+/// dropped.
+fn rasterizer() -> &'static Rasterizer {
+    static RASTERIZER: LazyLock<Rasterizer> = LazyLock::new(|| Rasterizer::new().unwrap());
+    &RASTERIZER
+}
 
 #[test]
 fn linear_filtering_does_not_add_borders_to_any_raster_layer() {
@@ -116,8 +128,7 @@ fn linear_filtering_does_not_add_borders_to_any_raster_layer() {
     ]))
     .unwrap();
 
-    let raster = Rasterizer::new()
-        .unwrap()
+    let raster = rasterizer()
         .rasterize(&frame, RasterOptions::default())
         .unwrap();
 
@@ -192,8 +203,7 @@ fn output_scale_keeps_every_pixel_of_a_matching_raster() {
     .into_frame_with_raster_sources(&HashMap::from([(resource_id, Arc::from(&pixels[..]))]))
     .unwrap();
 
-    let raster = Rasterizer::new()
-        .unwrap()
+    let raster = rasterizer()
         .rasterize(
             &frame,
             RasterOptions {
@@ -211,8 +221,7 @@ fn output_scale_keeps_every_pixel_of_a_matching_raster() {
 fn rasterizes_surfaces_beyond_the_default_wgpu_texture_limit() {
     // WGPU's default limits cap textures at 8192 px, far below what desktop
     // GPUs support, and tall scans or spreads exceed it.
-    let image = Rasterizer::new()
-        .unwrap()
+    let image = rasterizer()
         .rasterize_scene(
             &Scene::new(),
             4,
@@ -341,8 +350,7 @@ fn tiled_layers_composite_like_premultiplied_source_over() {
     ]))
     .unwrap();
 
-    let raster = Rasterizer::new()
-        .unwrap()
+    let raster = rasterizer()
         .rasterize(&frame, RasterOptions::default())
         .unwrap();
 
@@ -424,8 +432,7 @@ fn vector_layer_edges_blend_partially_over_raster_layers() {
     }
     .into_frame_with_raster_sources(&HashMap::from([(source, Arc::from(&blue[..]))]))
     .unwrap();
-    let image = Rasterizer::new()
-        .unwrap()
+    let image = rasterizer()
         .rasterize(&frame, RasterOptions::default())
         .unwrap()
         .image;
@@ -489,8 +496,7 @@ fn native_readback_preserves_straight_alpha_for_transparent_layers() {
     }
     .into_frame_with_raster_sources(&HashMap::from([(source, Arc::from(pixels))]))
     .unwrap();
-    let image = Rasterizer::new()
-        .unwrap()
+    let image = rasterizer()
         .rasterize(&frame, RasterOptions::default())
         .unwrap()
         .image;
