@@ -207,14 +207,22 @@ async fn infer_text<M: Send + 'static>(
 }
 
 // PaddleOCR-VL reads a column of dots, as in a silent reaction balloon, as
-// boxes, circles or emoji. Normalize only text made entirely of such symbols so
-// ordinary OCR output, and hearts and notes used as lettering, are preserved.
+// boxes, circles or emoji, sometimes mixed with middle dots it read correctly.
+// Normalize only text made entirely of such symbols and middle dots, with at
+// least one symbol, so ordinary OCR output, dots read as dots, masked words
+// such as ○○…, and hearts and notes used as lettering are preserved.
 fn normalize_ocr_text(text: String) -> String {
     let visible = text
         .chars()
         .filter(|character| !character.is_whitespace() && *character != '\u{FE0F}')
         .collect::<Vec<_>>();
-    if visible.len() >= 2 && visible.iter().copied().all(misread_dot) {
+    if visible.len() >= 2
+        && visible.iter().copied().any(misread_dot)
+        && visible
+            .iter()
+            .copied()
+            .all(|character| misread_dot(character) || matches!(character, '・' | '･' | '·'))
+    {
         "…".to_owned()
     } else {
         text
@@ -280,6 +288,8 @@ mod tests {
             "☑ ☐ ☒ ☐ ☐",
             "● ● ● ● ●",
             "☀️ 🌞 ☁️ ☉ ⚪️ ☛️",
+            "・ ●  ・ ●  ・",
+            "●・",
         ] {
             assert_eq!(normalize_ocr_text(text.to_owned()), "…", "{text}");
         }
@@ -287,7 +297,18 @@ mod tests {
 
     #[test]
     fn ordinary_text_lettering_symbols_and_single_boxes_are_unchanged() {
-        for text in ["待って…", "・・・", "!!", "♡♡", "♪♪", "☐"] {
+        for text in [
+            "待って…",
+            "・・・",
+            "……",
+            "!!",
+            "♡♡",
+            "♪♪",
+            "♡・",
+            "○○…",
+            "☐",
+            "●待って",
+        ] {
             assert_eq!(normalize_ocr_text(text.to_owned()), text);
         }
     }
