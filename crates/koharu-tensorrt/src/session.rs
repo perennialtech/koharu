@@ -1,4 +1,5 @@
 //! One model on one GPU, with its engine and compiled kernels cached on disk.
+//! Sessions may share [`Scratch`] to reuse activation memory sized per run.
 
 use std::{
     collections::HashSet,
@@ -44,6 +45,27 @@ impl<'a> Binding<'a> {
     }
 }
 
+/// Shared activation memory on one device, sized for each run's input shapes.
+///
+/// Clones share one allocation that grows to the largest size requested.
+/// Sessions sharing it serialize their runs through stream synchronization.
+/// The previous allocation is freed before a larger one is allocated.
+#[derive(Clone, Debug)]
+pub struct Scratch {
+    device: u32,
+    memory: Arc<Mutex<Option<DeviceBuffer>>>,
+}
+
+impl Scratch {
+    /// Creates an empty scratch for `device`. Memory is allocated on first run.
+    pub fn new(device: u32) -> Self {
+        Self {
+            device,
+            memory: Arc::new(Mutex::new(None)),
+        }
+    }
+}
+
 // TensorRT-RTX compiles kernels for a new dynamic shape in the background
 // while runs use fallback kernels, so nothing marks when they are ready. After
 // a new shape a saver thread writes the runtime cache this often, for this
@@ -59,6 +81,7 @@ pub struct Session {
     engine: Engine,
     names: Vec<CString>,
     device: u32,
+    scratch: Option<Scratch>,
     /// Input shapes run so far; `None` for an engine without dynamic inputs,
     /// whose kernels are all compiled when the context is created.
     shapes: Option<HashSet<Vec<Vec<i64>>>>,
@@ -90,6 +113,9 @@ impl Session {
     /// compute capability and the driver version, since compiled kernels are
     /// specific to both. With `cuda_graph`, runs replay a captured CUDA graph.
     /// `ranges` bounds each dynamic input and is part of the engine's key.
+    /// `scratch` shares activation memory sized per run; without it, the context
+    /// reserves the maximum for the engine's profiles. A scratch must be on
+    /// `device` and cannot be used with CUDA graphs, which capture its address.
     #[tracing::instrument(level = "info", skip_all, fields(model = %onnx.display()))]
     pub fn open(
         onnx: &Path,
@@ -97,7 +123,18 @@ impl Session {
         device: u32,
         cuda_graph: bool,
         ranges: &[ShapeRange<'_>],
+        scratch: Option<&Scratch>,
     ) -> Result<Self> {
+        if let Some(scratch) = scratch {
+            ensure!(
+                !cuda_graph,
+                "shared scratch cannot be used with CUDA graphs"
+            );
+            ensure!(
+                scratch.device == device,
+                "scratch is on a different CUDA device"
+            );
+        }
         crate::cudart()?;
         cuda::set_device(device)?;
         fs::create_dir_all(cache_dir)
@@ -123,7 +160,7 @@ impl Session {
             Err(error) => return Err(error).context("failed to read the runtime cache"),
         };
         let started = Instant::now();
-        let context = ExecutionContext::new(&engine, &cached, cuda_graph)?;
+        let context = ExecutionContext::new(&engine, &cached, cuda_graph, scratch.is_some())?;
         tracing::info!(
             elapsed_ms = started.elapsed().as_millis(),
             cached = !cached.is_empty(),
@@ -158,6 +195,7 @@ impl Session {
             engine,
             names,
             device,
+            scratch: scratch.cloned(),
             shapes: dynamic.then(HashSet::new),
         })
     }
@@ -166,7 +204,8 @@ impl Session {
         self.engine.tensors()
     }
 
-    /// Activation memory the engine needs per context, in bytes.
+    /// Upper bound on activation memory per context across all profiles, in bytes.
+    /// A scratch session sizes its activation memory for each run instead.
     pub fn device_memory(&self) -> i64 {
         self.engine.device_memory()
     }
@@ -217,6 +256,29 @@ impl Session {
             input_shapes.push(shape.to_vec());
         }
 
+        let mut scratch = self
+            .scratch
+            .as_ref()
+            .map(|scratch| {
+                scratch
+                    .memory
+                    .lock()
+                    .map_err(|_| anyhow!("TensorRT-RTX scratch lock is poisoned"))
+            })
+            .transpose()?;
+        if let Some(memory) = &mut scratch {
+            let size = context.update_device_memory_size()?;
+            if memory.as_ref().is_none_or(|buffer| buffer.len() < size) {
+                // Growing must not temporarily require both allocations to fit.
+                drop(memory.take());
+                **memory = Some(DeviceBuffer::new(self.device, size)?);
+            }
+            let buffer = memory.as_ref().expect("scratch is allocated");
+            // SAFETY: cudaMalloc supplies aligned memory of the required size;
+            // the scratch lock keeps it live and exclusive until synchronization.
+            unsafe { context.set_device_memory(buffer.raw(), buffer.len())? };
+        }
+
         for (index, tensor) in self.engine.tensors().iter().enumerate() {
             let binding = bound[index].expect("every tensor is bound");
             let shape = context.shape(&self.names[index])?;
@@ -239,8 +301,12 @@ impl Session {
 
         // SAFETY: every tensor is bound to a large enough live buffer and the
         // stream is live; the borrows outlast the synchronization.
-        unsafe { context.enqueue(stream.raw())? };
-        stream.synchronize()?;
+        let enqueued = unsafe { context.enqueue(stream.raw()) };
+        // A failed enqueue may still have submitted work using the scratch.
+        let synchronized = stream.synchronize();
+        enqueued?;
+        synchronized?;
+        drop(scratch);
 
         if let Some(shapes) = &mut self.shapes
             && shapes.insert(input_shapes)

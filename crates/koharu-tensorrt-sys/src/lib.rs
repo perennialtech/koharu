@@ -97,6 +97,7 @@ unsafe extern "C" {
         cache: *const c_void,
         cache_size: usize,
         cuda_graph: i32,
+        user_managed_memory: i32,
     ) -> *mut ktrt_context;
     pub fn ktrt_context_free(context: *mut ktrt_context);
     pub fn ktrt_context_runtime_cache(context: *const ktrt_context) -> *mut ktrt_blob;
@@ -106,6 +107,15 @@ unsafe extern "C" {
         dims: *const i64,
         rank: i32,
     ) -> i32;
+    pub fn ktrt_context_update_device_memory_size(
+        context: *mut ktrt_context,
+        size: *mut usize,
+    ) -> i32;
+    pub fn ktrt_context_set_device_memory(
+        context: *mut ktrt_context,
+        memory: *mut c_void,
+        size: i64,
+    );
     pub fn ktrt_context_io_shape(
         context: *const ktrt_context,
         name: *const c_char,

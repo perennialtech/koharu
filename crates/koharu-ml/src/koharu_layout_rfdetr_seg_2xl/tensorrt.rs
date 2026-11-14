@@ -52,8 +52,14 @@ pub(super) struct Outputs {
 impl Network {
     pub(super) fn load(device: u32, network: &Path, mask_head: &Path) -> Result<Self> {
         let stream = Stream::new(device)?;
-        let network =
-            crate::backend::tensorrt_session(device, network, "koharu-layout-highres", true, &[])?;
+        let network = crate::backend::tensorrt_session(
+            device,
+            network,
+            "koharu-layout-highres",
+            true,
+            &[],
+            None,
+        )?;
         let hidden = HIDDEN_DIM as i64;
         let mask_head = crate::backend::tensorrt_session(
             device,
@@ -68,6 +74,7 @@ impl Network {
                 opt: &[1, 32, hidden],
                 max: &[1, NUM_QUERIES as i64, hidden],
             }],
+            None,
         )?;
         let buffer = |floats: usize| DeviceBuffer::new(device, floats * F32);
         Ok(Self {

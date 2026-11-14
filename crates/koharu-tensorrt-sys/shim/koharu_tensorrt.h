@@ -83,13 +83,20 @@ int64_t ktrt_engine_device_memory(const ktrt_engine *engine);
 
 /* Creates an execution context, compiling kernels for the current device.
  * `cache` may hold a serialized runtime cache from an earlier process, which
- * skips the compilation for kernels it already holds. The engine must
- * outlive the context. */
-ktrt_context *ktrt_context_create(ktrt_engine *engine, const void *cache, size_t cache_size, int32_t cuda_graph);
+ * skips the compilation for kernels it already holds. With `user_managed_memory`,
+ * the caller must supply activation memory before enqueueing. The engine
+ * must outlive the context. */
+ktrt_context *ktrt_context_create(ktrt_engine *engine, const void *cache, size_t cache_size, int32_t cuda_graph,
+                                  int32_t user_managed_memory);
 void ktrt_context_free(ktrt_context *context);
 /* The runtime cache with every kernel compiled so far. */
 ktrt_blob *ktrt_context_runtime_cache(const ktrt_context *context);
 int32_t ktrt_context_set_input_shape(ktrt_context *context, const char *name, const int64_t *dims, int32_t rank);
+/* Repartitions activation memory after all input shapes have been set.
+ * Writes the required size, or returns a non-zero status on error. */
+int32_t ktrt_context_update_device_memory_size(ktrt_context *context, size_t *size);
+/* The allocation must remain live and exclusive until inference completes. */
+void ktrt_context_set_device_memory(ktrt_context *context, void *memory, int64_t size);
 /* The shape a tensor has after the inputs' shapes are set: same contract as
  * ktrt_engine_io_shape. */
 int32_t ktrt_context_io_shape(const ktrt_context *context, const char *name, int64_t *dims, int32_t capacity);

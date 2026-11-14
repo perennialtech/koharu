@@ -87,7 +87,8 @@ impl Network {
             .iter()
             .zip(exports)
             .map(|(&(width, height), onnx)| {
-                let session = crate::backend::tensorrt_session(device, onnx, "lama", true, &[])?;
+                let session =
+                    crate::backend::tensorrt_session(device, onnx, "lama", true, &[], None)?;
                 let pixels = width as usize * height as usize;
                 Ok(Engine {
                     shape: (width, height),

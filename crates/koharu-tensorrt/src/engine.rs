@@ -225,7 +225,12 @@ pub(crate) struct ExecutionContext {
 unsafe impl Send for ExecutionContext {}
 
 impl ExecutionContext {
-    pub(crate) fn new(engine: &Engine, cache: &[u8], cuda_graph: bool) -> Result<Self> {
+    pub(crate) fn new(
+        engine: &Engine,
+        cache: &[u8],
+        cuda_graph: bool,
+        user_managed_memory: bool,
+    ) -> Result<Self> {
         // SAFETY: the engine is live and `cache` is a live slice.
         let raw = unsafe {
             sys::ktrt_context_create(
@@ -237,6 +242,7 @@ impl ExecutionContext {
                 },
                 cache.len(),
                 i32::from(cuda_graph),
+                i32::from(user_managed_memory),
             )
         };
         if raw.is_null() {
@@ -269,6 +275,30 @@ impl ExecutionContext {
             },
             &format!("failed to set the shape of {}", name.to_string_lossy()),
         )
+    }
+
+    pub(crate) fn update_device_memory_size(&mut self) -> Result<usize> {
+        let mut size = 0;
+        // SAFETY: the context is live and the out-pointer is valid.
+        crate::check(
+            unsafe { sys::ktrt_context_update_device_memory_size(self.raw, &mut size) },
+            "failed to size TensorRT-RTX activation memory",
+        )?;
+        Ok(size)
+    }
+
+    /// # Safety
+    ///
+    /// `memory` must be CUDA-aligned device memory of at least `size` bytes,
+    /// sufficient for the current input shapes, and stay live and exclusive
+    /// until the enqueued work has finished.
+    pub(crate) unsafe fn set_device_memory(
+        &mut self,
+        memory: *mut std::ffi::c_void,
+        size: usize,
+    ) -> Result<()> {
+        unsafe { sys::ktrt_context_set_device_memory(self.raw, memory, i64::try_from(size)?) };
+        Ok(())
     }
 
     pub(crate) fn shape(&self, name: &CStr) -> Result<Vec<i64>> {
