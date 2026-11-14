@@ -28,7 +28,7 @@ crate::model_repository!("mayocream/koharu-layout-highres" @ "68077eb09401a46e54
 
 // ONNX export of the checkpoint above (model.safetensors); the repository holds
 // the export script.
-crate::model_repository!("8q0sb/koharu-onnx" @ "fda0b1ad6a31da8887f86bbeaa77ab47da2aac70" {
+crate::model_repository!("8q0sb/koharu-onnx" @ "26af0c10ce9ced0774a2afbc8750493bf0cd42cd" {
     NETWORK = "koharu-layout-highres/koharu-layout-highres.onnx",
     MASK_HEAD = "koharu-layout-highres/koharu-layout-highres-mask-head.onnx",
 });
