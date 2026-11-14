@@ -17,7 +17,10 @@ use ort::{
     value::{Tensor, TensorRef},
 };
 
-use crate::{Backend, Device, backend::onnx_session};
+use crate::{
+    Backend, Device,
+    backend::{Shapes, onnx_session},
+};
 
 pub(super) const RESOLUTION: usize = 1920;
 pub(super) const MASK_RESOLUTION: usize = RESOLUTION / 4;
@@ -64,7 +67,7 @@ impl Model {
         // fixture scores 0.61 instead of 0.95. TF32 is excluded too: it adds
         // and drops detections against FP32 on the hard pages at no
         // measurable speed gain.
-        let network = onnx_session(device, network, false)?;
+        let network = onnx_session(device, network, false, Shapes::Fixed)?;
         // On CUDA the spatial features stay on the device for the mask head
         // instead of a round trip through host memory.
         let mut outputs = OutputSelector::default();
@@ -89,7 +92,7 @@ impl Model {
         Ok(Self {
             network_options: RunOptions::new()?.with_outputs(outputs),
             network,
-            mask_head: onnx_session(device, mask_head, false)?,
+            mask_head: onnx_session(device, mask_head, false, Shapes::Dynamic)?,
         })
     }
 
