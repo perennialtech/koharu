@@ -18,7 +18,7 @@ use anyhow::{Result, anyhow};
 use koharu_tensorrt_sys as sys;
 
 pub use self::{
-    cuda::{DeviceBuffer, Stream},
+    cuda::{DeviceBuffer, Element, Stream},
     engine::{DataType, ShapeRange, TensorInfo},
     session::{Binding, Session},
 };

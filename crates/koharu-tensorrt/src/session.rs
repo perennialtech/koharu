@@ -6,10 +6,12 @@ use std::{
     fs,
     io::{self, Write as _},
     path::{Path, PathBuf},
+    sync::{Arc, Mutex, MutexGuard, mpsc},
+    thread,
     time::{Duration, Instant},
 };
 
-use anyhow::{Context as _, Result, bail, ensure};
+use anyhow::{Context as _, Result, anyhow, bail, ensure};
 
 use crate::{
     DeviceBuffer, ShapeRange, Stream, TensorInfo, cuda,
@@ -44,22 +46,38 @@ impl<'a> Binding<'a> {
 
 // TensorRT-RTX compiles kernels for a new dynamic shape in the background
 // while runs use fallback kernels, so nothing marks when they are ready. After
-// a new shape the runtime cache is saved at most this often, for this long.
+// a new shape a saver thread writes the runtime cache this often, for this
+// long, whether or not more runs come.
 const CACHE_SAVE_INTERVAL: Duration = Duration::from_secs(5);
 const CACHE_SAVE_WINDOW: Duration = Duration::from_secs(30);
 
-/// Field order drops the context before the engine.
+/// `Drop` stops the saver, so the context is no longer shared, and field
+/// order then drops the context before the engine.
 pub struct Session {
-    context: ExecutionContext,
+    saver: Option<Saver>,
+    live: Arc<Mutex<Live>>,
     engine: Engine,
     names: Vec<CString>,
     device: u32,
-    cache_path: PathBuf,
     /// Input shapes run so far; `None` for an engine without dynamic inputs,
     /// whose kernels are all compiled when the context is created.
     shapes: Option<HashSet<Vec<Vec<i64>>>>,
+}
+
+/// The context and its runtime cache's bookkeeping, shared with the saver.
+struct Live {
+    context: ExecutionContext,
+    cache_path: PathBuf,
+    /// The runtime cache as last written.
+    saved: Vec<u8>,
     last_new_shape: Option<Instant>,
-    last_save: Instant,
+    /// Whether a saver thread is running; it clears this as it exits.
+    saving: bool,
+}
+
+struct Saver {
+    stop: mpsc::Sender<()>,
+    thread: thread::JoinHandle<()>,
 }
 
 impl Session {
@@ -116,6 +134,13 @@ impl Session {
         if compiled != cached {
             write_atomic(&cache_path, &compiled)?;
         }
+        let live = Live {
+            context,
+            cache_path,
+            saved: compiled,
+            last_new_shape: None,
+            saving: false,
+        };
 
         let names = engine
             .tensors()
@@ -127,14 +152,12 @@ impl Session {
             .iter()
             .any(|tensor| tensor.input && tensor.shape.iter().any(|extent| *extent < 0));
         Ok(Self {
-            context,
+            saver: None,
+            live: Arc::new(Mutex::new(live)),
             engine,
             names,
             device,
-            cache_path,
             shapes: dynamic.then(HashSet::new),
-            last_new_shape: None,
-            last_save: Instant::now(),
         })
     }
 
@@ -151,6 +174,8 @@ impl Session {
     /// Every engine tensor must be bound exactly once.
     pub fn run(&mut self, bindings: &[Binding<'_>], stream: &Stream) -> Result<()> {
         cuda::set_device(self.device)?;
+        let mut live = lock(&self.live)?;
+        let context = &mut live.context;
         let mut bound = vec![None; self.names.len()];
         for binding in bindings {
             let index = self
@@ -187,13 +212,13 @@ impl Session {
                 tensor.name,
                 tensor.shape
             );
-            self.context.set_input_shape(&self.names[index], shape)?;
+            context.set_input_shape(&self.names[index], shape)?;
             input_shapes.push(shape.to_vec());
         }
 
         for (index, tensor) in self.engine.tensors().iter().enumerate() {
             let binding = bound[index].expect("every tensor is bound");
-            let shape = self.context.shape(&self.names[index])?;
+            let shape = context.shape(&self.names[index])?;
             if shape.iter().any(|extent| *extent < 0) {
                 bail!("tensor {} has unresolved shape {shape:?}", tensor.name);
             }
@@ -207,52 +232,110 @@ impl Session {
             // SAFETY: the buffer is large enough, and it stays borrowed until
             // the stream is synchronized below.
             unsafe {
-                self.context
-                    .set_tensor_address(&self.names[index], binding.buffer.raw())?;
+                context.set_tensor_address(&self.names[index], binding.buffer.raw())?;
             }
         }
 
         // SAFETY: every tensor is bound to a large enough live buffer and the
         // stream is live; the borrows outlast the synchronization.
-        unsafe { self.context.enqueue(stream.raw())? };
+        unsafe { context.enqueue(stream.raw())? };
         stream.synchronize()?;
 
         if let Some(shapes) = &mut self.shapes
             && shapes.insert(input_shapes)
         {
-            self.last_new_shape = Some(Instant::now());
+            live.last_new_shape = Some(Instant::now());
+            if !live.saving {
+                live.saving = true;
+                drop(live);
+                self.start_saver()?;
+            }
         }
-        self.save_runtime_cache(false);
         Ok(())
     }
 
-    /// Saves kernels compiled since the last save while a new shape's
-    /// background compilation may still be running. A failed save only costs
-    /// the next process a recompile, so it is logged rather than returned.
-    fn save_runtime_cache(&mut self, now: bool) {
-        let Some(last_new_shape) = self.last_new_shape else {
-            return;
-        };
-        if !now && self.last_save.elapsed() < CACHE_SAVE_INTERVAL {
-            return;
+    /// Starts a thread that saves the runtime cache until the save window
+    /// after the latest new shape closes.
+    fn start_saver(&mut self) -> Result<()> {
+        if let Some(saver) = self.saver.take() {
+            // It has cleared `saving`, so it is exiting.
+            let _ = saver.thread.join();
         }
-        if let Err(error) = self
-            .context
-            .runtime_cache()
-            .and_then(|bytes| write_atomic(&self.cache_path, &bytes))
-        {
-            tracing::warn!(%error, "failed to save the TensorRT-RTX runtime cache");
-        }
-        self.last_save = Instant::now();
-        if last_new_shape.elapsed() >= CACHE_SAVE_WINDOW {
-            self.last_new_shape = None;
+        let (stop, stopped) = mpsc::channel();
+        let live = Arc::clone(&self.live);
+        let device = self.device;
+        let spawned = thread::Builder::new()
+            .name("tensorrt-cache".into())
+            .spawn(move || {
+                if let Err(error) = cuda::set_device(device) {
+                    tracing::warn!(%error, "TensorRT-RTX cache saver cannot select the GPU");
+                }
+                while let Err(mpsc::RecvTimeoutError::Timeout) =
+                    stopped.recv_timeout(CACHE_SAVE_INTERVAL)
+                {
+                    let Ok(mut live) = live.lock() else { return };
+                    live.save();
+                    if live
+                        .last_new_shape
+                        .is_none_or(|shape| shape.elapsed() >= CACHE_SAVE_WINDOW)
+                    {
+                        live.last_new_shape = None;
+                        live.saving = false;
+                        return;
+                    }
+                }
+            });
+        match spawned {
+            Ok(thread) => {
+                self.saver = Some(Saver { stop, thread });
+                Ok(())
+            }
+            Err(error) => {
+                // Only the next process's warm start depends on the saver;
+                // `Drop` still saves.
+                tracing::warn!(%error, "failed to start the TensorRT-RTX cache saver");
+                lock(&self.live)?.saving = false;
+                Ok(())
+            }
         }
     }
 }
 
+impl Live {
+    /// Writes kernels compiled since the last save. A failed save only costs
+    /// the next process a recompile, so it is logged rather than returned.
+    /// The lock keeps it apart from runs, while TensorRT-RTX's background
+    /// compilation may still be adding to the cache.
+    fn save(&mut self) {
+        let result = self.context.runtime_cache().and_then(|bytes| {
+            if bytes != self.saved {
+                write_atomic(&self.cache_path, &bytes)?;
+                self.saved = bytes;
+            }
+            Ok(())
+        });
+        if let Err(error) = result {
+            tracing::warn!(%error, "failed to save the TensorRT-RTX runtime cache");
+        }
+    }
+}
+
+fn lock(live: &Mutex<Live>) -> Result<MutexGuard<'_, Live>> {
+    live.lock()
+        .map_err(|_| anyhow!("TensorRT-RTX session lock is poisoned"))
+}
+
 impl Drop for Session {
     fn drop(&mut self) {
-        self.save_runtime_cache(true);
+        if let Some(Saver { stop, thread }) = self.saver.take() {
+            drop(stop);
+            let _ = thread.join();
+        }
+        if self.shapes.is_some()
+            && let Ok(mut live) = self.live.lock()
+        {
+            live.save();
+        }
     }
 }
 

@@ -116,13 +116,31 @@ impl Drop for Stream {
     }
 }
 
+mod sealed {
+    pub trait Sealed {}
+}
+
+/// A primitive type every bit pattern of which is a valid value, so device
+/// bytes can be copied into it.
+pub trait Element: Copy + sealed::Sealed {}
+
+macro_rules! elements {
+    ($($type:ty),*) => {
+        $(
+            impl sealed::Sealed for $type {}
+            impl Element for $type {}
+        )*
+    };
+}
+
+elements!(f32, f64, i8, i16, i32, i64, u8, u16, u32, u64);
+
 /// Device memory owned by Rust.
 ///
-/// Host transfers are ordered on a [`Stream`]. Copies from pageable host
-/// memory return once the source is staged and copies to it return once the
-/// data has arrived, so a host slice is never read or written after its
-/// borrow ends. Dropping the buffer frees it with `cudaFree`, which waits for
-/// work still using it.
+/// Host transfers are ordered on a [`Stream`] and wait for it before
+/// returning, so a host slice is never read or written after its borrow
+/// ends. Dropping the buffer frees it with `cudaFree`, which waits for work
+/// still using it.
 #[derive(Debug)]
 pub struct DeviceBuffer {
     raw: *mut c_void,
@@ -156,8 +174,8 @@ impl DeviceBuffer {
         self.len == 0
     }
 
-    /// Copies `data` to the start of the buffer.
-    pub fn upload<T: Copy>(&mut self, data: &[T], stream: &Stream) -> Result<()> {
+    /// Copies `data` to the start of the buffer, waiting for the stream.
+    pub fn upload<T: Element>(&mut self, data: &[T], stream: &Stream) -> Result<()> {
         let bytes = std::mem::size_of_val(data);
         ensure!(
             bytes <= self.len,
@@ -166,7 +184,7 @@ impl DeviceBuffer {
         );
         let cudart = crate::cudart()?;
         // SAFETY: the destination holds `bytes` bytes and the source is a live
-        // slice; see the type's note on host lifetimes.
+        // slice; the stream is synchronized before the borrow of `data` ends.
         check(
             cudart,
             unsafe {
@@ -179,11 +197,14 @@ impl DeviceBuffer {
                 )
             },
             "cudaMemcpyAsync",
-        )
+        )?;
+        // A copy from pageable memory may still be reading `data` when
+        // cudaMemcpyAsync returns.
+        stream.synchronize()
     }
 
     /// Copies the start of the buffer into `data`, waiting for the stream.
-    pub fn download<T: Copy>(&self, data: &mut [T], stream: &Stream) -> Result<()> {
+    pub fn download<T: Element>(&self, data: &mut [T], stream: &Stream) -> Result<()> {
         let bytes = std::mem::size_of_val(data);
         ensure!(
             bytes <= self.len,
@@ -191,8 +212,9 @@ impl DeviceBuffer {
             self.len
         );
         let cudart = crate::cudart()?;
-        // SAFETY: as in `upload`, with the stream synchronized before the
-        // borrow of `data` ends.
+        // SAFETY: the source holds `bytes` bytes, `data` is a live slice of a
+        // type valid for any bytes, and the stream is synchronized before its
+        // borrow ends.
         check(
             cudart,
             unsafe {
