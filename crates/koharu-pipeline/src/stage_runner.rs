@@ -212,7 +212,7 @@ mod tests {
             "Non-zero status code returned while running Conv node. Status Message: \
              bfc_arena.cc:359 Failed to allocate memory for requested buffer of size 268435456"
         )
-        .context("waifu2x-cunet failed");
+        .context("comic-text-bubble-detector failed");
         assert!(is_out_of_memory(&error));
     }
 }

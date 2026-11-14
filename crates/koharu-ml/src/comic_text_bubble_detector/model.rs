@@ -42,7 +42,7 @@ impl Model {
         // matches the CPU to 0.02 px. The 43M-parameter network is cheap at
         // FP32.
         Ok(Self {
-            session: onnx_session(device, path, false, Shapes::Fixed)?,
+            session: onnx_session(device, path, Shapes::Fixed)?,
         })
     }
 

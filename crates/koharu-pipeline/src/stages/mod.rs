@@ -2,7 +2,6 @@ mod detection;
 mod inpainting;
 mod ocr;
 mod translation;
-mod upscaling;
 
 use std::{collections::BTreeSet, sync::Arc};
 
@@ -82,7 +81,6 @@ pub(crate) struct Stages {
     ocr: ocr::Processor,
     translation: translation::Processor,
     inpainting: inpainting::Processor,
-    upscaling: upscaling::Processor,
 }
 
 impl Stages {
@@ -96,7 +94,6 @@ impl Stages {
             ocr: ocr::Processor::new(config.ocr.clone(), device.clone()),
             translation: translation::Processor::new(config.translation.clone(), translator),
             inpainting: inpainting::Processor::new(config.inpainting()?, device.clone())?,
-            upscaling: upscaling::Processor::new(device.clone()),
         })
     }
 
@@ -106,7 +103,6 @@ impl Stages {
             Stage::Ocr => &self.ocr,
             Stage::Translation => &self.translation,
             Stage::Inpainting => &self.inpainting,
-            Stage::Upscaling => &self.upscaling,
         }
     }
 
@@ -177,7 +173,6 @@ mod tests {
                 "paddleocr-vl-1.6",
                 "translator",
                 "lama",
-                "waifu2x-cunet",
             ]
         );
     }
