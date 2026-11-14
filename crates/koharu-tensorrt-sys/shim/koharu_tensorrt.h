@@ -47,10 +47,22 @@ const void *ktrt_blob_data(const ktrt_blob *blob);
 size_t ktrt_blob_size(const ktrt_blob *blob);
 void ktrt_blob_free(ktrt_blob *blob);
 
+/* The extents a dynamic input may take: every run's shape must lie between
+ * `min` and `max`, and kernels are tuned for `opt`. Each array holds `rank`
+ * extents. */
+typedef struct ktrt_shape_range {
+    const char *name;
+    int32_t rank;
+    const int64_t *min;
+    const int64_t *opt;
+    const int64_t *max;
+} ktrt_shape_range;
+
 /* Parses an ONNX file into a strongly typed network and builds a serialized
  * engine. Building needs no GPU; kernels are compiled when a context is
- * created. */
-ktrt_blob *ktrt_build_onnx(const char *path);
+ * created. A network with dynamic inputs needs a range for each of them,
+ * which together form its one optimization profile. */
+ktrt_blob *ktrt_build_onnx(const char *path, const ktrt_shape_range *ranges, int32_t range_count);
 
 ktrt_runtime *ktrt_runtime_create(void);
 void ktrt_runtime_free(ktrt_runtime *runtime);

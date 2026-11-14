@@ -54,7 +54,7 @@ impl Network {
             .iter()
             .map(|&size| {
                 let onnx = directory.join(format!("lama-manga-{size}.onnx"));
-                let session = crate::backend::tensorrt_session(device, &onnx, "lama")?;
+                let session = crate::backend::tensorrt_session(device, &onnx, "lama", true, &[])?;
                 let pixels = size as usize * size as usize;
                 Ok(Engine {
                     size,

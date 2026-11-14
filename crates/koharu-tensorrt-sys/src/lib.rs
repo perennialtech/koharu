@@ -46,6 +46,16 @@ pub struct ktrt_entry_points {
     pub log: Option<ktrt_log_fn>,
 }
 
+/// Mirrors `ktrt_shape_range`: the extents a dynamic input may take.
+#[repr(C)]
+pub struct ktrt_shape_range {
+    pub name: *const c_char,
+    pub rank: i32,
+    pub min: *const i64,
+    pub opt: *const i64,
+    pub max: *const i64,
+}
+
 unsafe extern "C" {
     pub fn ktrt_init(entry_points: *const ktrt_entry_points) -> i32;
     pub fn ktrt_last_error() -> *const c_char;
@@ -55,7 +65,11 @@ unsafe extern "C" {
     pub fn ktrt_blob_size(blob: *const ktrt_blob) -> usize;
     pub fn ktrt_blob_free(blob: *mut ktrt_blob);
 
-    pub fn ktrt_build_onnx(path: *const c_char) -> *mut ktrt_blob;
+    pub fn ktrt_build_onnx(
+        path: *const c_char,
+        ranges: *const ktrt_shape_range,
+        range_count: i32,
+    ) -> *mut ktrt_blob;
 
     pub fn ktrt_runtime_create() -> *mut ktrt_runtime;
     pub fn ktrt_runtime_free(runtime: *mut ktrt_runtime);

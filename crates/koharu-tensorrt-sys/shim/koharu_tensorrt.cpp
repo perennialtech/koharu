@@ -110,7 +110,7 @@ void ktrt_blob_free(ktrt_blob *blob) {
     delete blob;
 }
 
-ktrt_blob *ktrt_build_onnx(char const *path) {
+ktrt_blob *ktrt_build_onnx(char const *path, ktrt_shape_range const *ranges, int32_t range_count) {
     if (!initialized()) {
         return nullptr;
     }
@@ -147,6 +147,26 @@ ktrt_blob *ktrt_build_onnx(char const *path) {
     if (!config) {
         fail("failed to create a TensorRT-RTX builder configuration");
         return nullptr;
+    }
+    if (range_count > 0) {
+        // Owned by the builder.
+        nvinfer1::IOptimizationProfile *profile = builder->createOptimizationProfile();
+        for (int32_t i = 0; i < range_count; ++i) {
+            ktrt_shape_range const &range = ranges[i];
+            if (range.rank < 0 || range.rank > nvinfer1::Dims::MAX_DIMS ||
+                !profile->setDimensions(range.name, nvinfer1::OptProfileSelector::kMIN, dims_from(range.min, range.rank)) ||
+                !profile->setDimensions(range.name, nvinfer1::OptProfileSelector::kOPT, dims_from(range.opt, range.rank)) ||
+                !profile->setDimensions(range.name, nvinfer1::OptProfileSelector::kMAX, dims_from(range.max, range.rank))) {
+                std::string message = "invalid shape range for ";
+                message += range.name;
+                fail(message);
+                return nullptr;
+            }
+        }
+        if (config->addOptimizationProfile(profile) < 0) {
+            fail("TensorRT-RTX rejected the optimization profile");
+            return nullptr;
+        }
     }
     std::unique_ptr<nvinfer1::IHostMemory> memory{builder->buildSerializedNetwork(*network, *config)};
     if (!memory) {

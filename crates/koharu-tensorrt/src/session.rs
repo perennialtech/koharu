@@ -11,7 +11,7 @@ use std::{
 use anyhow::{Context as _, Result, bail, ensure};
 
 use crate::{
-    DeviceBuffer, Stream, TensorInfo, cuda,
+    DeviceBuffer, ShapeRange, Stream, TensorInfo, cuda,
     engine::{self, Engine, ExecutionContext},
 };
 
@@ -57,8 +57,15 @@ impl Session {
     /// TensorRT-RTX version, and the runtime cache additionally by the GPU's
     /// compute capability and the driver version, since compiled kernels are
     /// specific to both. With `cuda_graph`, runs replay a captured CUDA graph.
+    /// `ranges` bounds each dynamic input and is part of the engine's key.
     #[tracing::instrument(level = "info", skip_all, fields(model = %onnx.display()))]
-    pub fn open(onnx: &Path, cache_dir: &Path, device: u32, cuda_graph: bool) -> Result<Self> {
+    pub fn open(
+        onnx: &Path,
+        cache_dir: &Path,
+        device: u32,
+        cuda_graph: bool,
+        ranges: &[ShapeRange<'_>],
+    ) -> Result<Self> {
         crate::cudart()?;
         cuda::set_device(device)?;
         fs::create_dir_all(cache_dir)
@@ -68,10 +75,10 @@ impl Session {
             onnx.file_stem()
                 .and_then(|stem| stem.to_str())
                 .unwrap_or("model"),
-            content_hash(onnx)?,
+            content_hash(onnx, ranges)?,
             crate::version()?
         );
-        let engine = load_engine(onnx, &cache_dir.join(format!("{key}.engine")))?;
+        let engine = load_engine(onnx, ranges, &cache_dir.join(format!("{key}.engine")))?;
 
         let (major, minor) = cuda::compute_capability(device)?;
         let cache_path = cache_dir.join(format!(
@@ -189,7 +196,7 @@ impl Session {
     }
 }
 
-fn load_engine(onnx: &Path, path: &Path) -> Result<Engine> {
+fn load_engine(onnx: &Path, ranges: &[ShapeRange<'_>], path: &Path) -> Result<Engine> {
     if let Ok(bytes) = fs::read(path) {
         match Engine::deserialize(&bytes) {
             Ok(engine) => return Ok(engine),
@@ -197,7 +204,7 @@ fn load_engine(onnx: &Path, path: &Path) -> Result<Engine> {
         }
     }
     let started = Instant::now();
-    let bytes = engine::build(onnx)?;
+    let bytes = engine::build(onnx, ranges)?;
     tracing::info!(
         elapsed_ms = started.elapsed().as_millis(),
         bytes = bytes.len(),
@@ -207,11 +214,20 @@ fn load_engine(onnx: &Path, path: &Path) -> Result<Engine> {
     Engine::deserialize(&bytes)
 }
 
-fn content_hash(path: &Path) -> Result<String> {
+fn content_hash(path: &Path, ranges: &[ShapeRange<'_>]) -> Result<String> {
     let mut hasher = blake3::Hasher::new();
     let mut file =
         fs::File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
     io::copy(&mut file, &mut hasher)?;
+    for range in ranges {
+        hasher.update(range.name.as_bytes());
+        for extents in [range.min, range.opt, range.max] {
+            hasher.update(&(extents.len() as u64).to_le_bytes());
+            for extent in extents {
+                hasher.update(&extent.to_le_bytes());
+            }
+        }
+    }
     Ok(hasher.finalize().to_hex()[..16].to_owned())
 }
 
