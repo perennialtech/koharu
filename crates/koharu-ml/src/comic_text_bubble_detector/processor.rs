@@ -3,8 +3,11 @@
 //! https://github.com/huggingface/transformers/blob/v4.57.6/src/transformers/models/rt_detr/image_processing_rt_detr.py
 
 use anyhow::{Result, anyhow, ensure};
-use fast_image_resize::{FilterType, ResizeAlg, ResizeOptions, pixels::U8x3};
-use image::{DynamicImage, RgbImage};
+use fast_image_resize::{
+    FilterType, ResizeAlg, ResizeOptions,
+    pixels::{U8x3, U8x4},
+};
+use image::{DynamicImage, RgbImage, RgbaImage};
 use serde::Serialize;
 
 use super::model::{NUM_LABELS, NUM_QUERIES, Output, SIZE};
@@ -47,17 +50,35 @@ pub(super) fn preprocess(image: &DynamicImage) -> Result<Vec<f32>> {
         image.width() > 0 && image.height() > 0,
         "cannot detect bubbles in an empty image"
     );
-    let image = image.to_rgb8();
-    let mut resized = RgbImage::new(SIZE as u32, SIZE as u32);
-    crate::resize_image::<U8x3>(
-        &image,
-        &mut resized,
-        &ResizeOptions::new().resize_alg(ResizeAlg::Convolution(FilterType::Bilinear)),
-    )
-    .map_err(|error| anyhow!("failed to resize image for bubble detection: {error}"))?;
+    let options = ResizeOptions::new().resize_alg(ResizeAlg::Convolution(FilterType::Bilinear));
+    let failed = |error| anyhow!("failed to resize image for bubble detection: {error}");
+    let (resized, stride) = match image {
+        // The filter runs on each channel independently, so resizing RGBA
+        // without alpha weighting and then dropping alpha equals converting
+        // with `to_rgb8` first.
+        DynamicImage::ImageRgba8(image) => {
+            let mut resized = RgbaImage::new(SIZE as u32, SIZE as u32);
+            crate::resize_image::<U8x4>(image, &mut resized, &options.use_alpha(false))
+                .map_err(failed)?;
+            (resized.into_raw(), 4)
+        }
+        image => {
+            let converted;
+            let source = match image {
+                DynamicImage::ImageRgb8(image) => image,
+                image => {
+                    converted = image.to_rgb8();
+                    &converted
+                }
+            };
+            let mut resized = RgbImage::new(SIZE as u32, SIZE as u32);
+            crate::resize_image::<U8x3>(source, &mut resized, &options).map_err(failed)?;
+            (resized.into_raw(), 3)
+        }
+    };
     let plane = SIZE * SIZE;
     let mut pixel_values = vec![0.0; 3 * plane];
-    for (index, pixel) in resized.as_raw().as_chunks::<3>().0.iter().enumerate() {
+    for (index, pixel) in resized.chunks_exact(stride).enumerate() {
         for channel in 0..3 {
             pixel_values[channel * plane + index] = f32::from(pixel[channel]) / 255.0;
         }
@@ -117,4 +138,28 @@ pub(super) fn postprocess(
             })
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use image::{DynamicImage, Rgba, RgbaImage};
+
+    use super::preprocess;
+
+    #[test]
+    fn rgba_preprocessing_matches_rgb() {
+        // Downsampled along y and upsampled along x, with alpha that must be
+        // ignored.
+        let rgba = DynamicImage::ImageRgba8(RgbaImage::from_fn(503, 1777, |x, y| {
+            Rgba([
+                (x * 7 + y * 3) as u8,
+                (x * y) as u8,
+                (x ^ y) as u8,
+                (x + y) as u8,
+            ])
+        }));
+        let rgb = DynamicImage::ImageRgb8(rgba.to_rgb8());
+
+        assert_eq!(preprocess(&rgba).unwrap(), preprocess(&rgb).unwrap());
+    }
 }

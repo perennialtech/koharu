@@ -12,17 +12,19 @@ use std::path::Path;
 
 use anyhow::{Result, ensure};
 use ort::{
-    session::Session,
+    memory::{AllocationDevice, Allocator, AllocatorType, MemoryInfo, MemoryType},
+    session::{HasSelectedOutputs, OutputSelector, RunOptions, Session},
     value::{Tensor, TensorRef},
 };
 
-use crate::{Device, backend::onnx_session};
+use crate::{Backend, Device, backend::onnx_session};
 
 pub(super) const RESOLUTION: usize = 1920;
 pub(super) const MASK_RESOLUTION: usize = RESOLUTION / 4;
 pub(super) const NUM_QUERIES: usize = 300;
 pub(super) const NUM_CLASSES_WITH_BACKGROUND: usize = 5;
 const HIDDEN_DIM: usize = 256;
+const SPATIAL_RESOLUTION: usize = RESOLUTION / 12;
 
 #[derive(Debug)]
 pub(super) struct Output {
@@ -30,16 +32,29 @@ pub(super) struct Output {
     pub pred_logits: Vec<f32>,
     /// Normalized `cx, cy, w, h`, `[NUM_QUERIES, 4]`.
     pub pred_boxes: Vec<f32>,
-    /// Backbone level-0 features, `[1, HIDDEN_DIM, RESOLUTION / 12, RESOLUTION / 12]`.
+    /// Backbone level-0 features, `[1, HIDDEN_DIM, SPATIAL_RESOLUTION, SPATIAL_RESOLUTION]`,
+    /// in device memory on CUDA.
     spatial_features: Tensor<f32>,
     /// Final decoder layer query features, `[NUM_QUERIES, HIDDEN_DIM]`.
     query_features: Vec<f32>,
 }
 
-#[derive(Debug)]
 pub(super) struct Model {
+    // Declared before the sessions so the device buffer it holds is released
+    // before the session that allocated it.
+    network_options: RunOptions<HasSelectedOutputs>,
     network: Session,
     mask_head: Session,
+}
+
+impl std::fmt::Debug for Model {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("Model")
+            .field("network", &self.network)
+            .field("mask_head", &self.mask_head)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Model {
@@ -49,8 +64,31 @@ impl Model {
         // fixture scores 0.61 instead of 0.95. TF32 is excluded too: it adds
         // and drops detections against FP32 on the hard pages at no
         // measurable speed gain.
+        let network = onnx_session(device, network, false)?;
+        // On CUDA the spatial features stay on the device for the mask head
+        // instead of a round trip through host memory.
+        let mut outputs = OutputSelector::default();
+        if device.backend == Backend::Cuda {
+            let allocator = Allocator::new(
+                &network,
+                MemoryInfo::new(
+                    AllocationDevice::CUDA,
+                    i32::try_from(device.index)?,
+                    AllocatorType::Device,
+                    MemoryType::Default,
+                )?,
+            )?;
+            outputs = outputs.preallocate(
+                "spatial_features",
+                Tensor::<f32>::new(
+                    &allocator,
+                    [1, HIDDEN_DIM, SPATIAL_RESOLUTION, SPATIAL_RESOLUTION],
+                )?,
+            );
+        }
         Ok(Self {
-            network: onnx_session(device, network, false)?,
+            network_options: RunOptions::new()?.with_outputs(outputs),
+            network,
             mask_head: onnx_session(device, mask_head, false)?,
         })
     }
@@ -58,7 +96,9 @@ impl Model {
     /// Runs the detector on normalized planar `[1, 3, RESOLUTION, RESOLUTION]` RGB.
     pub(super) fn forward(&mut self, pixel_values: &[f32]) -> Result<Output> {
         let input = TensorRef::from_array_view(([1, 3, RESOLUTION, RESOLUTION], pixel_values))?;
-        let mut outputs = self.network.run(ort::inputs![input])?;
+        let mut outputs = self
+            .network
+            .run_with_options(ort::inputs![input], &self.network_options)?;
         let (shape, pred_logits) = outputs["pred_logits"].try_extract_tensor::<f32>()?;
         ensure!(
             shape.as_ref() == [1, NUM_QUERIES as i64, NUM_CLASSES_WITH_BACKGROUND as i64],

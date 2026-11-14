@@ -26,6 +26,7 @@ fast_image_resize = { workspace = true }
 minijinja = { workspace = true }
 minijinja-contrib = { workspace = true }
 ort = { workspace = true }
+rayon = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
