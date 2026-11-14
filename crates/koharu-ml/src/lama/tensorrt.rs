@@ -8,17 +8,32 @@
 //! upsampling deconvolutions, which run in FP16 because TensorRT-RTX 1.7 has
 //! no BF16 deconvolution on Ampere.
 
-use std::{path::Path, sync::Mutex};
+use std::sync::Mutex;
 
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow};
 use image::{GrayImage, RgbImage};
 use koharu_tensorrt::{Binding, DeviceBuffer, Session, Stream};
 use rayon::prelude::*;
+
+// Exports of mayocream/lama-manga (the weights LaMa::load pins); the
+// repository holds the export scripts.
+crate::model_repository!("8q0sb/koharu-onnx" @ "86d109e3410b5d7d528e845eb966512e58bb17bd" {
+    ENGINE_512X512 = "lama-manga/lama-manga-512x512.onnx",
+    ENGINE_512X768 = "lama-manga/lama-manga-512x768.onnx",
+    ENGINE_768X512 = "lama-manga/lama-manga-768x512.onnx",
+    ENGINE_768X768 = "lama-manga/lama-manga-768x768.onnx",
+});
 
 /// Engine shapes as (width, height). Pipeline tiles are at most 768 px on a
 /// side and most are wider or taller than 512, so the two oblong shapes cut
 /// the pixels run per tile by about a seventh against squares alone.
 const SHAPES: [(u32, u32); 4] = [(512, 512), (512, 768), (768, 512), (768, 768)];
+const EXPORTS: [koharu_runtime::HuggingFaceFile<'static>; 4] = [
+    ENGINE_512X512,
+    ENGINE_512X768,
+    ENGINE_768X512,
+    ENGINE_768X768,
+];
 
 /// The smallest engine shape that holds a `width` x `height` crop.
 pub(super) fn crop_size(width: u32, height: u32) -> Option<(u32, u32)> {
@@ -52,15 +67,27 @@ impl std::fmt::Debug for Network {
 }
 
 impl Network {
-    /// Opens `lama-manga-<width>x<height>.onnx` from `directory` for each
-    /// shape.
-    pub(super) fn load(directory: &Path, device: u32) -> Result<Self> {
+    /// Opens one engine per shape, building it on first use.
+    pub(super) async fn load(device: u32) -> Result<Self> {
+        let mut exports = Vec::with_capacity(EXPORTS.len());
+        for export in EXPORTS {
+            exports.push(
+                export
+                    .resolve()
+                    .await
+                    .context("failed to resolve a LaMa export")?,
+            );
+        }
+        tokio_rayon::spawn(move || Self::open(device, &exports)).await
+    }
+
+    fn open(device: u32, exports: &[std::path::PathBuf]) -> Result<Self> {
         let stream = Stream::new(device)?;
         let engines = SHAPES
             .iter()
-            .map(|&(width, height)| {
-                let onnx = directory.join(format!("lama-manga-{width}x{height}.onnx"));
-                let session = crate::backend::tensorrt_session(device, &onnx, "lama", true, &[])?;
+            .zip(exports)
+            .map(|(&(width, height), onnx)| {
+                let session = crate::backend::tensorrt_session(device, onnx, "lama", true, &[])?;
                 let pixels = width as usize * height as usize;
                 Ok(Engine {
                     shape: (width, height),

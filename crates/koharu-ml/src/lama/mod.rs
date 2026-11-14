@@ -5,8 +5,6 @@ mod model;
 mod processor;
 mod tensorrt;
 
-use std::path::PathBuf;
-
 use anyhow::{Context, Result};
 use image::{DynamicImage, GrayImage, RgbImage};
 use koharu_runtime::Backend;
@@ -20,11 +18,6 @@ use self::{config::FFCResNetGeneratorConfig, model::Model, processor::InpaintMod
 crate::model_repository!("mayocream/lama-manga" @ "f91c85b26913b3e83f9877867b4c336da3675238" {
     WEIGHTS = "lama-manga.safetensors"
 });
-
-/// Prototype only: a directory with the fixed-shape TensorRT-RTX exports
-/// (`lama-manga-<size>.onnx`). Shipping this needs the exports published as
-/// pinned files of the model repository.
-const TENSORRT_ONNX: &str = "KOHARU_LAMA_TENSORRT_ONNX";
 
 #[derive(Debug)]
 pub struct LaMa {
@@ -43,11 +36,12 @@ enum Network {
 impl LaMa {
     pub async fn load(device: crate::Device) -> Result<Self> {
         // The TensorRT exports are BF16, which needs Ampere or newer.
-        if let Some(directory) = std::env::var_os(TENSORRT_ONNX).map(PathBuf::from)
-            && device.backend == Backend::Cuda
+        if device.backend == Backend::Cuda
             && device.compute_capability() >= 80
+            && crate::initialized(crate::Feature::TensorRt)
         {
-            let network = tensorrt::Network::load(&directory, u32::try_from(device.index)?)
+            let network = tensorrt::Network::load(u32::try_from(device.index)?)
+                .await
                 .context("failed to load LaMa on TensorRT-RTX")?;
             return Ok(Self {
                 network: Network::TensorRt(network),
