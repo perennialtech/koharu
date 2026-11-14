@@ -49,9 +49,6 @@ impl Operation {
             Self::Through {
                 stage: Stage::Inpainting,
             } => vec![Stage::Detection, Stage::Inpainting],
-            Self::Through {
-                stage: Stage::Upscaling,
-            } => vec![Stage::Upscaling],
             Self::Only { stage } => vec![*stage],
             Self::Stages { stages } => Stage::ALL
                 .into_iter()

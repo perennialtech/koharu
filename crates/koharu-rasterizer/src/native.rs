@@ -47,9 +47,7 @@ impl From<DownsampleFilter> for ResizeAlg {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RasterOptions {
-    /// Output pixels per frame unit.
-    pub output_scale: u32,
-    /// Render passes at this multiple of the output and downsample to it.
+    /// Render passes at this multiple of the frame size and downsample to it.
     pub supersampling_factor: u32,
     pub downsample_filter: DownsampleFilter,
 }
@@ -65,25 +63,18 @@ impl RasterOptions {
 
     fn surface(self, width: u32, height: u32) -> AnyResult<Surface> {
         checked_surface(width, height)?;
-        if self.output_scale == 0 {
-            bail!("invalid raster output scale 0");
-        }
-        let supersampling = self.supersampling_factor.clamp(1, MAX_SUPERSAMPLING_FACTOR);
-        let scale = self
-            .output_scale
-            .checked_mul(supersampling)
-            .context("raster scale overflow")?;
-        let size = |length: u32, scale: u32| {
+        let scale = self.supersampling_factor.clamp(1, MAX_SUPERSAMPLING_FACTOR);
+        let size = |length: u32| {
             length
                 .checked_mul(scale)
                 .context("render surface size overflow")
         };
         Ok(Surface {
             scale,
-            width: size(width, self.output_scale)?,
-            height: size(height, self.output_scale)?,
-            raster_width: size(width, scale)?,
-            raster_height: size(height, scale)?,
+            width,
+            height,
+            raster_width: size(width)?,
+            raster_height: size(height)?,
         })
     }
 }
@@ -101,7 +92,6 @@ struct Surface {
 impl Default for RasterOptions {
     fn default() -> Self {
         Self {
-            output_scale: 1,
             supersampling_factor: 1,
             downsample_filter: DownsampleFilter::Lanczos3,
         }

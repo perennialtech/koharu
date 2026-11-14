@@ -13,7 +13,7 @@ use anyhow::{Context, Result};
 use axum::body::Bytes;
 use koharu_config::Config;
 use koharu_pipeline::{
-    Committer, InpaintingModel, Operation, Pipeline, PipelineError, Request as PipelineRequest,
+    Committer, InpaintingModel, Pipeline, PipelineError, Request as PipelineRequest,
     RequestTranslation, RunStatus, Scope, StageOutput, StopToken,
 };
 use koharu_rasterizer::{RasterOptions, Rasterizer};
@@ -145,7 +145,6 @@ impl Worker {
         stop: &StopToken,
         replies: &mpsc::UnboundedSender<(Reply, Bytes)>,
     ) -> Result<Option<Bytes>> {
-        let stages = input.stages();
         let Input {
             source,
             media_type,
@@ -154,7 +153,6 @@ impl Worker {
             language,
             instructions,
             engines,
-            scale,
         } = input;
         let mut session = Session::memory().await?;
         let mut page = None;
@@ -189,7 +187,6 @@ impl Worker {
             .execute(
                 snapshot,
                 PipelineRequest {
-                    operation: Operation::Stages { stages },
                     scope: Scope::Pages(vec![page]),
                     translation: Some(RequestTranslation {
                         target_language: language,
@@ -217,13 +214,7 @@ impl Worker {
         let frame = frame.raster_frame()?;
         let rasterizer = self.rasterizer.clone();
         tokio::task::spawn_blocking(move || {
-            let raster = rasterizer.rasterize(
-                &frame,
-                RasterOptions {
-                    output_scale: scale,
-                    ..RasterOptions::default()
-                },
-            )?;
+            let raster = rasterizer.rasterize(&frame, RasterOptions::default())?;
             Ok(Some(Bytes::from(raster.encode_png()?)))
         })
         .await?

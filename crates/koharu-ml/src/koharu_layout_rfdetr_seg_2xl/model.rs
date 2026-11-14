@@ -72,7 +72,7 @@ impl Model {
         // attention the column keeps its width and the panel scores 0.76,
         // inside the 0.70-0.97 that dither gives at FP32. TF32 gives no
         // speedup on that GPU.
-        let network = onnx_session(device, network, false, Shapes::Fixed)?;
+        let network = onnx_session(device, network, Shapes::Fixed)?;
         // On CUDA the spatial features stay on the device for the mask head
         // instead of a round trip through host memory.
         let mut outputs = OutputSelector::default();
@@ -97,7 +97,7 @@ impl Model {
         Ok(Self {
             network_options: RunOptions::new()?.with_outputs(outputs),
             network,
-            mask_head: onnx_session(device, mask_head, false, Shapes::Dynamic)?,
+            mask_head: onnx_session(device, mask_head, Shapes::Dynamic)?,
         })
     }
 

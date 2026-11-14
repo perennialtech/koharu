@@ -25,17 +25,6 @@ pub(crate) struct Input {
     pub(crate) language: Language,
     pub(crate) instructions: Option<String>,
     pub(crate) engines: Option<Vec<Provider>>,
-    /// Result pixels per source pixel.
-    pub(crate) scale: u32,
-}
-
-impl Input {
-    pub(crate) fn stages(&self) -> Vec<Stage> {
-        Stage::ALL
-            .into_iter()
-            .filter(|&stage| stage != Stage::Upscaling || self.scale > 1)
-            .collect()
-    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, ToSchema)]
@@ -212,7 +201,7 @@ pub(crate) struct Job {
 
 impl Job {
     fn new(id: Uuid, input: Input) -> Self {
-        let stages = input.stages();
+        let stages = Stage::ALL;
         Self {
             state: watch::Sender::new(JobState {
                 view: Translation {

@@ -191,7 +191,6 @@ mod tests {
             language: Language::English,
             instructions: instructions.map(ToOwned::to_owned),
             engines: None,
-            scale: 1,
         }
     }
 
