@@ -207,10 +207,10 @@ async fn infer_text<M: Send + 'static>(
 }
 
 // PaddleOCR-VL reads a column of dots, as in a silent reaction balloon, as
-// boxes, circles or emoji, sometimes mixed with dots it read correctly.
-// Normalize only text made entirely of such symbols and dots, with at least one
-// symbol, so ordinary OCR output, dots read as dots, and hearts and notes used
-// as lettering are preserved.
+// boxes, circles or emoji, sometimes mixed with middle dots it read correctly.
+// Normalize only text made entirely of such symbols and middle dots, with at
+// least one symbol, so ordinary OCR output, dots read as dots, masked words
+// such as ○○…, and hearts and notes used as lettering are preserved.
 fn normalize_ocr_text(text: String) -> String {
     let visible = text
         .chars()
@@ -221,19 +221,12 @@ fn normalize_ocr_text(text: String) -> String {
         && visible
             .iter()
             .copied()
-            .all(|character| misread_dot(character) || dot(character))
+            .all(|character| misread_dot(character) || matches!(character, '・' | '･' | '·'))
     {
         "…".to_owned()
     } else {
         text
     }
-}
-
-fn dot(character: char) -> bool {
-    matches!(
-        character,
-        '・' | '･' | '·' | '.' | '。' | '｡' | '…' | '‥' | '⋮' | '︙'
-    )
 }
 
 fn misread_dot(character: char) -> bool {
@@ -312,6 +305,7 @@ mod tests {
             "♡♡",
             "♪♪",
             "♡・",
+            "○○…",
             "☐",
             "●待って",
         ] {
