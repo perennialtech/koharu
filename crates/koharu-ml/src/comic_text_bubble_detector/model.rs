@@ -12,7 +12,10 @@ use std::path::Path;
 use anyhow::{Result, ensure};
 use ort::{session::Session, value::TensorRef};
 
-use crate::{Device, backend::onnx_session};
+use crate::{
+    Device,
+    backend::{Shapes, onnx_session},
+};
 
 pub(super) const NUM_LABELS: usize = 3;
 pub(super) const NUM_QUERIES: usize = 300;
@@ -39,7 +42,7 @@ impl Model {
         // matches the CPU to 0.02 px. The 43M-parameter network is cheap at
         // FP32.
         Ok(Self {
-            session: onnx_session(device, path, false)?,
+            session: onnx_session(device, path, false, Shapes::Fixed)?,
         })
     }
 

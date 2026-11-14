@@ -9,7 +9,10 @@ use anyhow::{Context, Result, ensure};
 use image::RgbImage;
 use ort::{session::Session, value::TensorRef};
 
-use crate::{Device, backend::onnx_session};
+use crate::{
+    Device,
+    backend::{Shapes, onnx_session},
+};
 
 crate::model_repository!("deepghs/waifu2x_onnx" @ "333b95cc88a6a9f39abb6426ab580f0d673f1185" {
     MODEL = "20250502/onnx_models/cunet/art/noise0_scale2x.onnx"
@@ -35,9 +38,10 @@ impl Waifu2x {
             .resolve()
             .await
             .context("failed to resolve waifu2x model")?;
-        let session = tokio_rayon::spawn(move || onnx_session(&device, &model, true))
-            .await
-            .context("failed to load waifu2x")?;
+        let session =
+            tokio_rayon::spawn(move || onnx_session(&device, &model, true, Shapes::Fixed))
+                .await
+                .context("failed to load waifu2x")?;
         Ok(Self { session })
     }
 

@@ -6,7 +6,8 @@
 //! https://github.com/roboflow/rf-detr/blob/4ab7c18729de9d02ffd0495795d0831b5630f01b/src/rfdetr/models/heads/segmentation.py
 //! The segmentation head is a second graph: its spatial blocks are
 //! query-independent, so only the queries postprocessing keeps are projected
-//! to masks instead of all 300.
+//! to masks instead of all 300. The network's attention runs in FP16; see
+//! `Model::load`.
 
 use std::path::Path;
 
@@ -17,7 +18,10 @@ use ort::{
     value::{Tensor, TensorRef},
 };
 
-use crate::{Backend, Device, backend::onnx_session};
+use crate::{
+    Backend, Device,
+    backend::{Shapes, onnx_session},
+};
 
 pub(super) const RESOLUTION: usize = 1920;
 pub(super) const MASK_RESOLUTION: usize = RESOLUTION / 4;
@@ -59,12 +63,16 @@ impl std::fmt::Debug for Model {
 
 impl Model {
     pub(super) fn load(device: &Device, network: &Path, mask_head: &Path) -> Result<Self> {
-        // FP32 on CUDA. Under BF16 a column box on 144304368_p1 loses a third
-        // of its width, so the column is never read, and a panel on the port
-        // fixture scores 0.61 instead of 0.95. TF32 is excluded too: it adds
-        // and drops detections against FP32 on the hard pages at no
-        // measurable speed gain.
-        let network = onnx_session(device, network, false)?;
+        // The network graph computes attention in FP16 and everything else in
+        // FP32, which takes it from about 1 s to 0.3 s on an RTX 3080. Across
+        // the 27 hard pages FP16 attention changes fewer detections than an
+        // invisible +-1/255 dither of the page does at FP32. Whole-network
+        // BF16 made a column box on 144304368_p1 lose a third of its width
+        // and a port-fixture panel score 0.61 instead of 0.95; with FP16
+        // attention the column keeps its width and the panel scores 0.76,
+        // inside the 0.70-0.97 that dither gives at FP32. TF32 gives no
+        // speedup on that GPU.
+        let network = onnx_session(device, network, false, Shapes::Fixed)?;
         // On CUDA the spatial features stay on the device for the mask head
         // instead of a round trip through host memory.
         let mut outputs = OutputSelector::default();
@@ -89,7 +97,7 @@ impl Model {
         Ok(Self {
             network_options: RunOptions::new()?.with_outputs(outputs),
             network,
-            mask_head: onnx_session(device, mask_head, false)?,
+            mask_head: onnx_session(device, mask_head, false, Shapes::Dynamic)?,
         })
     }
 

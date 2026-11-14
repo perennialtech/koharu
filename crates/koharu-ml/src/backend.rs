@@ -20,21 +20,43 @@ impl TryIntoDevice<koharu_torch::Device> for Device {
     }
 }
 
+/// Whether a session's input shapes change from one run to the next.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum Shapes {
+    Fixed,
+    Dynamic,
+}
+
 /// Opens an ONNX model on `device`. A CUDA device never falls back to the CPU
 /// provider: a model that cannot run on the GPU fails to load instead.
 /// `allow_tf32` lets CUDA convolutions and matrix products round inputs to
 /// TF32; models whose outputs move under that rounding pass `false`.
+///
+/// On CUDA, intermediates are not planned into one preallocated block, and
+/// with [`Shapes::Fixed`] the device arena grows by what each allocation
+/// requests instead of by powers of two. Together they cut RF-DETR's peak
+/// VRAM on an RTX 3080 from 6.3 to 3.1 GiB with no measurable change in
+/// latency. [`Shapes::Dynamic`] keeps power-of-two growth: exact growth would
+/// add an arena region for each new largest shape, and regions never merge.
 pub(crate) fn onnx_session(
     device: &Device,
     model: &Path,
     allow_tf32: bool,
+    shapes: Shapes,
 ) -> Result<ort::session::Session> {
     let mut builder = ort::session::Session::builder(crate::onnx_environment()?)?;
     if device.backend == Backend::Cuda {
+        let arena = match shapes {
+            Shapes::Fixed => ort::ep::ArenaExtendStrategy::SameAsRequested,
+            Shapes::Dynamic => ort::ep::ArenaExtendStrategy::NextPowerOfTwo,
+        };
         builder = builder
+            .with_memory_pattern(false)
+            .map_err(ort::Error::<()>::from)?
             .with_execution_providers([ort::ep::CUDA::default()
                 .with_device_id(i32::try_from(device.index)?)
                 .with_conv_algorithm_search(ort::ep::cuda::ConvAlgorithmSearch::Exhaustive)
+                .with_arena_extend_strategy(arena)
                 .with_tf32(allow_tf32)
                 .build()
                 .error_on_failure()])
