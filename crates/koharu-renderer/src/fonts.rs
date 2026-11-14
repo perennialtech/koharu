@@ -41,6 +41,8 @@ const SYMBOL_FALLBACK_FAMILIES: &[&str] = &[
     "Segoe UI Symbol",
     "Segoe UI Emoji",
     "Noto Sans Symbols 2",
+    // Debian and Ubuntu's fonts-noto-core name the family without the space.
+    "Noto Sans Symbols2",
     "Noto Sans Symbols",
     "Noto Color Emoji",
     "Apple Symbols",
