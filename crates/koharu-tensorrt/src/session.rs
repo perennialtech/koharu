@@ -84,8 +84,9 @@ impl Session {
     /// Opens `onnx` on `device`, keeping the serialized engine and the
     /// runtime cache of compiled kernels in `cache_dir`.
     ///
-    /// The engine file is keyed by the ONNX file's contents and the
-    /// TensorRT-RTX version, and the runtime cache additionally by the GPU's
+    /// The engine file is keyed by the ONNX file's contents, including
+    /// weights kept beside it in `<file name>.data`, and the TensorRT-RTX
+    /// version, and the runtime cache additionally by the GPU's
     /// compute capability and the driver version, since compiled kernels are
     /// specific to both. With `cuda_graph`, runs replay a captured CUDA graph.
     /// `ranges` bounds each dynamic input and is part of the engine's key.
@@ -362,6 +363,20 @@ fn content_hash(path: &Path, ranges: &[ShapeRange<'_>]) -> Result<String> {
     let mut file =
         fs::File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
     io::copy(&mut file, &mut hasher)?;
+    // A graph over 2 GB keeps its weights in an external data file, which
+    // its own bytes only name.
+    let mut weights = path.as_os_str().to_owned();
+    weights.push(".data");
+    match fs::File::open(&weights) {
+        Ok(mut file) => {
+            io::copy(&mut file, &mut hasher)?;
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("failed to open {}", Path::new(&weights).display()));
+        }
+    }
     for range in ranges {
         hasher.update(range.name.as_bytes());
         for extents in [range.min, range.opt, range.max] {
