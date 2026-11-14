@@ -101,6 +101,13 @@ pub fn device(cpu: bool) -> Device {
     }
 }
 
+/// Whether process initialization included `feature`.
+pub(crate) fn initialized(feature: Feature) -> bool {
+    READY
+        .get()
+        .is_some_and(|ready| ready.features.contains(&feature))
+}
+
 /// Returns the process-wide ONNX Runtime environment.
 pub(crate) fn onnx_environment() -> anyhow::Result<&'static ort::environment::Environment> {
     ONNX.get()

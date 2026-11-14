@@ -61,6 +61,7 @@ async fn run(arguments: &Arguments) -> Result<()> {
         koharu_ml::Feature::Torch,
         koharu_ml::Feature::Llama,
         koharu_ml::Feature::OnnxRuntime,
+        koharu_ml::Feature::TensorRt,
     ];
     if matches!(&pipeline_config.inpainting, InpaintingModel::Flux2Klein(_)) {
         features.push(koharu_ml::Feature::Diffusion);

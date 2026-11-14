@@ -23,89 +23,85 @@ pub(super) struct InpaintModel {
     device: Device,
 }
 
+/// IOPaint's HD strategies around `forward`, which inpaints one crop.
+pub(super) fn inpaint(
+    image: &DynamicImage,
+    mask: &GrayImage,
+    config: &InpaintRequest,
+    mut forward: impl FnMut(&RgbImage, &GrayImage) -> Result<RgbImage>,
+) -> Result<RgbImage> {
+    let image = image.to_rgb8();
+    ensure!(
+        image.dimensions() == mask.dimensions(),
+        "image and mask dimensions differ: image={:?}, mask={:?}",
+        image.dimensions(),
+        mask.dimensions()
+    );
+    ensure!(
+        image.width() > 0 && image.height() > 0,
+        "image dimensions must be non-zero"
+    );
+
+    match config.hd_strategy {
+        HDStrategy::Crop
+            if image.width().max(image.height()) > config.hd_strategy_crop_trigger_size =>
+        {
+            let boxes = boxes_from_mask(mask);
+            let mut crop_results = Vec::with_capacity(boxes.len());
+            for bounding_box in boxes {
+                let crop_box = crop_box(
+                    image.width(),
+                    image.height(),
+                    bounding_box,
+                    config.hd_strategy_crop_margin,
+                );
+                let [left, top, right, bottom] = crop_box;
+                let crop_image =
+                    image::imageops::crop_imm(&image, left, top, right - left, bottom - top)
+                        .to_image();
+                let crop_mask =
+                    image::imageops::crop_imm(mask, left, top, right - left, bottom - top)
+                        .to_image();
+                crop_results.push((forward(&crop_image, &crop_mask)?, crop_box));
+            }
+
+            let mut result = image;
+            for (crop_result, [left, top, _, _]) in crop_results {
+                image::imageops::replace(&mut result, &crop_result, left.into(), top.into());
+            }
+            Ok(result)
+        }
+        HDStrategy::Resize
+            if image.width().max(image.height()) > config.hd_strategy_resize_limit =>
+        {
+            let (width, height) = resize_dimensions(
+                image.width(),
+                image.height(),
+                config.hd_strategy_resize_limit,
+            );
+            let resized_image = resize_rgb(&image, width, height)?;
+            let resized_mask = resize_gray(mask, width, height)?;
+            let resized_result = forward(&resized_image, &resized_mask)?;
+            let mut result = resize_rgb(&resized_result, image.width(), image.height())?;
+            for (index, value) in mask.as_raw().iter().enumerate() {
+                if *value < 127 {
+                    let offset = index * 3;
+                    result.as_flat_samples_mut().samples[offset..offset + 3]
+                        .copy_from_slice(&image.as_raw()[offset..offset + 3]);
+                }
+            }
+            Ok(result)
+        }
+        _ => forward(&image, mask),
+    }
+}
+
 impl InpaintModel {
     pub(super) fn new(device: Device) -> Self {
         Self { device }
     }
 
-    pub(super) fn call(
-        &self,
-        model: &Model,
-        image: &DynamicImage,
-        mask: &GrayImage,
-        config: &InpaintRequest,
-    ) -> Result<RgbImage> {
-        let image = image.to_rgb8();
-        ensure!(
-            image.dimensions() == mask.dimensions(),
-            "image and mask dimensions differ: image={:?}, mask={:?}",
-            image.dimensions(),
-            mask.dimensions()
-        );
-        ensure!(
-            image.width() > 0 && image.height() > 0,
-            "image dimensions must be non-zero"
-        );
-
-        match config.hd_strategy {
-            HDStrategy::Crop
-                if image.width().max(image.height()) > config.hd_strategy_crop_trigger_size =>
-            {
-                let boxes = boxes_from_mask(mask);
-                let mut crop_results = Vec::with_capacity(boxes.len());
-                for bounding_box in boxes {
-                    let crop_box = crop_box(
-                        image.width(),
-                        image.height(),
-                        bounding_box,
-                        config.hd_strategy_crop_margin,
-                    );
-                    let [left, top, right, bottom] = crop_box;
-                    let crop_image =
-                        image::imageops::crop_imm(&image, left, top, right - left, bottom - top)
-                            .to_image();
-                    let crop_mask =
-                        image::imageops::crop_imm(mask, left, top, right - left, bottom - top)
-                            .to_image();
-                    crop_results.push((
-                        self.pad_forward(model, &crop_image, &crop_mask, config)?,
-                        crop_box,
-                    ));
-                }
-
-                let mut result = image;
-                for (crop_result, [left, top, _, _]) in crop_results {
-                    image::imageops::replace(&mut result, &crop_result, left.into(), top.into());
-                }
-                Ok(result)
-            }
-            HDStrategy::Resize
-                if image.width().max(image.height()) > config.hd_strategy_resize_limit =>
-            {
-                let (width, height) = resize_dimensions(
-                    image.width(),
-                    image.height(),
-                    config.hd_strategy_resize_limit,
-                );
-                let resized_image = resize_rgb(&image, width, height)?;
-                let resized_mask = resize_gray(mask, width, height)?;
-                let resized_result =
-                    self.pad_forward(model, &resized_image, &resized_mask, config)?;
-                let mut result = resize_rgb(&resized_result, image.width(), image.height())?;
-                for (index, value) in mask.as_raw().iter().enumerate() {
-                    if *value < 127 {
-                        let offset = index * 3;
-                        result.as_flat_samples_mut().samples[offset..offset + 3]
-                            .copy_from_slice(&image.as_raw()[offset..offset + 3]);
-                    }
-                }
-                Ok(result)
-            }
-            _ => self.pad_forward(model, &image, mask, config),
-        }
-    }
-
-    fn pad_forward(
+    pub(super) fn pad_forward(
         &self,
         model: &Model,
         image: &RgbImage,
@@ -147,7 +143,7 @@ impl InpaintModel {
     }
 }
 
-fn resize_dimensions(width: u32, height: u32, size_limit: u32) -> (u32, u32) {
+pub(super) fn resize_dimensions(width: u32, height: u32, size_limit: u32) -> (u32, u32) {
     let ratio = size_limit as f64 / width.max(height) as f64;
     (
         (width as f64 * ratio + 0.5) as u32,
@@ -155,7 +151,7 @@ fn resize_dimensions(width: u32, height: u32, size_limit: u32) -> (u32, u32) {
     )
 }
 
-fn resize_rgb(image: &RgbImage, width: u32, height: u32) -> Result<RgbImage> {
+pub(super) fn resize_rgb(image: &RgbImage, width: u32, height: u32) -> Result<RgbImage> {
     let mut output = RgbImage::new(width, height);
     crate::resize_image::<U8x3>(
         image,
@@ -166,7 +162,7 @@ fn resize_rgb(image: &RgbImage, width: u32, height: u32) -> Result<RgbImage> {
     Ok(output)
 }
 
-fn resize_gray(image: &GrayImage, width: u32, height: u32) -> Result<GrayImage> {
+pub(super) fn resize_gray(image: &GrayImage, width: u32, height: u32) -> Result<GrayImage> {
     let mut output = GrayImage::new(width, height);
     crate::resize_image::<U8>(
         image,
@@ -328,7 +324,7 @@ fn symmetric_indices(length: u32, output_length: u32, device: Device) -> Tensor 
     indices.where_self(&indices.lt(length), &(period - &indices - 1))
 }
 
-fn symmetric_index(index: u32, length: u32) -> u32 {
+pub(super) fn symmetric_index(index: u32, length: u32) -> u32 {
     let index = index % (length * 2);
     if index < length {
         index

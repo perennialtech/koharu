@@ -2624,6 +2624,7 @@ dependencies = [
  "koharu-diffusion",
  "koharu-llama",
  "koharu-runtime",
+ "koharu-tensorrt",
  "koharu-torch",
  "minijinja",
  "minijinja-contrib",
@@ -2819,6 +2820,26 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "koharu-tensorrt"
+version = "0.83.5"
+dependencies = [
+ "anyhow",
+ "blake3",
+ "koharu-tensorrt-sys",
+ "tempfile",
+ "tracing",
+]
+
+[[package]]
+name = "koharu-tensorrt-sys"
+version = "0.83.5"
+dependencies = [
+ "cc",
+ "libc",
+ "libloading 0.9.0",
 ]
 
 [[package]]

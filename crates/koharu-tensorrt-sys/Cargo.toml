@@ -1,0 +1,23 @@
+[package]
+name = "koharu-tensorrt-sys"
+version.workspace = true
+edition.workspace = true
+description = "Low-level FFI for TensorRT-RTX through a C++ shim, and the CUDA runtime calls it needs."
+license = "MIT OR Apache-2.0"
+authors.workspace = true
+readme.workspace = true
+homepage.workspace = true
+repository.workspace = true
+keywords = ["tensorrt", "cuda", "ffi", "deep-learning", "machine-learning"]
+categories = ["external-ffi-bindings", "science"]
+publish = true
+build = "build.rs"
+
+[dependencies]
+libloading = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = { workspace = true }
+
+[build-dependencies]
+cc = { workspace = true }

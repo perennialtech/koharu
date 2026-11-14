@@ -12,7 +12,7 @@ pub mod download;
 
 pub use device::{Backend, Device, DeviceType};
 pub use hardware::Hardware;
-pub use runtime::{Feature, OnnxRuntime, Package, Runtime, Torch};
+pub use runtime::{Feature, OnnxRuntime, Package, Runtime, TensorRt, Torch};
 pub use source::HuggingFaceFile;
 pub use store::Store;
 
