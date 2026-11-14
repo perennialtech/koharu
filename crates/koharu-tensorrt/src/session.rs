@@ -1,11 +1,12 @@
 //! One model on one GPU, with its engine and compiled kernels cached on disk.
 
 use std::{
+    collections::HashSet,
     ffi::CString,
     fs,
     io::{self, Write as _},
     path::{Path, PathBuf},
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context as _, Result, bail, ensure};
@@ -41,12 +42,24 @@ impl<'a> Binding<'a> {
     }
 }
 
+// TensorRT-RTX compiles kernels for a new dynamic shape in the background
+// while runs use fallback kernels, so nothing marks when they are ready. After
+// a new shape the runtime cache is saved at most this often, for this long.
+const CACHE_SAVE_INTERVAL: Duration = Duration::from_secs(5);
+const CACHE_SAVE_WINDOW: Duration = Duration::from_secs(30);
+
 /// Field order drops the context before the engine.
 pub struct Session {
     context: ExecutionContext,
     engine: Engine,
     names: Vec<CString>,
     device: u32,
+    cache_path: PathBuf,
+    /// Input shapes run so far; `None` for an engine without dynamic inputs,
+    /// whose kernels are all compiled when the context is created.
+    shapes: Option<HashSet<Vec<Vec<i64>>>>,
+    last_new_shape: Option<Instant>,
+    last_save: Instant,
 }
 
 impl Session {
@@ -109,11 +122,19 @@ impl Session {
             .iter()
             .map(|tensor| CString::new(tensor.name.as_str()))
             .collect::<Result<_, _>>()?;
+        let dynamic = engine
+            .tensors()
+            .iter()
+            .any(|tensor| tensor.input && tensor.shape.iter().any(|extent| *extent < 0));
         Ok(Self {
             context,
             engine,
             names,
             device,
+            cache_path,
+            shapes: dynamic.then(HashSet::new),
+            last_new_shape: None,
+            last_save: Instant::now(),
         })
     }
 
@@ -146,6 +167,7 @@ impl Session {
             bound[index] = Some(binding);
         }
 
+        let mut input_shapes = Vec::new();
         for (index, tensor) in self.engine.tensors().iter().enumerate() {
             let binding =
                 bound[index].with_context(|| format!("tensor {} is not bound", tensor.name))?;
@@ -166,6 +188,7 @@ impl Session {
                 tensor.shape
             );
             self.context.set_input_shape(&self.names[index], shape)?;
+            input_shapes.push(shape.to_vec());
         }
 
         for (index, tensor) in self.engine.tensors().iter().enumerate() {
@@ -192,7 +215,44 @@ impl Session {
         // SAFETY: every tensor is bound to a large enough live buffer and the
         // stream is live; the borrows outlast the synchronization.
         unsafe { self.context.enqueue(stream.raw())? };
-        stream.synchronize()
+        stream.synchronize()?;
+
+        if let Some(shapes) = &mut self.shapes
+            && shapes.insert(input_shapes)
+        {
+            self.last_new_shape = Some(Instant::now());
+        }
+        self.save_runtime_cache(false);
+        Ok(())
+    }
+
+    /// Saves kernels compiled since the last save while a new shape's
+    /// background compilation may still be running. A failed save only costs
+    /// the next process a recompile, so it is logged rather than returned.
+    fn save_runtime_cache(&mut self, now: bool) {
+        let Some(last_new_shape) = self.last_new_shape else {
+            return;
+        };
+        if !now && self.last_save.elapsed() < CACHE_SAVE_INTERVAL {
+            return;
+        }
+        if let Err(error) = self
+            .context
+            .runtime_cache()
+            .and_then(|bytes| write_atomic(&self.cache_path, &bytes))
+        {
+            tracing::warn!(%error, "failed to save the TensorRT-RTX runtime cache");
+        }
+        self.last_save = Instant::now();
+        if last_new_shape.elapsed() >= CACHE_SAVE_WINDOW {
+            self.last_new_shape = None;
+        }
+    }
+}
+
+impl Drop for Session {
+    fn drop(&mut self) {
+        self.save_runtime_cache(true);
     }
 }
 
