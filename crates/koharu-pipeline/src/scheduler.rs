@@ -35,13 +35,10 @@ impl PageWork {
     }
 
     fn ready(&self, index: usize) -> bool {
-        let Some(prerequisite) = prerequisite(self.stages[index].stage) else {
-            return true;
-        };
-        self.stages
-            .iter()
-            .find(|work| work.stage == prerequisite)
-            .is_none_or(|work| work.state == WorkState::Finished)
+        self.stages.iter().all(|work| {
+            !prerequisites(self.stages[index].stage).contains(&work.stage)
+                || work.state == WorkState::Finished
+        })
     }
 }
 
@@ -142,11 +139,15 @@ impl Scheduler {
     }
 }
 
-const fn prerequisite(stage: Stage) -> Option<Stage> {
+const fn prerequisites(stage: Stage) -> &'static [Stage] {
     match stage {
-        Stage::Detection | Stage::Upscaling => None,
-        Stage::Ocr | Stage::Inpainting => Some(Stage::Detection),
-        Stage::Translation => Some(Stage::Ocr),
+        Stage::Detection => &[],
+        Stage::Ocr | Stage::Inpainting => &[Stage::Detection],
+        Stage::Translation => &[Stage::Ocr],
+        // Upscaling reads only the source, but it writes the page's assets,
+        // which detection, OCR and inpainting observe. Overlapping any of them
+        // makes whichever commits second fail its rebase.
+        Stage::Upscaling => &[Stage::Detection, Stage::Ocr, Stage::Inpainting],
     }
 }
 
@@ -193,6 +194,54 @@ mod tests {
         assert_eq!(translation, (pages[0], Stage::Translation));
         assert!(busy.contains(&Stage::Detection));
         assert!(busy.contains(&Stage::Inpainting));
+    }
+
+    #[test]
+    fn upscaling_waits_for_the_stages_that_observe_page_assets() {
+        let pages = pages(1);
+        let mut scheduler = Scheduler::new(&pages, &Stage::ALL);
+        let mut busy = BTreeSet::new();
+
+        assert_eq!(
+            scheduler.start_next(&busy),
+            Some((pages[0], Stage::Detection))
+        );
+        busy.insert(Stage::Detection);
+        assert!(scheduler.start_next(&busy).is_none());
+
+        busy.clear();
+        assert!(!scheduler.complete_stage(pages[0], Stage::Detection));
+        for stage in [Stage::Ocr, Stage::Inpainting] {
+            assert_eq!(scheduler.start_next(&busy), Some((pages[0], stage)));
+            busy.insert(stage);
+        }
+        assert!(scheduler.start_next(&busy).is_none());
+
+        assert!(!scheduler.complete_stage(pages[0], Stage::Ocr));
+        busy.remove(&Stage::Ocr);
+        assert_eq!(
+            scheduler.start_next(&busy),
+            Some((pages[0], Stage::Translation))
+        );
+        busy.insert(Stage::Translation);
+        assert!(scheduler.start_next(&busy).is_none());
+
+        assert!(!scheduler.complete_stage(pages[0], Stage::Inpainting));
+        busy.remove(&Stage::Inpainting);
+        assert_eq!(
+            scheduler.start_next(&busy),
+            Some((pages[0], Stage::Upscaling))
+        );
+    }
+
+    #[test]
+    fn upscaling_alone_needs_no_earlier_stage() {
+        let pages = pages(1);
+        let mut scheduler = Scheduler::new(&pages, &[Stage::Upscaling]);
+        assert_eq!(
+            scheduler.start_next(&BTreeSet::new()),
+            Some((pages[0], Stage::Upscaling))
+        );
     }
 
     #[test]
