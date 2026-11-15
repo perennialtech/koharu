@@ -10,7 +10,7 @@ use super::scheduler::EulerSchedule;
 // Exports of ShinoharaHare/Waifu-Inpaint-XL; the repository holds the export
 // script and the graphs' contracts. unet.onnx keeps its weights in
 // unet.onnx.data beside it.
-crate::model_repository!("8q0sb/koharu-onnx" @ "0000000000000000000000000000000000000000" {
+crate::model_repository!("8q0sb/koharu-onnx" @ "fda740eafb39fd7f298029531ba0e17c243c0f10" {
     UNET = "waifu-inpaint-xl/unet.onnx",
     UNET_WEIGHTS = "waifu-inpaint-xl/unet.onnx.data",
     VAE_ENCODER = "waifu-inpaint-xl/vae-encoder.onnx",
