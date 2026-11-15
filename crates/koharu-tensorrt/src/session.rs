@@ -410,6 +410,9 @@ fn load_engine(onnx: &Path, ranges: &[ShapeRange<'_>], path: &Path) -> Result<En
     if let Ok(bytes) = fs::read(path) {
         match Engine::deserialize(&bytes) {
             Ok(engine) => return Ok(engine),
+            // The engine's weights did not fit; rebuilding cannot help, and
+            // the caller may free memory and retry.
+            Err(error) if out_of_memory(&error) => return Err(error),
             Err(error) => tracing::warn!(%error, "rebuilding unreadable cached engine"),
         }
     }
@@ -422,6 +425,11 @@ fn load_engine(onnx: &Path, ranges: &[ShapeRange<'_>], path: &Path) -> Result<En
     );
     write_atomic(path, &bytes)?;
     Engine::deserialize(&bytes)
+}
+
+fn out_of_memory(error: &anyhow::Error) -> bool {
+    let message = error.to_string().to_ascii_lowercase();
+    message.contains("outofmemory") || message.contains("out of memory")
 }
 
 fn content_hash(path: &Path, ranges: &[ShapeRange<'_>]) -> Result<String> {

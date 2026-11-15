@@ -158,6 +158,8 @@ fn is_out_of_memory(error: &anyhow::Error) -> bool {
         let message = source.to_string().to_ascii_lowercase();
         message.contains("out of memory")
             || message.contains("cuda_error_out_of_memory")
+            // TensorRT reports "Error Code 2: OutOfMemory".
+            || message.contains("outofmemory")
             || message.contains("not enough memory")
             // ONNX Runtime's CUDA arena swallows the cudaMalloc error and
             // reports only this.
