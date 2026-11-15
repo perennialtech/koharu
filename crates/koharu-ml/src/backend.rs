@@ -66,12 +66,14 @@ pub(crate) fn onnx_session(
 /// Opens an ONNX model on TensorRT-RTX. Engines and compiled kernels are
 /// cached per model under the runtime store. `ranges` bounds each dynamic
 /// input; with `cuda_graph`, runs replay a graph captured per input shape.
+/// `scratch` shares activation memory sized per run and excludes CUDA graphs.
 pub(crate) fn tensorrt_session(
     device: u32,
     model: &Path,
     name: &str,
     cuda_graph: bool,
     ranges: &[koharu_tensorrt::ShapeRange<'_>],
+    scratch: Option<&koharu_tensorrt::Scratch>,
 ) -> Result<koharu_tensorrt::Session> {
     anyhow::ensure!(
         crate::initialized(koharu_runtime::Feature::TensorRt),
@@ -80,7 +82,7 @@ pub(crate) fn tensorrt_session(
     let cache = koharu_runtime::Store::root()
         .join("tensorrt-engines")
         .join(name);
-    koharu_tensorrt::Session::open(model, &cache, device, cuda_graph, ranges)
+    koharu_tensorrt::Session::open(model, &cache, device, cuda_graph, ranges, scratch)
 }
 
 pub(crate) fn set_precision(var_store: &mut nn::VarStore) {

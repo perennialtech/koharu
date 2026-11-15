@@ -8,7 +8,7 @@ use anyhow::Result;
 
 use crate::{Device, Hardware};
 use graph::{Component, Plan};
-use packages::{Diffusion, Llama};
+use packages::Llama;
 
 pub use packages::{OnnxRuntime, TensorRt, Torch};
 
@@ -45,7 +45,6 @@ pub(crate) trait DiscoverablePackage: RuntimePackage {
 pub enum Feature {
     Torch,
     Llama,
-    Diffusion,
     OnnxRuntime,
     TensorRt,
 }
@@ -80,7 +79,6 @@ impl Runtime {
             let Some(node) = (match feature {
                 Feature::Torch => plan.require::<Torch>(hardware)?,
                 Feature::Llama => plan.require::<Llama>(hardware)?,
-                Feature::Diffusion => plan.require::<Diffusion>(hardware)?,
                 Feature::OnnxRuntime => plan.require::<OnnxRuntime>(hardware)?,
                 Feature::TensorRt => plan.require::<TensorRt>(hardware)?,
             }) else {

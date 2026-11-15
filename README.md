@@ -76,6 +76,16 @@ includes a job ID and a `Location` header. Poll that URL or subscribe to its
 from the `result_url` in the response. Use the job's `/cancel` endpoint to
 request cancellation.
 
+Set `decensor=true` to repaint bars and mosaics already in the page before it
+is translated, or add `translate=false` to only repaint them. Decensoring
+finds censors with
+[kitsumed's YOLO11m-seg](https://huggingface.co/kitsumed/yolov11m_seg-2d-censorship-detection)
+(AGPL-3.0 weights) and repaints them with
+[Waifu-Inpaint-XL](https://huggingface.co/ShinoharaHare/Waifu-Inpaint-XL)
+(CreativeML Open RAIL++-M). It needs a Turing or newer NVIDIA GPU with about
+9 GB of free memory, and downloads about 5.5 GB of models on first use. It
+does not find blur, and the repainted regions can show artifacts.
+
 Koharu runs one job at a time. Jobs continue after clients disconnect. Jobs
 and their results live in memory and expire after an hour in a terminal
 state or immediately on server restart. Each submission runs independently.
@@ -100,9 +110,9 @@ without a container.
 Run `koharu-server --help` (or `./target/debug/koharu-server --help`) for the
 supported flags, defaults, environment-variable fallbacks and the API keys
 each translation provider reads. You can choose the translation engines and
-their failover order, the models LLM engines use, the inpainting model, the
-listener address, and the endpoints of self-hosted translators there. API
-callers choose engines by name but never their models.
+their failover order, the models LLM engines use, the listener address, and
+the endpoints of self-hosted translators there. API callers choose engines by
+name but never their models.
 
 Every translation engine is a remote service, so recognized text goes to the
 engines you select; LLM engines also receive the page image. Without any

@@ -70,7 +70,7 @@ impl StageProcessor for Processor {
             request = request.with_instructions(instructions);
         }
         if Translator::uses_image(engines, &self.config.generation)
-            && let Some(image) = input.images.get(&input.scene, input.page, "source").await?
+            && let Some(image) = input.page_image().await?
         {
             request = request.with_image(image);
         }

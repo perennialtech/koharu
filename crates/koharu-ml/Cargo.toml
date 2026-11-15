@@ -12,7 +12,6 @@ keywords.workspace = true
 publish.workspace = true
 
 [dependencies]
-koharu-diffusion = { workspace = true }
 koharu-llama = { workspace = true }
 koharu-runtime = { workspace = true }
 koharu-tensorrt = { workspace = true }
@@ -41,10 +40,6 @@ tempfile = { workspace = true }
 
 [[bench]]
 name = "lama"
-harness = false
-
-[[bench]]
-name = "flux2_klein"
 harness = false
 
 [[bench]]

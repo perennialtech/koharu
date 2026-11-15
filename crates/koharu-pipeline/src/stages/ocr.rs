@@ -64,11 +64,7 @@ impl Model {
     async fn run(&self, input: StageInput) -> Result<koharu_scene::Patch> {
         let page = input.page;
         let mut targets = Vec::new();
-        let source = input
-            .images
-            .get(&input.scene, page, "source")
-            .await?
-            .ok_or_else(|| anyhow!("page {page} has no source image"))?;
+        let source = input.require_page_image().await?;
         for entity in input.scene.descendants(page)? {
             let region = entity.id();
             if !input.contains_entity(region)? {

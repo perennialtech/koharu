@@ -25,6 +25,8 @@ pub(crate) struct Input {
     pub(crate) language: Language,
     pub(crate) instructions: Option<String>,
     pub(crate) engines: Option<Vec<Provider>>,
+    /// Pipeline stages to run, in pipeline order.
+    pub(crate) stages: Vec<Stage>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, ToSchema)]
@@ -201,7 +203,7 @@ pub(crate) struct Job {
 
 impl Job {
     fn new(id: Uuid, input: Input) -> Self {
-        let stages = Stage::ALL;
+        let stages = input.stages.clone();
         Self {
             state: watch::Sender::new(JobState {
                 view: Translation {

@@ -329,6 +329,7 @@ pub enum ImageKind {
     Source,
     Cleanup,
     Paint,
+    Decensor,
     Embedded,
 }
 

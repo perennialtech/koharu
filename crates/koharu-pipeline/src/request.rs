@@ -20,6 +20,7 @@ pub struct InpaintingMask {
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize, Type)]
 #[serde(tag = "operation", rename_all = "snake_case")]
 pub enum Operation {
+    /// Translates: every stage but the opt-in decensoring.
     #[default]
     Full,
     Through {
@@ -36,7 +37,15 @@ pub enum Operation {
 impl Operation {
     pub(crate) fn stages(&self) -> Result<Vec<Stage>> {
         let stages = match self {
-            Self::Full => Stage::ALL.to_vec(),
+            Self::Full => vec![
+                Stage::Detection,
+                Stage::Ocr,
+                Stage::Translation,
+                Stage::Inpainting,
+            ],
+            Self::Through {
+                stage: Stage::Decensoring,
+            } => vec![Stage::Decensoring],
             Self::Through {
                 stage: Stage::Detection,
             } => vec![Stage::Detection],
