@@ -221,7 +221,7 @@ impl Model {
 }
 
 #[derive(Clone, Debug)]
-struct FlatFillRegion {
+pub(super) struct FlatFillRegion {
     bounds: [u32; 4],
     polygon: Vec<(f32, f32)>,
 }
@@ -394,7 +394,7 @@ struct MaskComponent {
 // https://github.com/dmMaze/BallonsTranslator/blob/4bcc635c19f6c63a902872cf77b3d554e14ed1b7/ballontranslator/modules/inpaint/base.py#L168-L200
 // Koharu uses the detected bubble polygons as those blocks. Uniform bubbles are
 // filled first; only the remaining mask is split into bounded model crops.
-fn inpaint_tiled(
+pub(super) fn inpaint_tiled(
     image: &DynamicImage,
     mask: &GrayImage,
     text_mask: &GrayImage,

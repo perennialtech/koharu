@@ -299,11 +299,20 @@ async fn serves_openapi_and_reports_failures() {
 }
 
 async fn upload_with_translators(app: &Router, translators: &[&str]) -> Response {
+    let fields = translators
+        .iter()
+        .map(|translator| ("translator", *translator))
+        .collect::<Vec<_>>();
+    upload_with_fields(app, &fields).await
+}
+
+async fn upload_with_fields(app: &Router, fields: &[(&str, &str)]) -> Response {
     let mut body = b"--page\r\nContent-Disposition: form-data; name=\"image\"; filename=\"page.png\"\r\nContent-Type: image/png\r\n\r\n".to_vec();
     body.extend_from_slice(&png());
-    for translator in translators {
+    for (name, value) in fields {
         body.extend_from_slice(
-            format!("\r\n--page\r\nContent-Disposition: form-data; name=\"translator\"\r\n\r\n{translator}").as_bytes(),
+            format!("\r\n--page\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n{value}")
+                .as_bytes(),
         );
     }
     body.extend_from_slice(b"\r\n--page--\r\n");
@@ -349,6 +358,38 @@ async fn lists_engines_and_keeps_requested_failover_order() {
             StatusCode::BAD_REQUEST,
             "{translators:?}"
         );
+    }
+    assert!(queue.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn decensoring_is_opt_in_and_translation_can_be_skipped() {
+    let (jobs, mut queue) = Jobs::new();
+    let app = router(jobs, engines());
+    let translation = [
+        Stage::Detection,
+        Stage::Ocr,
+        Stage::Translation,
+        Stage::Inpainting,
+    ];
+    for (fields, stages) in [
+        (&[][..], translation.to_vec()),
+        (
+            &[("decensor", "true")][..],
+            [&[Stage::Decensoring][..], &translation].concat(),
+        ),
+        (
+            &[("decensor", "true"), ("translate", "false")][..],
+            vec![Stage::Decensoring],
+        ),
+    ] {
+        let response = upload_with_fields(&app, fields).await;
+        assert_eq!(response.status(), StatusCode::ACCEPTED, "{fields:?}");
+        assert_eq!(queue.recv().await.unwrap().start().unwrap().stages, stages);
+    }
+    for fields in [&[("translate", "false")][..], &[("decensor", "yes")]] {
+        let response = upload_with_fields(&app, fields).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{fields:?}");
     }
     assert!(queue.try_recv().is_err());
 }

@@ -13,8 +13,8 @@ use anyhow::{Context, Result};
 use axum::body::Bytes;
 use koharu_config::Config;
 use koharu_pipeline::{
-    Committer, Pipeline, PipelineError, Request as PipelineRequest, RequestTranslation, RunStatus,
-    Scope, StageOutput, StopToken,
+    Committer, Operation, Pipeline, PipelineError, Request as PipelineRequest, RequestTranslation,
+    RunStatus, Scope, StageOutput, StopToken,
 };
 use koharu_rasterizer::{RasterOptions, Rasterizer};
 use koharu_renderer::Renderer;
@@ -151,6 +151,7 @@ impl Worker {
             language,
             instructions,
             engines,
+            stages,
         } = input;
         let mut session = Session::memory().await?;
         let mut page = None;
@@ -185,6 +186,7 @@ impl Worker {
             .execute(
                 snapshot,
                 PipelineRequest {
+                    operation: Operation::Stages { stages },
                     scope: Scope::Pages(vec![page]),
                     translation: Some(RequestTranslation {
                         target_language: language,

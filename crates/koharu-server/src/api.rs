@@ -12,6 +12,7 @@ use axum::{
     routing::{get, post},
 };
 use futures::{Stream, stream};
+use koharu_pipeline::Stage;
 use koharu_translator::{Language, Provider, ProvidersConfig};
 use serde::Serialize;
 use utoipa::{OpenApi, ToSchema};
@@ -74,6 +75,15 @@ struct Upload {
     /// engines use the model the server configures.
     #[schema(value_type = Option<Vec<String>>, example = json!(["google-web", "microsoft-edge"]))]
     translator: Vec<Provider>,
+    /// Repaint bars and mosaics already in the page before translating it.
+    /// Defaults to false. Needs a few more GB of downloads on first use and
+    /// most of a 10 GB GPU while it runs.
+    #[schema(value_type = Option<bool>)]
+    decensor: Option<bool>,
+    /// Translate the page. Defaults to true; with false the page is only
+    /// decensored and the translation fields are ignored.
+    #[schema(value_type = Option<bool>)]
+    translate: Option<bool>,
 }
 
 impl Upload {
@@ -82,6 +92,8 @@ impl Upload {
         let mut target_language = None;
         let mut instructions = None;
         let mut translator = Vec::new();
+        let mut decensor = None;
+        let mut translate = None;
         while let Some(field) = multipart
             .next_field()
             .await
@@ -105,6 +117,12 @@ impl Upload {
                 }
                 Some("instructions") if instructions.is_none() => {
                     instructions = Some(field.text().await.map_err(|_| ApiError::MULTIPART)?);
+                }
+                Some("decensor") if decensor.is_none() => {
+                    decensor = Some(flag(field).await?);
+                }
+                Some("translate") if translate.is_none() => {
+                    translate = Some(flag(field).await?);
                 }
                 Some("translator") => {
                     let value = field.text().await.map_err(|_| ApiError::MULTIPART)?;
@@ -131,10 +149,30 @@ impl Upload {
             target_language,
             instructions,
             translator,
+            decensor,
+            translate,
         })
     }
 
     fn validate(self, engines: &Engines) -> Result<Input, ApiError> {
+        let mut stages = Vec::new();
+        if self.decensor.unwrap_or(false) {
+            stages.push(Stage::Decensoring);
+        }
+        if self.translate.unwrap_or(true) {
+            stages.extend([
+                Stage::Detection,
+                Stage::Ocr,
+                Stage::Translation,
+                Stage::Inpainting,
+            ]);
+        }
+        if stages.is_empty() {
+            return Err(ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "Nothing to do: decensor and translate are both false",
+            ));
+        }
         for &engine in &self.translator {
             engines
                 .providers
@@ -158,8 +196,20 @@ impl Upload {
             language: self.target_language.unwrap_or(Language::English),
             instructions: self.instructions,
             engines: (!self.translator.is_empty()).then_some(self.translator),
+            stages,
         })
     }
+}
+
+async fn flag(field: axum::extract::multipart::Field<'_>) -> Result<bool, ApiError> {
+    let name = field.name().unwrap_or_default().to_owned();
+    let value = field.text().await.map_err(|_| ApiError::MULTIPART)?;
+    value.trim().parse().map_err(|_| {
+        ApiError::new(
+            StatusCode::BAD_REQUEST,
+            format!("{name} must be true or false"),
+        )
+    })
 }
 
 #[derive(Serialize, ToSchema)]

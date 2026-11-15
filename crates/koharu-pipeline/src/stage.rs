@@ -20,6 +20,8 @@ use specta::Type;
 #[serde(rename_all = "snake_case")]
 #[strum(serialize_all = "snake_case", ascii_case_insensitive)]
 pub enum Stage {
+    /// Opt-in: runs before every other stage of its page.
+    Decensoring,
     Detection,
     Ocr,
     Translation,
@@ -27,7 +29,8 @@ pub enum Stage {
 }
 
 impl Stage {
-    pub const ALL: [Self; 4] = [
+    pub const ALL: [Self; 5] = [
+        Self::Decensoring,
         Self::Detection,
         Self::Ocr,
         Self::Translation,

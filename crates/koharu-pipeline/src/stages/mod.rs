@@ -1,3 +1,4 @@
+mod decensoring;
 mod detection;
 mod inpainting;
 mod ocr;
@@ -76,6 +77,7 @@ trait StageProcessor: Send + Sync {
 }
 
 pub(crate) struct Stages {
+    decensoring: decensoring::Processor,
     detection: detection::Processor,
     ocr: ocr::Processor,
     translation: translation::Processor,
@@ -89,6 +91,7 @@ impl Stages {
         device: &koharu_ml::Device,
     ) -> Result<Self> {
         Ok(Self {
+            decensoring: decensoring::Processor::new(device.clone()),
             detection: detection::Processor::new(config.detection()?, device.clone()),
             ocr: ocr::Processor::new(config.ocr.clone(), device.clone()),
             translation: translation::Processor::new(config.translation.clone(), translator),
@@ -98,6 +101,7 @@ impl Stages {
 
     fn processor(&self, stage: Stage) -> &dyn StageProcessor {
         match stage {
+            Stage::Decensoring => &self.decensoring,
             Stage::Detection => &self.detection,
             Stage::Ocr => &self.ocr,
             Stage::Translation => &self.translation,
@@ -168,6 +172,7 @@ mod tests {
         assert_eq!(
             Stage::ALL.map(|stage| stages.model(stage)),
             [
+                "kitsumed-yolo11m-seg+waifu-inpaint-xl",
                 "koharu-layout-rfdetr-seg-2xl",
                 "paddleocr-vl-1.6",
                 "translator",
