@@ -2,14 +2,14 @@
 //! Sessions may share [`Scratch`] to reuse activation memory sized per run.
 
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     ffi::CString,
     fs,
     io::{self, Write as _},
     path::{Path, PathBuf},
-    sync::{Arc, Mutex, MutexGuard, mpsc},
+    sync::{Arc, LazyLock, Mutex, MutexGuard, mpsc},
     thread,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime},
 };
 
 use anyhow::{Context as _, Result, anyhow, bail, ensure};
@@ -427,6 +427,33 @@ fn load_engine(onnx: &Path, ranges: &[ShapeRange<'_>], path: &Path) -> Result<En
     Engine::deserialize(&bytes)
 }
 
+/// A file's digest, or `None` when it does not exist. Digests are kept by
+/// path, size and modification time: models are reopened whenever memory
+/// pressure unloaded them, and rereading gigabytes of weights each time
+/// takes seconds.
+fn file_digest(path: &Path) -> Result<Option<blake3::Hash>> {
+    type Key = (PathBuf, u64, SystemTime);
+    static DIGESTS: LazyLock<Mutex<HashMap<Key, blake3::Hash>>> = LazyLock::new(Default::default);
+
+    let metadata = match fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error).with_context(|| format!("failed to read {}", path.display()));
+        }
+    };
+    let key = (path.to_owned(), metadata.len(), metadata.modified()?);
+    let digests = || DIGESTS.lock().unwrap_or_else(|error| error.into_inner());
+    if let Some(digest) = digests().get(&key) {
+        return Ok(Some(*digest));
+    }
+    let file =
+        fs::File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
+    let digest = blake3::Hasher::new().update_reader(file)?.finalize();
+    digests().insert(key, digest);
+    Ok(Some(digest))
+}
+
 fn out_of_memory(error: &anyhow::Error) -> bool {
     let message = error.to_string().to_ascii_lowercase();
     message.contains("outofmemory") || message.contains("out of memory")
@@ -434,22 +461,14 @@ fn out_of_memory(error: &anyhow::Error) -> bool {
 
 fn content_hash(path: &Path, ranges: &[ShapeRange<'_>]) -> Result<String> {
     let mut hasher = blake3::Hasher::new();
-    let mut file =
-        fs::File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
-    io::copy(&mut file, &mut hasher)?;
+    let graph = file_digest(path)?.with_context(|| format!("{} does not exist", path.display()))?;
+    hasher.update(graph.as_bytes());
     // A graph over 2 GB keeps its weights in an external data file, which
     // its own bytes only name.
     let mut weights = path.as_os_str().to_owned();
     weights.push(".data");
-    match fs::File::open(&weights) {
-        Ok(mut file) => {
-            io::copy(&mut file, &mut hasher)?;
-        }
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-        Err(error) => {
-            return Err(error)
-                .with_context(|| format!("failed to open {}", Path::new(&weights).display()));
-        }
+    if let Some(weights) = file_digest(Path::new(&weights))? {
+        hasher.update(weights.as_bytes());
     }
     for range in ranges {
         hasher.update(range.name.as_bytes());

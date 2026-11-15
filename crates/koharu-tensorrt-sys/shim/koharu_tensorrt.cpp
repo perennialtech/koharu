@@ -194,6 +194,9 @@ void ktrt_runtime_free(ktrt_runtime *runtime) {
 }
 
 ktrt_engine *ktrt_engine_deserialize(ktrt_runtime *runtime, void const *data, size_t size) {
+    // Callers read the reason to tell running out of memory from a stale
+    // engine, so an error from an earlier call must not stand in for it.
+    last_error.clear();
     std::unique_ptr<nvinfer1::ICudaEngine> engine{runtime->runtime->deserializeCudaEngine(data, size)};
     if (!engine) {
         return nullptr;
