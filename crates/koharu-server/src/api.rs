@@ -159,7 +159,8 @@ impl Upload {
         if self.decensor.unwrap_or(false) {
             stages.push(Stage::Decensoring);
         }
-        if self.translate.unwrap_or(true) {
+        let translate = self.translate.unwrap_or(true);
+        if translate {
             stages.extend([
                 Stage::Detection,
                 Stage::Ocr,
@@ -173,7 +174,12 @@ impl Upload {
                 "Nothing to do: decensor and translate are both false",
             ));
         }
-        for &engine in &self.translator {
+        let translator = if translate {
+            self.translator
+        } else {
+            Vec::new()
+        };
+        for &engine in &translator {
             engines
                 .providers
                 .validate(engine)
@@ -195,7 +201,7 @@ impl Upload {
             height: decoded.height(),
             language: self.target_language.unwrap_or(Language::English),
             instructions: self.instructions,
-            engines: (!self.translator.is_empty()).then_some(self.translator),
+            engines: (!translator.is_empty()).then_some(translator),
             stages,
         })
     }

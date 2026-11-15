@@ -382,6 +382,15 @@ async fn decensoring_is_opt_in_and_translation_can_be_skipped() {
             &[("decensor", "true"), ("translate", "false")][..],
             vec![Stage::Decensoring],
         ),
+        // Translation fields are not checked when nothing is translated.
+        (
+            &[
+                ("decensor", "true"),
+                ("translate", "false"),
+                ("translator", "deeplx"),
+            ][..],
+            vec![Stage::Decensoring],
+        ),
     ] {
         let response = upload_with_fields(&app, fields).await;
         assert_eq!(response.status(), StatusCode::ACCEPTED, "{fields:?}");

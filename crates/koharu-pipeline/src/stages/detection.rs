@@ -188,12 +188,7 @@ impl Model {
     }
 
     async fn run(&self, input: StageInput) -> Result<koharu_scene::Patch> {
-        let page = input.page;
-        let image = input
-            .images
-            .get(&input.scene, page, "source")
-            .await?
-            .ok_or_else(|| anyhow!("page {page} has no source image"))?;
+        let image = input.require_page_image().await?;
         let output = self.detect(image.clone()).await?;
         build_patch(&input, &image, output, &generation(PRODUCER, MODEL_ID)?).await
     }

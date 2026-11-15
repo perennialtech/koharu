@@ -58,18 +58,7 @@ impl StageProcessor for Processor {
     }
 
     fn skip(&self, input: &StageInput) -> Result<bool> {
-        let source = AssetRole::new("source")?;
-        for entity in input.scene.children(input.page)? {
-            if input
-                .scene
-                .component::<RasterLayer>(entity)?
-                .is_some_and(|layer| layer.kind == RasterLayerKind::Decensor)
-                && input.scene.asset(entity, &source)?.is_some()
-            {
-                return Ok(true);
-            }
-        }
-        Ok(false)
+        Ok(input.decensor_layer()?.is_some())
     }
 
     fn unload(&self) -> bool {
@@ -190,6 +179,7 @@ impl StageProcessor for Processor {
 
         let mut edit = input.scene.edit_as(generation(PRODUCER, MODEL)?);
         edit.observe_assets(page)?;
+        // Directly over the source and under any cleanup.
         let entity = edit.add_entity(page, At::Start)?;
         edit.set(
             entity,
