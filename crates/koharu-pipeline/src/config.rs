@@ -3,7 +3,7 @@ use koharu_translator::{GenerationConfig, Language, Provider};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use specta::Type;
 
-use crate::stages::{Flux2KleinConfig, KoharuLayoutRFDetrSeg2XLConfig};
+use crate::stages::KoharuLayoutRFDetrSeg2XLConfig;
 
 #[derive(Clone, Debug, PartialEq, Type)]
 pub struct PipelineConfig {
@@ -64,16 +64,12 @@ impl Serialize for PipelineConfig {
         };
         let inpainting = match &self.inpainting {
             InpaintingModel::LaMa {} => "lama",
-            InpaintingModel::Flux2Klein(_) => "flux2-klein",
         };
         let mut processor = self.processor.clone();
         let DetectionModel::KoharuLayoutRFDetrSeg2XL(config) = &self.detection;
         processor
             .koharu_layout_rfdetr_seg_2xl
             .get_or_insert_with(|| config.clone());
-        if let InpaintingModel::Flux2Klein(config) = &self.inpainting {
-            processor.flux2_klein.get_or_insert_with(|| config.clone());
-        }
         PipelineFile {
             detection: ModelSelection {
                 model: detection.to_owned(),
@@ -120,9 +116,6 @@ impl<'de> Deserialize<'de> for PipelineConfig {
         };
         let inpainting = match file.inpainting.model.as_str() {
             "lama" => InpaintingModel::LaMa {},
-            "flux2-klein" => {
-                InpaintingModel::Flux2Klein(file.processor.flux2_klein.clone().unwrap_or_default())
-            }
             model => {
                 return Err(serde::de::Error::custom(format!(
                     "unsupported inpainting model {model}"
@@ -193,15 +186,7 @@ impl PipelineConfig {
     }
 
     pub fn inpainting(&self) -> Result<InpaintingModel> {
-        match &self.inpainting {
-            InpaintingModel::LaMa {} => Ok(InpaintingModel::LaMa {}),
-            InpaintingModel::Flux2Klein(config) => Ok(InpaintingModel::Flux2Klein(
-                self.processor
-                    .flux2_klein
-                    .clone()
-                    .unwrap_or_else(|| config.clone()),
-            )),
-        }
+        Ok(self.inpainting.clone())
     }
 
     pub fn validate(&self) -> Result<()> {
@@ -216,8 +201,6 @@ impl PipelineConfig {
 pub struct ProcessorConfig {
     #[serde(rename = "koharu-layout-rfdetr-seg-2xl")]
     pub koharu_layout_rfdetr_seg_2xl: Option<KoharuLayoutRFDetrSeg2XLConfig>,
-    #[serde(rename = "flux2-klein")]
-    pub flux2_klein: Option<Flux2KleinConfig>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Type)]
@@ -239,8 +222,6 @@ pub enum OcrModel {
 pub enum InpaintingModel {
     #[serde(rename = "lama")]
     LaMa {},
-    #[serde(rename = "flux2-klein")]
-    Flux2Klein(Flux2KleinConfig),
 }
 
 #[cfg(test)]
@@ -270,10 +251,7 @@ mod tests {
                 model = "paddleocr-vl-1.6"
 
                 [inpainting]
-                model = "flux2-klein"
-
-                [processor."flux2-klein"]
-                prompt = "Remove the lettering."
+                model = "lama"
             "#,
         )
         .unwrap();
@@ -283,11 +261,7 @@ mod tests {
             DetectionModel::KoharuLayoutRFDetrSeg2XL(_)
         ));
         assert!(matches!(config.ocr, OcrModel::PaddleOcrVl1_6));
-        assert!(matches!(
-            config.inpainting(),
-            Ok(InpaintingModel::Flux2Klein(config))
-                if config.prompt == "Remove the lettering."
-        ));
+        assert!(matches!(config.inpainting(), Ok(InpaintingModel::LaMa {})));
     }
 
     #[test]
@@ -325,22 +299,17 @@ mod tests {
     }
 
     #[test]
-    fn parses_detection_and_generative_inpainting_options() {
+    fn parses_detection_options() {
         let config = toml::from_str::<PipelineConfig>(
             r#"
                 [detection]
                 model = "koharu-layout-rfdetr-seg-2xl"
-
-                [inpainting]
-                model = "flux2-klein"
 
                 [processor."koharu-layout-rfdetr-seg-2xl"]
                 text_threshold = 0.25
                 bubble_threshold = 0.45
                 panel_threshold = 0.55
 
-                [processor."flux2-klein"]
-                prompt = "Reconstruct the illustration without text."
             "#,
         )
         .unwrap();
@@ -352,33 +321,6 @@ mod tests {
                     && config.bubble_threshold == Some(0.45)
                     && config.panel_threshold == Some(0.55)
         ));
-        assert!(matches!(
-            config.inpainting().unwrap(),
-            InpaintingModel::Flux2Klein(config)
-                if config.prompt == "Reconstruct the illustration without text."
-        ));
-    }
-
-    #[test]
-    fn keeps_profiles_separate_from_active_stage_selection() {
-        let config = toml::from_str::<PipelineConfig>(
-            r#"
-                [detection]
-                model = "koharu-layout-rfdetr-seg-2xl"
-
-                [inpainting]
-                model = "flux2-klein"
-
-                [processor."flux2-klein"]
-                prompt = "saved prompt"
-            "#,
-        )
-        .unwrap();
-
-        let InpaintingModel::Flux2Klein(config) = config.inpainting().unwrap() else {
-            panic!("expected FLUX profile")
-        };
-        assert_eq!(config.prompt, "saved prompt");
     }
 
     #[test]
@@ -390,22 +332,15 @@ mod tests {
             }),
             ocr: OcrModel::PaddleOcrVl1_6,
             translation: TranslationConfig::default(),
-            inpainting: InpaintingModel::Flux2Klein(Flux2KleinConfig {
-                prompt: "Keep the line art.".to_owned(),
-            }),
+            inpainting: InpaintingModel::LaMa {},
             processor: ProcessorConfig::default(),
         };
         let document = toml::to_string(&config).unwrap();
         assert!(document.contains("[detection]\nmodel = \"koharu-layout-rfdetr-seg-2xl\""));
         assert!(document.contains("[processor.koharu-layout-rfdetr-seg-2xl]"));
-        assert!(document.contains("[processor.flux2-klein]"));
         assert!(document.contains("[translation]"));
-        assert!(!document.contains("prompt = \"Keep the line art.\"\n[inpainting]"));
 
         let restored = toml::from_str::<PipelineConfig>(&document).unwrap();
-        assert!(matches!(
-            restored.inpainting().unwrap(),
-            InpaintingModel::Flux2Klein(config) if config.prompt == "Keep the line art."
-        ));
+        assert_eq!(restored.detection().unwrap(), config.detection().unwrap());
     }
 }

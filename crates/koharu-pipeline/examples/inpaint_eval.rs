@@ -6,8 +6,7 @@ use std::{collections::BTreeMap, path::PathBuf, sync::Arc, time::Duration};
 use anyhow::{Context, Result};
 use koharu_config::Config;
 use koharu_pipeline::{
-    Committer, Flux2KleinConfig, InpaintingModel, Operation, Pipeline, PipelineConfig, Progress,
-    Request, Scope, Stage, StageOutput,
+    Committer, Operation, Pipeline, PipelineConfig, Progress, Request, Scope, Stage, StageOutput,
 };
 use koharu_rasterizer::{RasterOptions, Rasterizer};
 use koharu_renderer::Renderer;
@@ -28,27 +27,16 @@ async fn main() -> Result<()> {
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
     let mut args = std::env::args().skip(1);
-    let model = args
-        .next()
-        .context("usage: inpaint_eval <lama|flux2-klein> <pages> <out>")?;
-    let pages = PathBuf::from(args.next().context("missing pages directory")?);
+    let pages = PathBuf::from(args.next().context("usage: inpaint_eval <pages> <out>")?);
     let out = PathBuf::from(args.next().context("missing output directory")?);
     std::fs::create_dir_all(&out)?;
 
-    let mut config = PipelineConfig::default();
-    config.inpainting = match model.as_str() {
-        "lama" => InpaintingModel::LaMa {},
-        "flux2-klein" => InpaintingModel::Flux2Klein(Flux2KleinConfig::default()),
-        other => anyhow::bail!("unknown inpainting model {other}"),
-    };
-    let mut features = vec![
+    let config = PipelineConfig::default();
+    let features = [
         koharu_ml::Feature::Torch,
         koharu_ml::Feature::OnnxRuntime,
         koharu_ml::Feature::TensorRt,
     ];
-    if matches!(&config.inpainting, InpaintingModel::Flux2Klein(_)) {
-        features.push(koharu_ml::Feature::Diffusion);
-    }
     koharu_ml::init(&features).await?;
     let pipeline = Pipeline::from_config(
         Config::memory(config),

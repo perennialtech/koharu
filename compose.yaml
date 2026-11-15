@@ -18,7 +18,6 @@ services:
       - koharu-cache:/var/cache/koharu
     environment:
       - KOHARU_TRANSLATORS
-      - KOHARU_INPAINTING
       - KOHARU_DEEPLX_BASE_URL
       - KOHARU_OPENAI_COMPATIBLE_BASE_URL
       - KOHARU_OPENAI_COMPATIBLE_MODEL

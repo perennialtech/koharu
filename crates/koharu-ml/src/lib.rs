@@ -7,19 +7,16 @@ use tokio::sync::OnceCell;
 mod backend;
 
 pub mod comic_text_bubble_detector;
-pub mod flux2_klein;
 pub mod koharu_layout_rfdetr_seg_2xl;
 pub mod lama;
 pub mod llm;
 pub mod paddle_ocr_vl_quantized;
 
-pub use koharu_diffusion as diffusion;
 pub use koharu_llama as llama;
 pub use koharu_runtime::{Backend, Device, DeviceType, Feature};
 pub use koharu_torch as torch;
 
 static LLAMA: OnceCell<LlamaBackend> = OnceCell::const_new();
-static DIFFUSION: OnceCell<()> = OnceCell::const_new();
 static ONNX: OnceCell<ort::environment::Environment> = OnceCell::const_new();
 struct Initialized {
     device: Device,
@@ -47,15 +44,6 @@ pub async fn init(features: &[Feature]) -> anyhow::Result<()> {
                     .get_or_try_init(|| async {
                         koharu_llama::send_logs_to_tracing(koharu_llama::LogOptions::default());
                         LlamaBackend::init().context("failed to initialize llama.cpp backend")
-                    })
-                    .await?;
-            }
-            if features.contains(&Feature::Diffusion) {
-                DIFFUSION
-                    .get_or_try_init(|| async {
-                        koharu_diffusion::send_logs_to_tracing()
-                            .context("failed to redirect stable-diffusion.cpp logs")?;
-                        Ok::<(), anyhow::Error>(())
                     })
                     .await?;
             }

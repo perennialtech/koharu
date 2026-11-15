@@ -13,8 +13,8 @@ use anyhow::{Context, Result};
 use axum::body::Bytes;
 use koharu_config::Config;
 use koharu_pipeline::{
-    Committer, InpaintingModel, Pipeline, PipelineError, Request as PipelineRequest,
-    RequestTranslation, RunStatus, Scope, StageOutput, StopToken,
+    Committer, Pipeline, PipelineError, Request as PipelineRequest, RequestTranslation, RunStatus,
+    Scope, StageOutput, StopToken,
 };
 use koharu_rasterizer::{RasterOptions, Rasterizer};
 use koharu_renderer::Renderer;
@@ -57,15 +57,12 @@ async fn run(arguments: &Arguments) -> Result<()> {
         .context("worker stdin is not a socket")?
         .into_split();
     let (pipeline_config, provider_config) = arguments.configs()?;
-    let mut features = vec![
+    let features = [
         koharu_ml::Feature::Torch,
         koharu_ml::Feature::Llama,
         koharu_ml::Feature::OnnxRuntime,
         koharu_ml::Feature::TensorRt,
     ];
-    if matches!(&pipeline_config.inpainting, InpaintingModel::Flux2Klein(_)) {
-        features.push(koharu_ml::Feature::Diffusion);
-    }
     koharu_ml::init(&features)
         .await
         .context("cannot initialize model runtimes")?;

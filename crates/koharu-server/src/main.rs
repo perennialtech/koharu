@@ -10,19 +10,13 @@ mod worker;
 use std::{future::Future, net::SocketAddr, time::Duration};
 
 use anyhow::{Context, Result};
-use clap::{Parser, ValueEnum};
-use koharu_pipeline::{Flux2KleinConfig, InpaintingModel, PipelineConfig};
+use clap::Parser;
+use koharu_pipeline::PipelineConfig;
 use koharu_translator::{Provider, ProvidersConfig};
 use tracing_subscriber::EnvFilter;
 use url::Url;
 
 use jobs::Jobs;
-
-#[derive(Clone, Copy, Debug, ValueEnum)]
-enum InpaintingChoice {
-    Lama,
-    Flux2Klein,
-}
 
 #[derive(Debug, Parser)]
 #[command(version, about = "Translate manga page images over HTTP")]
@@ -65,10 +59,6 @@ struct Arguments {
     #[arg(long, env = "KOHARU_AZURE_REGION")]
     azure_region: Option<String>,
 
-    /// Inpainting model used to erase original text.
-    #[arg(long, env = "KOHARU_INPAINTING", value_enum, default_value = "lama")]
-    inpainting: InpaintingChoice,
-
     /// Run as the model worker. The server starts it with this flag.
     #[arg(long, hide = true)]
     worker: bool,
@@ -92,12 +82,6 @@ impl Arguments {
                 .validate(*engine)
                 .with_context(|| format!("cannot use translator {engine}"))?;
         }
-        pipeline.inpainting = match self.inpainting {
-            InpaintingChoice::Lama => InpaintingModel::LaMa {},
-            InpaintingChoice::Flux2Klein => {
-                InpaintingModel::Flux2Klein(Flux2KleinConfig::default())
-            }
-        };
         Ok((pipeline, providers))
     }
 }
@@ -303,13 +287,12 @@ mod tests {
     }
 
     #[test]
-    fn cli_defaults_to_keyless_engines_and_keeps_selected_inpainter() {
-        let (config, _) = configs(&["--inpainting", "flux2-klein"]).unwrap();
+    fn cli_defaults_to_keyless_engines() {
+        let (config, _) = configs(&[]).unwrap();
         assert_eq!(
             config.translation.engines,
             [Provider::GoogleWeb, Provider::MicrosoftEdge]
         );
-        assert!(matches!(config.inpainting, InpaintingModel::Flux2Klein(_)));
     }
 
     #[test]

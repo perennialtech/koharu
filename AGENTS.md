@@ -28,7 +28,7 @@ Document only durable, repository-specific constraints here. Do not record curre
 - Keep safe public APIs separate from unsafe FFI, dynamic loading, and build integration.
 - Do not hand-edit generated or derived source. Change its authoritative input and run the generator.
 - Do not commit credentials, model weights, datasets, generated outputs, or machine-specific artifacts.
-- Native llama.cpp and diffusion runtimes come from prebuilt packages. Do not compile those CUDA trees inside the app build. Release and publish jobs do a fresh build.
+- Native llama.cpp runtimes come from prebuilt packages. Do not compile those CUDA trees inside the app build. Release and publish jobs do a fresh build.
 - Hardware discovery stays separate from managed runtime package activation. Do not load a cached accelerator runtime during the probe.
 
 ## ML Architecture

@@ -22,8 +22,6 @@ koharu-bindgen = { path = "crates/koharu-bindgen" }
 koharu-config = { path = "crates/koharu-config" }
 koharu-storage = { path = "crates/koharu-storage" }
 koharu-scene = { path = "crates/koharu-scene" }
-koharu-diffusion = { path = "crates/koharu-diffusion" }
-koharu-diffusion-sys = { path = "crates/koharu-diffusion-sys" }
 koharu-llama = { path = "crates/koharu-llama" }
 koharu-llama-sys = { path = "crates/koharu-llama-sys" }
 koharu-runtime = { path = "crates/koharu-runtime" }

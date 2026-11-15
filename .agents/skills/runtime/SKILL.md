@@ -1,6 +1,6 @@
 ---
 name: runtime
-description: Sync Koharu's llama.cpp and stable-diffusion.cpp headers and Rust bindings. Use when updating native runtime releases, vendored C/C++ headers, koharu-llama, or koharu-diffusion after upstream API changes.
+description: Sync Koharu's llama.cpp headers and Rust bindings. Use when updating native runtime releases, vendored C/C++ headers, or koharu-llama after upstream API changes.
 ---
 
 # Runtime
@@ -11,11 +11,10 @@ Run from the repository root:
 .agents/skills/runtime/scripts/sync.sh
 ```
 
-The script updates only the vendored C/C++ headers and prints the latest published llama.cpp and stable-diffusion.cpp versions.
+The script updates only the vendored C/C++ headers and prints the latest published llama.cpp version.
 
-Use those versions to update:
+Use that version to update:
 
 - `crates/koharu-runtime/src/runtime/packages/llama.rs`
-- `crates/koharu-runtime/src/runtime/packages/diffusion.rs`
 
-Then review the generated bindings, update the safe wrappers as needed, and run the focused Cargo checks for the five runtime crates.
+Then review the generated bindings, update the safe wrappers as needed, and run the focused Cargo checks for the three runtime crates.

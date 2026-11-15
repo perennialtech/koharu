@@ -2567,26 +2567,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "koharu-diffusion"
-version = "0.83.5"
-dependencies = [
- "image",
- "koharu-diffusion-sys",
- "thiserror 2.0.21",
- "tracing",
-]
-
-[[package]]
-name = "koharu-diffusion-sys"
-version = "0.83.5"
-dependencies = [
- "anyhow",
- "koharu-bindgen",
- "libc",
- "libloading 0.9.0",
-]
-
-[[package]]
 name = "koharu-llama"
 version = "0.83.5"
 dependencies = [
@@ -2621,7 +2601,6 @@ dependencies = [
  "fast_image_resize",
  "image",
  "imageproc",
- "koharu-diffusion",
  "koharu-llama",
  "koharu-runtime",
  "koharu-tensorrt",

@@ -100,9 +100,9 @@ without a container.
 Run `koharu-server --help` (or `./target/debug/koharu-server --help`) for the
 supported flags, defaults, environment-variable fallbacks and the API keys
 each translation provider reads. You can choose the translation engines and
-their failover order, the models LLM engines use, the inpainting model, the
-listener address, and the endpoints of self-hosted translators there. API
-callers choose engines by name but never their models.
+their failover order, the models LLM engines use, the listener address, and
+the endpoints of self-hosted translators there. API callers choose engines by
+name but never their models.
 
 Every translation engine is a remote service, so recognized text goes to the
 engines you select; LLM engines also receive the page image. Without any

@@ -11,35 +11,16 @@ use image::{
     Rgba, RgbaImage,
 };
 use imageproc::region_labelling::{Connectivity, connected_components};
-use koharu_ml::{
-    flux2_klein::{Flux2KleinInpaint, Flux2KleinInpaintOptions},
-    lama::{InpaintRequest, LaMa},
-};
+use koharu_ml::lama::{InpaintRequest, LaMa};
 use koharu_scene::{
     AssetInput, AssetMetadata, AssetRole, At, BubbleRegion, EntityOrigin, Geometry, Origin,
     RasterLayer, RasterLayerKind, Region, RegionSpec,
 };
-use serde::{Deserialize, Serialize};
-use specta::Type;
 
 use super::{StageInput, StageProcessor, finish, generation};
 use crate::{InpaintingModel, ModelCell};
 
 const PRODUCER: &str = "dev.koharu.pipeline.inpainting";
-
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Type)]
-#[serde(default)]
-pub struct Flux2KleinConfig {
-    pub prompt: String,
-}
-
-impl Default for Flux2KleinConfig {
-    fn default() -> Self {
-        Self {
-            prompt: "Remove the text and reconstruct the background.".to_owned(),
-        }
-    }
-}
 
 pub(super) struct Processor {
     config: InpaintingModel,
@@ -49,16 +30,6 @@ pub(super) struct Processor {
 
 impl Processor {
     pub(super) fn new(config: InpaintingModel, device: koharu_ml::Device) -> Result<Self> {
-        match &config {
-            InpaintingModel::LaMa {} => {}
-            InpaintingModel::Flux2Klein(settings) => {
-                ensure!(
-                    !settings.prompt.contains('\0'),
-                    "FLUX.2 prompt contains NUL"
-                );
-            }
-        }
-
         Ok(Self {
             config,
             device,
@@ -72,7 +43,6 @@ impl StageProcessor for Processor {
     fn model(&self) -> &'static str {
         match self.config {
             InpaintingModel::LaMa {} => "lama",
-            InpaintingModel::Flux2Klein(_) => "flux2-klein",
         }
     }
 
@@ -117,73 +87,6 @@ impl StageProcessor for Processor {
 
 enum Model {
     LaMa(Arc<Mutex<LaMa>>),
-    Flux {
-        lama: Arc<Mutex<LaMa>>,
-        model: Arc<Mutex<Flux2KleinInpaint>>,
-        config: Flux2KleinConfig,
-    },
-}
-
-// FLUX.2 refines a LaMa fill instead of generating the masked region from
-// noise. From full noise it often paints blobs into white balloons and needs
-// all four steps. Starting partway down the schedule from the LaMa fill takes
-// fewer steps and repairs LaMa's smears. The reference image keeps the
-// original crop so the model still sees what it is removing.
-//
-// Cheaper variants measured on the hard-page set and rejected for quality:
-// one step leaves smears and drops detail; a half-scale reference saves a
-// quarter of the time but leaves text remnants and invents details; no
-// reference, or text conditioning without its 512-token padding, paints
-// unrelated photos into balloons.
-//
-// LaMa's fill stays plausible near known pixels and turns to blur deeper
-// inside large masks, such as big free text over artwork. On the hard-page set
-// every balloon and small-text tile reaches at most 63 px from known pixels and
-// refines cleanly in two steps, while the large free-text tiles reach 105 px
-// or more and need a third step to redraw detail.
-const FLUX_DEEP_MASK: u8 = 80;
-
-// A uniform LaMa fill, such as a plain balloon the flat fill missed, is
-// already exact. Fills with any visible variation still go to FLUX.2, which
-// removes the faint remnants LaMa leaves.
-const UNIFORM_FILL_MAX_DEVIATION: f64 = 2.0;
-
-fn is_uniform_fill(filled: &RgbImage, mask: &GrayImage) -> bool {
-    let mut channels = [Vec::new(), Vec::new(), Vec::new()];
-    for (pixel, mask) in filled.pixels().zip(mask.pixels()) {
-        if mask[0] >= 127 {
-            for channel in 0..3 {
-                channels[channel].push(pixel[channel]);
-            }
-        }
-    }
-    !channels[0].is_empty()
-        && channels.iter().all(|values| {
-            let mean =
-                values.iter().map(|&value| f64::from(value)).sum::<f64>() / values.len() as f64;
-            standard_deviation(values, mean) < UNIFORM_FILL_MAX_DEVIATION
-        })
-}
-
-fn flux_refine_options(mask: &GrayImage) -> Flux2KleinInpaintOptions {
-    let known = GrayImage::from_fn(mask.width(), mask.height(), |x, y| {
-        Luma([u8::from(mask.get_pixel(x, y)[0] < 127) * u8::MAX])
-    });
-    let depth = imageproc::distance_transform::distance_transform(
-        &known,
-        imageproc::distance_transform::Norm::L1,
-    );
-    let deep = depth
-        .as_raw()
-        .iter()
-        .any(|&distance| distance > FLUX_DEEP_MASK);
-    Flux2KleinInpaintOptions {
-        padding_mask_crop: None,
-        // Four-step schedule: 0.5 runs its last two steps, 0.75 its last three.
-        strength: if deep { 0.75 } else { 0.5 },
-        num_inference_steps: 4,
-        seed: 42,
-    }
 }
 
 impl Model {
@@ -191,15 +94,6 @@ impl Model {
         match config {
             InpaintingModel::LaMa {} => {
                 Ok(Self::LaMa(Arc::new(Mutex::new(LaMa::load(device).await?))))
-            }
-            InpaintingModel::Flux2Klein(config) => {
-                let (lama, model) =
-                    tokio::try_join!(LaMa::load(device.clone()), Flux2KleinInpaint::load(device))?;
-                Ok(Self::Flux {
-                    lama: Arc::new(Mutex::new(lama)),
-                    model: Arc::new(Mutex::new(model)),
-                    config: config.clone(),
-                })
             }
         }
     }
@@ -238,50 +132,6 @@ impl Model {
                                     mask,
                                     &InpaintRequest::default(),
                                 )?))
-                            },
-                        )
-                    })
-                    .await?,
-                )
-            }
-            Self::Flux {
-                lama,
-                model,
-                config,
-            } => {
-                let lama = lama.clone();
-                let model = model.clone();
-                let config = config.clone();
-                (
-                    "flux2-klein",
-                    tokio_rayon::spawn(move || -> Result<DynamicImage> {
-                        let lama = lama
-                            .lock()
-                            .map_err(|_| anyhow!("LaMa model lock is poisoned"))?;
-                        let model = model
-                            .lock()
-                            .map_err(|_| anyhow!("FLUX model lock is poisoned"))?;
-                        inpaint_tiled(
-                            &prepared.image,
-                            &prepared.mask,
-                            &prepared.text_mask,
-                            &prepared.flat_fill_regions,
-                            FLUX_TILE_CONTEXT,
-                            |_, _| None,
-                            |image, mask| {
-                                let filled =
-                                    lama.inference(image, mask, &InpaintRequest::default())?;
-                                if is_uniform_fill(&filled, mask) {
-                                    return Ok(DynamicImage::ImageRgb8(filled));
-                                }
-                                let filled = DynamicImage::ImageRgb8(filled);
-                                model.inference(
-                                    &config.prompt,
-                                    &filled,
-                                    Some(image),
-                                    &DynamicImage::ImageLuma8(mask.clone()),
-                                    &flux_refine_options(mask),
-                                )
                             },
                         )
                     })
@@ -520,12 +370,8 @@ async fn prepare(input: &StageInput) -> Result<InpaintInput> {
 
 const TILE_SIZE: u32 = 512;
 // Known pixels kept around each model crop. LaMa uses wide context to continue
-// texture into the mask. FLUX.2's time grows with crop area, and with less
-// context its refinement stays closer to the LaMa fill. At 128 px it sometimes
-// painted unrelated objects into large free-text masks, and at 64 px it left
-// LaMa's smears in place.
+// texture into the mask.
 const LAMA_TILE_CONTEXT: u32 = 128;
-const FLUX_TILE_CONTEXT: u32 = 96;
 const UNIFORM_BACKGROUND_MIN_PIXELS: usize = 16;
 const FLAT_FILL_EDGE_MARGIN: f32 = 3.0;
 
@@ -997,34 +843,6 @@ fn composite_generated(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn flux_refines_deep_masks_for_an_extra_step() {
-        let stroke = GrayImage::from_fn(400, 400, |x, _| {
-            Luma([u8::from((190..210).contains(&x)) * 255])
-        });
-        assert_eq!(flux_refine_options(&stroke).strength, 0.5);
-        let block = GrayImage::from_fn(400, 400, |x, y| {
-            Luma([u8::from((20..380).contains(&x) && (20..380).contains(&y)) * 255])
-        });
-        assert_eq!(flux_refine_options(&block).strength, 0.75);
-    }
-
-    #[test]
-    fn only_uniform_masked_fills_skip_flux() {
-        let mask = GrayImage::from_fn(64, 64, |x, _| Luma([u8::from(x < 32) * 255]));
-        let flat = RgbImage::from_fn(64, 64, |x, _| {
-            if x < 32 {
-                Rgb([250, 250, 250])
-            } else {
-                Rgb([0, 0, 0])
-            }
-        });
-        assert!(is_uniform_fill(&flat, &mask));
-        let gradient = RgbImage::from_fn(64, 64, |x, _| Rgb([100 + x as u8, 200, 200]));
-        assert!(!is_uniform_fill(&gradient, &mask));
-        assert!(!is_uniform_fill(&flat, &GrayImage::new(64, 64)));
-    }
 
     #[tokio::test]
     async fn transient_inpainting_mask_replaces_persistent_page_masks() {
