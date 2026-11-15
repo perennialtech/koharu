@@ -21,9 +21,12 @@ use crate::ModelCell;
 const PRODUCER: &str = "dev.koharu.pipeline.decensoring";
 const MODEL: &str = "kitsumed-yolo11m-seg+waifu-inpaint-xl";
 /// Pixels added around each detected censor. The detector's outlines stop
-/// short of a censor's edge (it covers 87% of censored pixels on real art),
-/// and a sliver left behind keeps the censor visible.
-const MASK_GROWTH: u8 = 8;
+/// short of a censor's edge, and a sliver left behind keeps the censor
+/// visible. On 73 real pages, 16 px leaves 77% of censors at least 98%
+/// covered against 73% at 8 px; past 16 px coverage barely rises while more
+/// of the page is repainted
+/// (https://github.com/perennialtech/censor-detect-eval).
+const MASK_GROWTH: u8 = 16;
 /// How far down the schedule mosaics are refined from.
 const MOSAIC_STRENGTH: f32 = 0.8;
 /// Known pixels kept around each generated crop.
