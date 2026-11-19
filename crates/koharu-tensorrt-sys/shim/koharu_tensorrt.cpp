@@ -249,17 +249,12 @@ int64_t ktrt_engine_device_memory(ktrt_engine const *engine) {
     return engine->engine->getDeviceMemorySizeV2();
 }
 
-ktrt_context *ktrt_context_create(ktrt_engine *engine, void const *cache, size_t cache_size, int32_t cuda_graph,
-                                  int32_t user_managed_memory) {
+ktrt_context *ktrt_context_create(ktrt_engine *engine, void const *cache, size_t cache_size, int32_t cuda_graph) {
     auto context = std::make_unique<ktrt_context>();
     context->config.reset(engine->engine->createRuntimeConfig());
     if (!context->config) {
         fail("failed to create a TensorRT-RTX runtime configuration");
         return nullptr;
-    }
-    if (user_managed_memory != 0) {
-        context->config->setExecutionContextAllocationStrategy(
-            nvinfer1::ExecutionContextAllocationStrategy::kUSER_MANAGED);
     }
     context->cache.reset(context->config->createRuntimeCache());
     if (!context->cache) {
@@ -311,22 +306,6 @@ int32_t ktrt_context_set_input_shape(ktrt_context *context, char const *name, in
         return 1;
     }
     return context->context->setInputShape(name, dims_from(dims, rank)) ? 0 : 1;
-}
-
-int32_t ktrt_context_update_device_memory_size(ktrt_context *context, size_t *size) {
-    last_error.clear();
-    *size = context->context->updateDeviceMemorySizeForShapes();
-    if (*size == 0) {
-        if (last_error.empty()) {
-            fail("failed to size TensorRT-RTX activation memory for the input shapes");
-        }
-        return 1;
-    }
-    return 0;
-}
-
-void ktrt_context_set_device_memory(ktrt_context *context, void *memory, int64_t size) {
-    context->context->setDeviceMemoryV2(memory, size);
 }
 
 int32_t ktrt_context_io_shape(ktrt_context const *context, char const *name, int64_t *dims, int32_t capacity) {

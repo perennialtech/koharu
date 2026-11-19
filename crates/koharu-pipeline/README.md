@@ -1,7 +1,7 @@
 # koharu-pipeline
 
-`koharu-pipeline` coordinates decensoring, detection, OCR, translation, and
-inpainting over a `koharu_scene` project. It owns model lifetime and scheduling; the caller owns
+`koharu-pipeline` coordinates detection, OCR, translation, and inpainting over a
+`koharu_scene` project. It owns model lifetime and scheduling; the caller owns
 durability through the `Committer` trait.
 
 The execution unit is one stage on one page. A stage result is committed as

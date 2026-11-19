@@ -363,42 +363,12 @@ async fn lists_engines_and_keeps_requested_failover_order() {
 }
 
 #[tokio::test]
-async fn decensoring_is_opt_in_and_translation_can_be_skipped() {
+async fn rejects_removed_upload_fields_before_queueing() {
     let (jobs, mut queue) = Jobs::new();
     let app = router(jobs, engines());
-    let translation = [
-        Stage::Detection,
-        Stage::Ocr,
-        Stage::Translation,
-        Stage::Inpainting,
-    ];
-    for (fields, stages) in [
-        (&[][..], translation.to_vec()),
-        (
-            &[("decensor", "true")][..],
-            [&[Stage::Decensoring][..], &translation].concat(),
-        ),
-        (
-            &[("decensor", "true"), ("translate", "false")][..],
-            vec![Stage::Decensoring],
-        ),
-        // Translation fields are not checked when nothing is translated.
-        (
-            &[
-                ("decensor", "true"),
-                ("translate", "false"),
-                ("translator", "deeplx"),
-            ][..],
-            vec![Stage::Decensoring],
-        ),
-    ] {
-        let response = upload_with_fields(&app, fields).await;
-        assert_eq!(response.status(), StatusCode::ACCEPTED, "{fields:?}");
-        assert_eq!(queue.recv().await.unwrap().start().unwrap().stages, stages);
-    }
-    for fields in [&[("translate", "false")][..], &[("decensor", "yes")]] {
-        let response = upload_with_fields(&app, fields).await;
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{fields:?}");
+    for field in [("decensor", "true"), ("translate", "false")] {
+        let response = upload_with_fields(&app, &[field]).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
     assert!(queue.try_recv().is_err());
 }

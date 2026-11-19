@@ -4,9 +4,6 @@
 //! The serialized engine is built once per model file and TensorRT-RTX
 //! version; the kernels TensorRT-RTX compiles for the GPU are kept in a
 //! runtime cache beside it, so later processes skip both steps.
-//! Sessions can share a [`Scratch`] to serialize runs and reuse one activation
-//! allocation sized for the largest run so far. Without it, each context
-//! reserves activation memory for the maximum across its engine's profiles.
 //!
 //! The TensorRT-RTX and CUDA runtime libraries must already be loaded by
 //! koharu-runtime's package before the first call.
@@ -23,7 +20,7 @@ use koharu_tensorrt_sys as sys;
 pub use self::{
     cuda::{DeviceBuffer, Element, Stream},
     engine::{DataType, ShapeRange, TensorInfo},
-    session::{Binding, Scratch, Session},
+    session::{Binding, Session},
 };
 
 /// Resolves the loaded libraries and initializes TensorRT-RTX. Later calls

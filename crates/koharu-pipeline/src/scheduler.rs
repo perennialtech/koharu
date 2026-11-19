@@ -144,8 +144,7 @@ impl Scheduler {
 
 const fn prerequisite(stage: Stage) -> Option<Stage> {
     match stage {
-        Stage::Decensoring => None,
-        Stage::Detection => Some(Stage::Decensoring),
+        Stage::Detection => None,
         Stage::Ocr | Stage::Inpainting => Some(Stage::Detection),
         Stage::Translation => Some(Stage::Ocr),
     }
@@ -162,13 +161,7 @@ mod tests {
     #[test]
     fn starts_pages_in_order_and_models_independently() {
         let pages = pages(2);
-        let stages = [
-            Stage::Detection,
-            Stage::Ocr,
-            Stage::Translation,
-            Stage::Inpainting,
-        ];
-        let mut scheduler = Scheduler::new(&pages, &stages);
+        let mut scheduler = Scheduler::new(&pages, &Stage::ALL);
         let mut busy = BTreeSet::new();
 
         let first = scheduler.start_next(&busy).unwrap();
@@ -194,26 +187,6 @@ mod tests {
         assert_eq!(translation, (pages[0], Stage::Translation));
         assert!(busy.contains(&Stage::Detection));
         assert!(busy.contains(&Stage::Inpainting));
-    }
-
-    #[test]
-    fn detection_waits_for_decensoring() {
-        let pages = pages(1);
-        let mut scheduler = Scheduler::new(&pages, &[Stage::Decensoring, Stage::Detection]);
-        let mut busy = BTreeSet::new();
-
-        assert_eq!(
-            scheduler.start_next(&busy),
-            Some((pages[0], Stage::Decensoring))
-        );
-        busy.insert(Stage::Decensoring);
-        assert!(scheduler.start_next(&busy).is_none());
-        busy.clear();
-        assert!(!scheduler.complete_stage(pages[0], Stage::Decensoring));
-        assert_eq!(
-            scheduler.start_next(&busy),
-            Some((pages[0], Stage::Detection))
-        );
     }
 
     #[test]
