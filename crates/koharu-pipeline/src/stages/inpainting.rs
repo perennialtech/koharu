@@ -392,9 +392,9 @@ struct InpaintTile {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct MaskComponent {
-    label: u32,
-    bounds: [u32; 4],
+pub(super) struct MaskComponent {
+    pub(super) label: u32,
+    pub(super) bounds: [u32; 4],
 }
 
 // BallonsTranslator avoids model inference for a text block when the non-text
@@ -555,7 +555,9 @@ fn inpaint_tiles(
     (labels, bounded_tiles)
 }
 
-fn mask_components(mask: &GrayImage) -> (ImageBuffer<Luma<u32>, Vec<u32>>, Vec<MaskComponent>) {
+pub(super) fn mask_components(
+    mask: &GrayImage,
+) -> (ImageBuffer<Luma<u32>, Vec<u32>>, Vec<MaskComponent>) {
     let binary = GrayImage::from_fn(mask.width(), mask.height(), |x, y| {
         Luma([(mask.get_pixel(x, y)[0] >= 127) as u8 * u8::MAX])
     });
@@ -605,7 +607,7 @@ fn bounds_area([left, top, right, bottom]: [u32; 4]) -> u64 {
     u64::from(right - left) * u64::from(bottom - top)
 }
 
-fn expand_bounds(
+pub(super) fn expand_bounds(
     [left, top, right, bottom]: [u32; 4],
     context: u32,
     width: u32,
@@ -622,7 +624,12 @@ fn expand_bounds(
 /// Grows `crop` to `size` (width, height), or to the whole page where the page
 /// is smaller, keeping it centred where the page allows. `crop` must fit in
 /// `size`.
-fn fixed_size_crop(crop: [u32; 4], size: (u32, u32), width: u32, height: u32) -> [u32; 4] {
+pub(super) fn fixed_size_crop(
+    crop: [u32; 4],
+    size: (u32, u32),
+    width: u32,
+    height: u32,
+) -> [u32; 4] {
     let axis = |start: u32, end: u32, length: u32, size: u32| {
         if length <= size {
             return (0, length);
