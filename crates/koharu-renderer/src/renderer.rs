@@ -642,7 +642,6 @@ impl Traversal<'_> {
                     let kind = match raster.kind {
                         RasterLayerKind::Cleanup => ImageKind::Cleanup,
                         RasterLayerKind::Paint => ImageKind::Paint,
-                        RasterLayerKind::Decensor => ImageKind::Decensor,
                     };
                     self.layers.push(image_draft(
                         entity,

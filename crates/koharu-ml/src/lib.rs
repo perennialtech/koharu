@@ -7,12 +7,10 @@ use tokio::sync::OnceCell;
 mod backend;
 
 pub mod comic_text_bubble_detector;
-pub mod kitsumed_yolo11m_seg;
 pub mod koharu_layout_rfdetr_seg_2xl;
 pub mod lama;
 pub mod llm;
 pub mod paddle_ocr_vl_quantized;
-pub mod waifu_inpaint_xl;
 
 pub use koharu_llama as llama;
 pub use koharu_runtime::{Backend, Device, DeviceType, Feature};

@@ -191,7 +191,6 @@ mod tests {
             language: Language::English,
             instructions: instructions.map(ToOwned::to_owned),
             engines: None,
-            stages: vec![koharu_pipeline::Stage::Detection],
         }
     }
 

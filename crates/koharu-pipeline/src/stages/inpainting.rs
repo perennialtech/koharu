@@ -192,8 +192,7 @@ impl Model {
             }
             entity
         } else {
-            let at = cleanup_position(&input, &mut edit)?;
-            let entity = edit.add_entity(page, at)?;
+            let entity = edit.add_entity(page, At::Start)?;
             edit.set(
                 entity,
                 &RasterLayer {
@@ -221,20 +220,8 @@ impl Model {
     }
 }
 
-/// Where a new cleanup layer goes: over the decensored page, so the cleanup
-/// is what shows where text and a repainted censor overlap.
-fn cleanup_position(input: &StageInput, edit: &mut koharu_scene::Edit) -> Result<At> {
-    Ok(match input.decensor_layer()? {
-        Some(layer) => {
-            edit.observe_assets(layer)?;
-            At::After(layer)
-        }
-        None => At::Start,
-    })
-}
-
 #[derive(Clone, Debug)]
-pub(super) struct FlatFillRegion {
+struct FlatFillRegion {
     bounds: [u32; 4],
     polygon: Vec<(f32, f32)>,
 }
@@ -403,7 +390,7 @@ struct MaskComponent {
 // https://github.com/dmMaze/BallonsTranslator/blob/4bcc635c19f6c63a902872cf77b3d554e14ed1b7/ballontranslator/modules/inpaint/base.py#L168-L200
 // Koharu uses the detected bubble polygons as those blocks. Uniform bubbles are
 // filled first; only the remaining mask is split into bounded model crops.
-pub(super) fn inpaint_tiled(
+fn inpaint_tiled(
     image: &DynamicImage,
     mask: &GrayImage,
     text_mask: &GrayImage,
@@ -974,84 +961,6 @@ mod tests {
 
         assert!(processor.skip(&automatic).unwrap());
         assert!(!processor.skip(&manual).unwrap());
-    }
-
-    #[tokio::test]
-    async fn cleanup_reads_and_stacks_over_the_decensored_page() {
-        let mut session = koharu_scene::Session::memory().await.unwrap();
-        let encode = |image: DynamicImage| {
-            let mut bytes = Cursor::new(Vec::new());
-            image.write_to(&mut bytes, ImageFormat::Png).unwrap();
-            AssetInput::new(
-                Arc::<[u8]>::from(bytes.into_inner()),
-                "image/png",
-                AssetMetadata {
-                    width: Some(4),
-                    height: Some(4),
-                    attributes: BTreeMap::new(),
-                },
-            )
-        };
-        let mut decensor = RgbaImage::new(4, 4);
-        decensor.put_pixel(1, 1, Rgba([200, 100, 50, 255]));
-        let mut text = GrayImage::new(4, 4);
-        text.put_pixel(1, 1, Luma([255]));
-        let mut ids = None;
-        let patch = session
-            .snapshot()
-            .patch(|edit| {
-                let page = edit.add_page(
-                    koharu_scene::PageDraft::new("page", 4.0, 4.0),
-                    koharu_scene::At::End,
-                )?;
-                edit.set_asset(
-                    page,
-                    &AssetRole::new("source")?,
-                    encode(DynamicImage::new_rgb8(4, 4)),
-                )?;
-                edit.set_asset(
-                    page,
-                    &AssetRole::new("text-mask")?,
-                    encode(DynamicImage::ImageLuma8(text.clone())),
-                )?;
-                let layer = edit.add_entity(page, At::Start)?;
-                edit.set(
-                    layer,
-                    &RasterLayer {
-                        origin: Origin::User,
-                        name: "Decensor".to_owned(),
-                        kind: RasterLayerKind::Decensor,
-                    },
-                )?;
-                edit.set_asset(
-                    layer,
-                    &AssetRole::new("source")?,
-                    encode(DynamicImage::ImageRgba8(decensor.clone())),
-                )?;
-                ids = Some((page, layer));
-                Ok(())
-            })
-            .unwrap();
-        let snapshot = session.commit(patch).await.unwrap().snapshot;
-        let (page, layer) = ids.unwrap();
-        let input = StageInput::new(
-            snapshot.clone(),
-            page,
-            None,
-            None,
-            Arc::new(crate::ImageCache::default()),
-            None,
-        );
-
-        let prepared = prepare(&input).await.unwrap();
-        let image = prepared.image.to_rgb8();
-        assert_eq!(image.get_pixel(1, 1).0, [200, 100, 50]);
-        assert_eq!(image.get_pixel(0, 0).0, [0, 0, 0]);
-        let mut edit = snapshot.edit();
-        assert_eq!(
-            cleanup_position(&input, &mut edit).unwrap(),
-            At::After(layer)
-        );
     }
 
     fn rectangle_region([left, top, right, bottom]: [u32; 4]) -> FlatFillRegion {

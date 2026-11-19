@@ -18,8 +18,6 @@ use super::Origin;
 pub enum RasterLayerKind {
     Cleanup,
     Paint,
-    /// Repaints censorship (bars and mosaics) that was in the page source.
-    Decensor,
 }
 
 /// A full-page transparent pixel layer composited above the page source.
