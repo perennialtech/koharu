@@ -7,14 +7,13 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     Device,
-    llm::{ChatMessage, GenerationOptions, Input, Llm, LoadOptions, MtmdOptions},
+    llm::{ChatMessage, FinishReason, GenerationOptions, Input, Llm, LoadOptions, MtmdOptions},
 };
 
-const MAX_NEW_TOKENS: usize = 512;
-const REPETITION_PENALTY: f32 = 1.2;
+const MAX_NEW_TOKENS: usize = 256;
 // Each sequence keeps its own KV stream sized for the prompt plus
-// MAX_NEW_TOKENS, about 14 MiB here, so pages with many text regions are
-// recognized in groups to bound VRAM.
+// MAX_NEW_TOKENS, so pages with many text regions are recognized in groups to
+// bound VRAM.
 const BATCH_SIZE: usize = 8;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -84,12 +83,15 @@ impl PaddleOCRVLQuantized {
             mtmd_default_marker(),
             task.prompt()
         ))])?;
+        // Upstream PaddleOCR-VL-1.6 uses greedy decoding without repetition
+        // penalty; a flat repeat penalty corrupts repeated kana and SFX while
+        // failing to break high-confidence repetition attractors.
         let options = GenerationOptions {
             max_tokens: MAX_NEW_TOKENS,
             temperature: 0.0,
-            repeat_penalty: REPETITION_PENALTY,
-            repeat_last_n: MAX_NEW_TOKENS as i32,
-            add_special: true,
+            repeat_penalty: 1.0,
+            repeat_last_n: 0,
+            add_special: false,
             ..GenerationOptions::default()
         };
         let mut results = Vec::with_capacity(images.len());
@@ -103,7 +105,11 @@ impl PaddleOCRVLQuantized {
                     .inference_batch(&inputs, &options)?
                     .into_iter()
                     .map(|generation| PaddleOCRVLResult {
-                        text: generation.text,
+                        text: if generation.finish_reason == FinishReason::StopToken {
+                            generation.text
+                        } else {
+                            String::new()
+                        },
                     }),
             );
         }

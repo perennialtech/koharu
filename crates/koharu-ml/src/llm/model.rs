@@ -251,6 +251,7 @@ impl Model {
             decoder: encoding_rs::Decoder,
             next_token: LlamaToken,
             position: i32,
+            tokens: Vec<LlamaToken>,
             generation: Generation,
             done: bool,
         }
@@ -274,6 +275,7 @@ impl Model {
                 decoder: encoding_rs::UTF_8.new_decoder(),
                 next_token,
                 position,
+                tokens: Vec::new(),
                 generation,
                 done: false,
             });
@@ -300,9 +302,12 @@ impl Model {
                     .model
                     .token_to_piece(sequence.next_token, &mut sequence.decoder, true, None)
                     .context("failed to decode generated token")?;
+                sequence.tokens.push(sequence.next_token);
                 generation.text.push_str(&piece);
                 generation.generated_tokens += 1;
-                if generation.generated_tokens >= options.max_tokens {
+                if generation.generated_tokens >= options.max_tokens
+                    || has_repetition_loop(&sequence.tokens)
+                {
                     sequence.done = true;
                     continue;
                 }
@@ -838,5 +843,45 @@ mod tests {
             ..Default::default()
         };
         assert!(context_values(&prepared(5, false), &options).is_err());
+    }
+}
+
+const MAX_LOOP_PERIOD: usize = 8;
+const MIN_LOOP_REPEATS: usize = 8;
+
+fn has_repetition_loop(tokens: &[LlamaToken]) -> bool {
+    for period in 1..=MAX_LOOP_PERIOD {
+        let window = period * MIN_LOOP_REPEATS;
+        if tokens.len() < window {
+            continue;
+        }
+        let tail = &tokens[tokens.len() - window..];
+        let pattern = &tail[..period];
+        if tail.chunks_exact(period).all(|chunk| chunk == pattern) {
+            return true;
+        }
+    }
+    false
+}
+
+#[cfg(test)]
+mod loop_tests {
+    use super::*;
+
+    #[test]
+    fn detects_single_and_multi_token_repetition_loops() {
+        let single: Vec<_> = (0..8).map(|_| LlamaToken(42)).collect();
+        assert!(has_repetition_loop(&single));
+
+        let short: Vec<_> = (0..7).map(|_| LlamaToken(42)).collect();
+        assert!(!has_repetition_loop(&short));
+
+        let cycle: Vec<_> = [1, 2, 3]
+            .into_iter()
+            .cycle()
+            .take(24)
+            .map(LlamaToken)
+            .collect();
+        assert!(has_repetition_loop(&cycle));
     }
 }

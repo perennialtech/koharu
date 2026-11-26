@@ -2,7 +2,7 @@ use std::fmt::Write;
 
 use anyhow::Context;
 use indoc::indoc;
-use serde::{Deserialize, Deserializer, Serialize, de};
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::{Language, TranslationContext, TranslationRequest};
@@ -12,12 +12,7 @@ pub(crate) fn prompts(request: &TranslationRequest) -> anyhow::Result<(String, S
         source_language: request.source_language,
         target_language: request.target_language,
         context: &request.context,
-        segments: request
-            .segments
-            .iter()
-            .enumerate()
-            .map(|(id, text)| TranslationInputSegment { id, text })
-            .collect(),
+        segments: &request.segments,
     };
     let user = serde_json::to_string(&input).context("failed to serialize translation input")?;
     Ok((translation_system_prompt(request), user))
@@ -35,17 +30,7 @@ pub(crate) fn translations(
             snippet(text),
         )
     })?;
-    let mut translations = source_segments.to_vec();
-    let mut translated = vec![false; source_segments.len()];
-
-    for translation in output.translations {
-        if translation.id < translations.len() && !translated[translation.id] {
-            translations[translation.id] = translation.text;
-            translated[translation.id] = true;
-        }
-    }
-
-    Ok(translations)
+    Ok(output.translations)
 }
 
 /// Keeps a model response readable in a log line without truncating so hard
@@ -89,21 +74,7 @@ pub(crate) fn output_schema(expected: usize) -> Value {
                 "minItems": expected,
                 "maxItems": expected,
                 "items": {
-                    "type": "object",
-                    "properties": {
-                        "id": {
-                            "type": "integer",
-                            "minimum": 0,
-                            "maximum": expected.saturating_sub(1),
-                            "description": "The ID copied from the corresponding input segment."
-                        },
-                        "text": {
-                            "type": "string",
-                            "description": "The translation of the input segment with this ID."
-                        }
-                    },
-                    "required": ["id", "text"],
-                    "additionalProperties": false
+                    "type": "string"
                 }
             }
         },
@@ -126,13 +97,11 @@ fn translation_system_prompt(request: &TranslationRequest) -> String {
             - Preserve meaning, character voice, emotional tone, relationship nuance, emphasis, and sound effects.
             - Localize idioms and sound effects naturally while keeping wording concise enough for speech bubbles.
             - Use surrounding segments only for disambiguation and continuity; never merge or split segments.
-            - Write every translated `text` value only in {target}; do not include source text, notes, explanations, or alternatives.
+            - Write every translated string only in {target}; do not include source text, notes, explanations, or alternatives.
             - Never preserve or repeat original-language text; translate names, terms, and sound effects using natural {target} conventions.
 
             Output requirements:
-            - Each input segment has a numeric `id`.
-            - Return only a JSON object whose `translations` array contains one object with `id` and translated `text` for every input segment.
-            - Copy every input ID exactly once; order does not matter.
+            - Return only a compact JSON object whose `translations` array contains one translated string per input segment, in the exact same order.
             - Never merge, split, omit, duplicate, or add segments.
         "},
         source = source,
@@ -176,42 +145,12 @@ struct TranslationInput<'a> {
     source_language: Option<Language>,
     target_language: Language,
     context: &'a [TranslationContext],
-    segments: Vec<TranslationInputSegment<'a>>,
-}
-
-#[derive(Serialize)]
-struct TranslationInputSegment<'a> {
-    id: usize,
-    text: &'a str,
+    segments: &'a [String],
 }
 
 #[derive(Debug, Deserialize)]
 struct TranslationOutput {
-    translations: Vec<TranslationOutputSegment>,
-}
-
-#[derive(Debug, Deserialize)]
-struct TranslationOutputSegment {
-    #[serde(deserialize_with = "deserialize_segment_id")]
-    id: usize,
-    text: String,
-}
-
-fn deserialize_segment_id<'de, D>(deserializer: D) -> Result<usize, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    #[derive(Deserialize)]
-    #[serde(untagged)]
-    enum SegmentId {
-        Number(usize),
-        String(String),
-    }
-
-    match SegmentId::deserialize(deserializer)? {
-        SegmentId::Number(id) => Ok(id),
-        SegmentId::String(id) => id.trim().parse().map_err(de::Error::custom),
-    }
+    translations: Vec<String>,
 }
 
 #[cfg(test)]
@@ -246,7 +185,7 @@ mod tests {
     #[test]
     fn parses_plain_json() {
         let source = ["one".to_owned(), "two".to_owned()];
-        let response = r#"{"translations":[{"id":0,"text":"hello"},{"id":1,"text":"world"}]}"#;
+        let response = r#"{"translations":["hello","world"]}"#;
 
         assert_eq!(
             translations("test", response, &source).unwrap(),
@@ -258,10 +197,10 @@ mod tests {
     fn rejects_wrapped_and_malformed_json() {
         let source = ["one".to_owned(), "two".to_owned()];
         for response in [
-            "```json\n{\"translations\":[{\"id\":0,\"text\":\"hello\"},{\"id\":1,\"text\":\"world\"}]}\n```",
-            r#"{translations: [{id: 0, text: 'hello'}, {id: 1, text: 'world'},],}"#,
-            r#"Here is the result: {"translations": [{"id": 0, "text": "hello"}, {"id": 1, "text": "world"},]}"#,
-            "{\"translations\":[{\"id\":0,\"text\":\"hello\"},{\"id\":1,\"text\":\"world\"",
+            "```json\n{\"translations\":[\"hello\",\"world\"]}\n```",
+            r#"{translations: ['hello', 'world']}"#,
+            r#"Here is the result: {"translations": ["hello", "world"]}"#,
+            "{\"translations\":[\"hello\",\"world\"",
         ] {
             assert!(
                 translations("test", response, &source).is_err(),
@@ -273,61 +212,28 @@ mod tests {
     #[test]
     fn parse_error_preserves_the_root_failure_and_response() {
         let source = ["one".to_owned()];
-        let response = "{\n  \"translations\": [{\"id\": 0}]\n}";
+        let response = "{\n  \"translations\": [42]\n}";
         let error = format!(
             "{:#}",
-            translations("test", response, &source).expect_err("missing text should fail")
+            translations("test", response, &source).expect_err("non-string item should fail")
         );
 
-        assert!(error.contains("missing field `text`"), "{error}");
+        assert!(error.contains("expected a string"), "{error}");
         assert!(
-            error.contains(r#"response was: {\n  "translations": [{"id": 0}]\n}"#),
+            error.contains(r#"response was: {\n  "translations": [42]\n}"#),
             "{error}"
         );
     }
 
     #[test]
-    fn restores_input_order_from_ids() {
-        let source = ["one".to_owned(), "two".to_owned()];
-        let response = r#"{"translations":[{"id":1,"text":"world"},{"id":0,"text":"hello"}]}"#;
-        assert_eq!(
-            translations("test", response, &source).unwrap(),
-            ["hello", "world"]
-        );
-    }
-
-    #[test]
-    fn tolerates_duplicate_missing_and_out_of_range_ids() {
-        let source = ["one".to_owned(), "two".to_owned()];
-        let short = r#"{"translations":[{"id":1,"text":"world"}]}"#;
-        assert_eq!(
-            translations("test", short, &source).unwrap(),
-            ["one", "world"]
-        );
-
-        let response = concat!(
-            r#"{"translations":["#,
-            r#"{"id":0,"text":"hello"},"#,
-            r#"{"id":0,"text":"duplicate"},"#,
-            r#"{"id":9,"text":"extra"}"#,
-            "]}"
-        );
-        assert_eq!(
-            translations("test", response, &source).unwrap(),
-            ["hello", "two"]
-        );
-    }
-
-    #[test]
-    fn prompt_payload_contains_ordered_context() {
+    fn prompt_payload_contains_ordered_context_and_segments() {
         let request = TranslationRequest::new(["new"], Language::English)
             .with_context([TranslationContext::new("old", "previous")]);
         let (_, user) = prompts(&request).unwrap();
         let input: serde_json::Value = serde_json::from_str(&user).unwrap();
         assert_eq!(input["context"][0]["source"], "old");
         assert_eq!(input["context"][0]["translation"], "previous");
-        assert_eq!(input["segments"][0]["id"], 0);
-        assert_eq!(input["segments"][0]["text"], "new");
+        assert_eq!(input["segments"][0], "new");
     }
 
     #[test]
@@ -337,19 +243,17 @@ mod tests {
             .with_instructions("Use informal speech.");
         let prompt = translation_system_prompt(&request);
         assert!(prompt.contains("from Japanese into natural Korean"));
-        assert!(prompt.contains("Copy every input ID exactly once"));
+        assert!(prompt.contains("exact same order"));
         assert!(prompt.contains("Use informal speech."));
     }
 
     #[test]
-    fn schema_requires_the_expected_number_of_id_text_pairs() {
+    fn schema_requires_the_expected_number_of_strings() {
         let schema = output_schema(3);
         let translations = &schema["properties"]["translations"];
         assert_eq!(translations["minItems"], 3);
         assert_eq!(translations["maxItems"], 3);
-        assert_eq!(translations["items"]["properties"]["id"]["minimum"], 0);
-        assert_eq!(translations["items"]["properties"]["id"]["maximum"], 2);
-        assert_eq!(translations["items"]["additionalProperties"], false);
+        assert_eq!(translations["items"]["type"], "string");
         assert_eq!(schema["additionalProperties"], false);
     }
 

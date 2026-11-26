@@ -12,8 +12,9 @@ use crate::{
 };
 
 const RELEASE: &str = "1.31.1";
-const ROOT: &str = "onnxruntime-linux-x64-gpu_cuda13-1.31.1/lib";
-const LIBRARY: &str = "libonnxruntime.so.1.31.1";
+const PACKAGE: &str = "microsoft.ml.onnxruntime.gpu.linux";
+const ROOT: &str = "runtimes/linux-x64/native";
+const LIBRARY: &str = "libonnxruntime.so";
 // ONNX Runtime loads its execution providers from the directory that holds
 // the core library, so they are extracted beside it but never loaded here.
 const LIBRARIES: [&str; 3] = [
@@ -55,11 +56,11 @@ impl Package for OnnxRuntime {
             move |path| self.complete(path),
             move |stage| async move {
                 let url = format!(
-                    "https://github.com/microsoft/onnxruntime/releases/download/v{RELEASE}/onnxruntime-linux-x64-gpu_cuda13-{RELEASE}.tgz"
+                    "https://api.nuget.org/v3-flatcontainer/{PACKAGE}/{RELEASE}/{PACKAGE}.{RELEASE}.nupkg"
                 );
-                let archive = tempfile::Builder::new().suffix(".tar.gz").tempfile()?;
+                let archive = tempfile::Builder::new().suffix(".zip").tempfile()?;
                 download::fetch(&url, archive.path()).await?;
-                let patterns = LIBRARIES.map(|name| format!("**/{name}"));
+                let patterns = LIBRARIES.map(|name| format!("{ROOT}/{name}"));
                 let patterns = patterns.iter().map(String::as_str).collect::<Vec<_>>();
                 extract(archive.path(), &stage, &patterns)
             },
