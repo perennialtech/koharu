@@ -236,11 +236,13 @@ fn misread_dot(character: char) -> bool {
 // that touch the crop edge. A margin of a fraction of the line thickness, the
 // box's shorter side, restores them without reaching neighbouring lines.
 const CROP_MARGIN: f64 = 0.15;
+const MIN_CROP_MARGIN_PX: f64 = 8.0;
 
 fn crop(source: &DynamicImage, geometry: &Geometry) -> Result<DynamicImage> {
     let (min_x, min_y, max_x, max_y) =
         geometry_extents(geometry).ok_or_else(|| anyhow!("geometry is empty"))?;
-    let margin = (max_x - min_x).min(max_y - min_y).max(0.0) * CROP_MARGIN;
+    let margin =
+        ((max_x - min_x).min(max_y - min_y).max(0.0) * CROP_MARGIN).max(MIN_CROP_MARGIN_PX);
     let x = (min_x - margin).floor().max(0.0) as u32;
     let y = (min_y - margin).floor().max(0.0) as u32;
     let right = (max_x + margin)
@@ -271,8 +273,8 @@ mod tests {
         let column = crop(&source, &Geometry::rectangle(50.0, 20.0, 20.0, 60.0)).unwrap();
         let edge = crop(&source, &Geometry::rectangle(0.0, 0.0, 40.0, 100.0)).unwrap();
 
-        assert_eq!((column.width(), column.height()), (26, 66));
-        assert_eq!((edge.width(), edge.height()), (46, 100));
+        assert_eq!((column.width(), column.height()), (36, 76));
+        assert_eq!((edge.width(), edge.height()), (48, 100));
     }
 
     #[test]
