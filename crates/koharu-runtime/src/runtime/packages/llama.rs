@@ -11,7 +11,7 @@ use crate::{
     source::extract,
 };
 
-const RELEASE: &str = "b11642";
+const RELEASE: &str = "b12755";
 const ASSET: &str = "x86_64-unknown-linux-gnu-cuda.tar.gz";
 const LIBRARIES: [&str; 2] = ["libllama.so", "libmtmd.so"];
 
