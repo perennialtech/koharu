@@ -298,42 +298,6 @@ impl LlamaSampler {
         }
     }
 
-    /// Lazy grammar sampler, introduced in <https://github.com/ggerganov/llama.cpp/pull/9639>
-    ///
-    /// This sampler enforces grammar rules only when specific trigger words or tokens are encountered.
-    pub fn grammar_lazy(
-        model: &LlamaModel,
-        grammar_str: &str,
-        grammar_root: &str,
-        trigger_words: impl IntoIterator<Item = impl AsRef<[u8]>>,
-        trigger_tokens: &[LlamaToken],
-    ) -> Result<Self, GrammarError> {
-        let (grammar_str, grammar_root) =
-            Self::sanitize_grammar_strings(grammar_str, grammar_root)?;
-        let trigger_words = Self::sanitize_trigger_words(trigger_words)?;
-
-        let mut trigger_word_ptrs: Vec<*const c_char> =
-            trigger_words.iter().map(|cs| cs.as_ptr()).collect();
-
-        let sampler = unsafe {
-            koharu_llama_sys::llama_sampler_init_grammar_lazy(
-                model.vocab_ptr(),
-                grammar_str.as_ptr(),
-                grammar_root.as_ptr(),
-                trigger_word_ptrs.as_mut_ptr(),
-                trigger_word_ptrs.len(),
-                trigger_tokens.as_ptr().cast(),
-                trigger_tokens.len(),
-            )
-        };
-
-        if sampler.is_null() {
-            Err(GrammarError::NullGrammar)
-        } else {
-            Ok(Self { sampler })
-        }
-    }
-
     /// Lazy grammar sampler using regex trigger patterns.
     ///
     /// Trigger patterns are regular expressions matched from the start of the
@@ -388,22 +352,6 @@ impl LlamaSampler {
             CString::new(grammar_str).unwrap(),
             CString::new(grammar_root).unwrap(),
         ))
-    }
-
-    fn sanitize_trigger_words(
-        trigger_words: impl IntoIterator<Item = impl AsRef<[u8]>>,
-    ) -> Result<Vec<CString>, GrammarError> {
-        let trigger_words: Vec<_> = trigger_words.into_iter().collect();
-        if trigger_words
-            .iter()
-            .any(|word| word.as_ref().contains(&b'\0'))
-        {
-            return Err(GrammarError::TriggerWordNullBytes);
-        }
-        Ok(trigger_words
-            .into_iter()
-            .map(|word| CString::new(word.as_ref()).unwrap())
-            .collect())
     }
 
     fn sanitize_trigger_patterns(
