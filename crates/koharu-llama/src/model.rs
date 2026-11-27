@@ -443,33 +443,31 @@ impl LlamaModel {
         special: bool,
         lstrip: Option<NonZeroU16>,
     ) -> Result<Vec<u8>, TokenToStringError> {
-        let string = CString::new(vec![b'*'; buffer_size]).expect("no null");
-        let len = string.as_bytes().len();
-        let len = c_int::try_from(len).expect("length fits into c_int");
-        let buf = string.into_raw();
+        if !(0..self.n_vocab()).contains(&token.0) {
+            return Err(TokenToStringError::UnknownTokenType);
+        }
+        let len = c_int::try_from(buffer_size).expect("length fits into c_int");
+        let mut bytes = vec![0u8; buffer_size];
         let lstrip = lstrip.map_or(0, |it| i32::from(it.get()));
         let size = unsafe {
             koharu_llama_sys::llama_token_to_piece(
                 self.vocab_ptr(),
                 token.0,
-                buf,
+                bytes.as_mut_ptr().cast(),
                 len,
                 lstrip,
                 special,
             )
         };
 
-        match size {
-            0 => Err(TokenToStringError::UnknownTokenType),
-            i if i.is_negative() => Err(TokenToStringError::InsufficientBufferSpace(i)),
-            size => {
-                let string = unsafe { CString::from_raw(buf) };
-                let mut bytes = string.into_bytes();
-                let len = usize::try_from(size).expect("size is positive and fits into usize");
-                bytes.truncate(len);
-                Ok(bytes)
-            }
+        if size == 0 {
+            return Ok(Vec::new());
         }
+        if size < 0 {
+            return Err(TokenToStringError::InsufficientBufferSpace(size));
+        }
+        bytes.truncate(usize::try_from(size).expect("nonnegative piece size"));
+        Ok(bytes)
     }
 
     /// Convert a token to a string with a specified buffer size.
@@ -601,6 +599,12 @@ impl LlamaModel {
         unsafe { koharu_llama_sys::llama_model_n_embd(self.model.as_ptr()) }
     }
 
+    /// Gets the input embedding width.
+    #[must_use]
+    pub fn n_embd_inp(&self) -> c_int {
+        unsafe { koharu_llama_sys::llama_model_n_embd_inp(self.model.as_ptr()) }
+    }
+
     /// Returns the width of embeddings produced by the model.
     #[must_use]
     pub fn n_embd_out(&self) -> c_int {
@@ -642,6 +646,18 @@ impl LlamaModel {
         // the field it's accessing is a uint32_t.
         u32::try_from(unsafe { koharu_llama_sys::llama_model_n_layer(self.model.as_ptr()) })
             .unwrap()
+    }
+
+    /// Returns the sliding window attention size for the model, or 0 if not using SWA.
+    #[must_use]
+    pub fn n_swa(&self) -> i32 {
+        unsafe { koharu_llama_sys::llama_model_n_swa(self.model.as_ptr()) }
+    }
+
+    /// Returns the number of extra next-token prediction layers in the model.
+    #[must_use]
+    pub fn n_layer_nextn(&self) -> i32 {
+        unsafe { koharu_llama_sys::llama_model_n_layer_nextn(self.model.as_ptr()) }
     }
 
     /// Returns the number of attention heads within the model.

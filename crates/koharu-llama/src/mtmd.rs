@@ -64,6 +64,8 @@ impl From<koharu_llama_sys::mtmd_input_chunk_type> for MtmdInputChunkType {
 ///     print_timings: true,
 ///     n_threads: 4,
 ///     media_marker: CString::new(mtmd_default_marker()).unwrap(),
+///     flash_attn_type: koharu_llama_sys::LLAMA_FLASH_ATTN_TYPE_AUTO,
+///     warmup: true,
 ///     image_min_tokens: -1,
 ///     image_max_tokens: -1,
 /// };
@@ -78,6 +80,10 @@ pub struct MtmdContextParams {
     pub n_threads: i32,
     /// Media marker string used to identify media positions in text
     pub media_marker: CString,
+    /// Flash attention policy for the multimodal projector
+    pub flash_attn_type: koharu_llama_sys::llama_flash_attn_type,
+    /// Whether to run a warmup encode pass after initialization
+    pub warmup: bool,
     /// Minimum number of tokens used to represent an image.
     /// Controls the visual token budget lower bound. Use -1 for the model default.
     /// Gemma 4 supported budgets: 70, 140, 280, 560, 1120.
@@ -103,6 +109,8 @@ impl From<&MtmdContextParams> for koharu_llama_sys::mtmd_context_params {
             print_timings,
             n_threads,
             media_marker,
+            flash_attn_type,
+            warmup,
             image_min_tokens,
             image_max_tokens,
         } = params;
@@ -111,6 +119,8 @@ impl From<&MtmdContextParams> for koharu_llama_sys::mtmd_context_params {
         context.print_timings = *print_timings;
         context.n_threads = *n_threads;
         context.media_marker = media_marker.as_ptr();
+        context.flash_attn_type = *flash_attn_type;
+        context.warmup = *warmup;
         context.image_min_tokens = *image_min_tokens;
         context.image_max_tokens = *image_max_tokens;
 
@@ -125,6 +135,8 @@ impl From<koharu_llama_sys::mtmd_context_params> for MtmdContextParams {
             print_timings: params.print_timings,
             n_threads: params.n_threads,
             media_marker: unsafe { CStr::from_ptr(params.media_marker) }.to_owned(),
+            flash_attn_type: params.flash_attn_type,
+            warmup: params.warmup,
             image_min_tokens: params.image_min_tokens,
             image_max_tokens: params.image_max_tokens,
         }
