@@ -393,10 +393,18 @@ fn build_synthetic_adversarial_pages() -> Vec<GtPage> {
     for variant in 0..4 {
         let shift = variant as f32 * 8.0;
         let b1 = make_gt_item([100.0, 100.0, 260.0, 280.0], true, None);
-        let b2 = make_gt_item([210.0 - shift, 210.0 - shift, 370.0 - shift, 390.0 - shift], true, None);
+        let b2 = make_gt_item(
+            [210.0 - shift, 210.0 - shift, 370.0 - shift, 390.0 - shift],
+            true,
+            None,
+        );
         // Texts strictly inside their respective ellipse masks, but b1/b2 bboxes overlap in [210-s..260, 210-s..280]
         let t1 = make_gt_item([145.0, 140.0, 210.0, 235.0], false, Some(0));
-        let t2 = make_gt_item([255.0 - shift, 250.0 - shift, 320.0 - shift, 345.0 - shift], false, Some(1));
+        let t2 = make_gt_item(
+            [255.0 - shift, 250.0 - shift, 320.0 - shift, 345.0 - shift],
+            false,
+            Some(1),
+        );
         pages.push(GtPage {
             id: next_id,
             name: format!("synth_diagonal_bubbles_{variant}"),
@@ -451,7 +459,11 @@ fn build_synthetic_adversarial_pages() -> Vec<GtPage> {
     for variant in 0..4 {
         let b_box = [100.0, 120.0, 420.0 + variant as f32 * 20.0, 320.0];
         let b = make_gt_item(b_box, true, None);
-        let t = make_gt_item([150.0, 160.0, 370.0 + variant as f32 * 10.0, 280.0], false, Some(0));
+        let t = make_gt_item(
+            [150.0, 160.0, 370.0 + variant as f32 * 10.0, 280.0],
+            false,
+            Some(0),
+        );
         pages.push(GtPage {
             id: next_id,
             name: format!("synth_translucent_multilobe_{variant}"),
@@ -470,7 +482,12 @@ fn build_synthetic_adversarial_pages() -> Vec<GtPage> {
         let b = make_gt_item([100.0, 100.0, 320.0, 320.0], true, None);
         let t = make_gt_item([155.0, 145.0, 265.0, 275.0], false, Some(0));
         let sfx = make_gt_item(
-            [115.0 + variant as f32 * 15.0, 120.0, 220.0 + variant as f32 * 15.0, 240.0],
+            [
+                115.0 + variant as f32 * 15.0,
+                120.0,
+                220.0 + variant as f32 * 15.0,
+                240.0,
+            ],
             false,
             Some(0),
         );
@@ -495,7 +512,11 @@ fn build_synthetic_adversarial_pages() -> Vec<GtPage> {
         let t1 = make_gt_item([140.0, 120.0, 220.0, 220.0], false, Some(0));
         let b2 = make_gt_item([450.0, 280.0, 660.0, 470.0], true, None);
         let t2 = make_gt_item([500.0, 320.0, 610.0, 430.0], false, Some(1));
-        let margin_cap = make_gt_item([730.0, 300.0 + variant as f32 * 20.0, 765.0, 450.0], false, None);
+        let margin_cap = make_gt_item(
+            [730.0, 300.0 + variant as f32 * 20.0, 765.0, 450.0],
+            false,
+            None,
+        );
         pages.push(GtPage {
             id: next_id,
             name: format!("synth_nested_panels_{variant}"),
@@ -639,7 +660,9 @@ fn generate_corrupted_proposals(page: &GtPage, seed: u64, stress_multiplier: f32
             && bh > 40.0
             && page.texts.iter().any(|t| t.bubble_idx == Some(b_idx))
             && rng.chance((0.14 * stress_multiplier).min(0.45));
-        let is_ogkalu_miss = !is_translucent_miss && !is_split_lobe && rng.chance((0.06 * stress_multiplier).min(0.20));
+        let is_ogkalu_miss = !is_translucent_miss
+            && !is_split_lobe
+            && rng.chance((0.06 * stress_multiplier).min(0.20));
 
         // RF-DETR bubble proposal
         if !is_translucent_miss {
@@ -675,15 +698,26 @@ fn generate_corrupted_proposals(page: &GtPage, seed: u64, stress_multiplier: f32
         if !is_ogkalu_miss {
             if is_split_lobe {
                 split_gt_bubbles.insert(b_idx);
-                let split_x = (bubble.bbox[0] + bubble.bbox[2]) * 0.5 + rng.range_f32(-0.08, 0.08) * bw;
+                let split_x =
+                    (bubble.bbox[0] + bubble.bbox[2]) * 0.5 + rng.range_f32(-0.08, 0.08) * bw;
                 let overlap = rng.range_f32(0.02, 0.08) * bw;
                 let left_lobe = clamp_bbox(
-                    [bubble.bbox[0], bubble.bbox[1], split_x + overlap, bubble.bbox[3]],
+                    [
+                        bubble.bbox[0],
+                        bubble.bbox[1],
+                        split_x + overlap,
+                        bubble.bbox[3],
+                    ],
                     w,
                     h,
                 );
                 let right_lobe = clamp_bbox(
-                    [split_x - overlap, bubble.bbox[1], bubble.bbox[2], bubble.bbox[3]],
+                    [
+                        split_x - overlap,
+                        bubble.bbox[1],
+                        bubble.bbox[2],
+                        bubble.bbox[3],
+                    ],
                     w,
                     h,
                 );
@@ -726,7 +760,16 @@ fn generate_corrupted_proposals(page: &GtPage, seed: u64, stress_multiplier: f32
             if rng.chance((0.10 * stress_multiplier).min(0.30)) {
                 let pad_x = tw * rng.range_f32(0.05, 0.15);
                 let pad_y = th * rng.range_f32(0.05, 0.15);
-                cbox = clamp_bbox([cbox[0] - pad_x, cbox[1] - pad_y, cbox[2] + pad_x, cbox[3] + pad_y], w, h);
+                cbox = clamp_bbox(
+                    [
+                        cbox[0] - pad_x,
+                        cbox[1] - pad_y,
+                        cbox[2] + pad_x,
+                        cbox[3] + pad_y,
+                    ],
+                    w,
+                    h,
+                );
             }
             comic.push(ComicTextBubbleDetection {
                 label: comic_label,
@@ -746,12 +789,21 @@ fn generate_corrupted_proposals(page: &GtPage, seed: u64, stress_multiplier: f32
         }
 
         // Split RF-DETR into 2 vertical columns
-        let split_cols = tw > 24.0 && th > tw * 0.7 && rng.chance((0.18 * stress_multiplier).min(0.45));
+        let split_cols =
+            tw > 24.0 && th > tw * 0.7 && rng.chance((0.18 * stress_multiplier).min(0.45));
         if split_cols {
             let mid_x = (text.bbox[0] + text.bbox[2]) * 0.5;
             let gap = rng.range_f32(0.0, (tw * 0.08).min(4.0));
-            let left_b = clamp_bbox([text.bbox[0], text.bbox[1], mid_x - gap * 0.5, text.bbox[3]], w, h);
-            let right_b = clamp_bbox([mid_x + gap * 0.5, text.bbox[1], text.bbox[2], text.bbox[3]], w, h);
+            let left_b = clamp_bbox(
+                [text.bbox[0], text.bbox[1], mid_x - gap * 0.5, text.bbox[3]],
+                w,
+                h,
+            );
+            let right_b = clamp_bbox(
+                [mid_x + gap * 0.5, text.bbox[1], text.bbox[2], text.bbox[3]],
+                w,
+                h,
+            );
             for sub in [left_b, right_b] {
                 let m = erode_mask_to_bbox(&text.mask, sub);
                 let area = m.pixels.iter().filter(|&&v| v != 0).count() as u32;
@@ -797,8 +849,10 @@ fn generate_corrupted_proposals(page: &GtPage, seed: u64, stress_multiplier: f32
                     rmask = Arc::new(leaked);
                     // Also occasionally graze the neighbor box with rbox
                     if rng.chance(0.40) {
-                        rbox[0] = rbox[0].min(neighbor.bbox[0] + (neighbor.bbox[2] - neighbor.bbox[0]) * 0.85);
-                        rbox[2] = rbox[2].max(neighbor.bbox[0] + (neighbor.bbox[2] - neighbor.bbox[0]) * 0.15);
+                        rbox[0] = rbox[0]
+                            .min(neighbor.bbox[0] + (neighbor.bbox[2] - neighbor.bbox[0]) * 0.85);
+                        rbox[2] = rbox[2]
+                            .max(neighbor.bbox[0] + (neighbor.bbox[2] - neighbor.bbox[0]) * 0.15);
                     }
                 }
             }
@@ -858,8 +912,14 @@ fn generate_corrupted_proposals(page: &GtPage, seed: u64, stress_multiplier: f32
         let gh = rng.range_f32(15.0, 50.0).min(h - gy);
         let gbox = [gx, gy, gx + gw, gy + gh];
         // Avoid accidentally landing on real GT text/bubbles
-        let hits_gt = page.texts.iter().any(|t| intersection_area(t.bbox, gbox) > 0.0)
-            || page.bubbles.iter().any(|b| intersection_area(b.bbox, gbox) > 0.0);
+        let hits_gt = page
+            .texts
+            .iter()
+            .any(|t| intersection_area(t.bbox, gbox) > 0.0)
+            || page
+                .bubbles
+                .iter()
+                .any(|b| intersection_area(b.bbox, gbox) > 0.0);
         if !hits_gt {
             if rng.chance(0.5) {
                 comic.push(ComicTextBubbleDetection {
@@ -1074,7 +1134,11 @@ impl Scorecard {
     }
 }
 
-fn greedy_match(gt: &[[f32; 4]], pred: &[[f32; 4]], min_iou: f32) -> (Vec<(usize, usize, f32)>, usize, usize) {
+fn greedy_match(
+    gt: &[[f32; 4]],
+    pred: &[[f32; 4]],
+    min_iou: f32,
+) -> (Vec<(usize, usize, f32)>, usize, usize) {
     let mut pairs = Vec::new();
     for (gi, &gb) in gt.iter().enumerate() {
         for (pi, &pb) in pred.iter().enumerate() {
@@ -1173,7 +1237,9 @@ fn evaluate_page(
                 }
             }
         }
-        if bubble_owners.len() >= 2 || (!bubble_owners.is_empty() && distinct_owners.contains(&None)) {
+        if bubble_owners.len() >= 2
+            || (!bubble_owners.is_empty() && distinct_owners.contains(&None))
+        {
             sc.cross_bubble_merges += 1;
         }
     }
@@ -1241,7 +1307,11 @@ fn evaluate_page(
     let mut extra_assoc_fp = 0usize;
     for (pi, &(pred_det_idx, _)) in pred_texts.iter().enumerate() {
         if !matched_pred_indices.contains(&pi)
-            && det_to_bubble.get(&pred_det_idx).copied().flatten().is_some()
+            && det_to_bubble
+                .get(&pred_det_idx)
+                .copied()
+                .flatten()
+                .is_some()
         {
             extra_assoc_fp += 1;
         }
@@ -1671,7 +1741,11 @@ fn evaluate_raw_summary(
                 let groups: Vec<Vec<[f32; 4]>> = entry
                     .gt
                     .iter()
-                    .map(|grp| grp.iter().filter_map(|&idx| cands.get(idx).copied()).collect())
+                    .map(|grp| {
+                        grp.iter()
+                            .filter_map(|&idx| cands.get(idx).copied())
+                            .collect()
+                    })
                     .collect();
                 let ign: Vec<[f32; 4]> = entry
                     .ignore
@@ -1683,9 +1757,7 @@ fn evaluate_raw_summary(
                     let matched: Vec<usize> = groups
                         .iter()
                         .enumerate()
-                        .filter_map(|(k, grp)| {
-                            grp.iter().any(|&c| iou(b, c) >= 0.5).then_some(k)
-                        })
+                        .filter_map(|(k, grp)| grp.iter().any(|&c| iou(b, c) >= 0.5).then_some(k))
                         .collect();
                     if !matched.is_empty() {
                         for k in matched {
@@ -1818,7 +1890,10 @@ fn run_raw_dumps_mode(
             print_row(&name, &sc);
             results.push((name, cfg, sc));
         }
-        println!("\nSweep completed in {:.2}s", t_sweep.elapsed().as_secs_f64());
+        println!(
+            "\nSweep completed in {:.2}s",
+            t_sweep.elapsed().as_secs_f64()
+        );
 
         let baseline_sc = &results[0].2;
         let default_sc = &results[1].2;
@@ -2011,14 +2086,21 @@ fn main() -> Result<()> {
     );
 
     let candidates = candidate_configs();
-    println!("\n=== VALIDATION + SYNTHETIC ADVERSARIAL SWEEP ({} configs) ===", candidates.len());
+    println!(
+        "\n=== VALIDATION + SYNTHETIC ADVERSARIAL SWEEP ({} configs) ===",
+        candidates.len()
+    );
     let t_sweep = Instant::now();
-    let mut results: Vec<(String, DetectionFusionConfig, Scorecard)> = Vec::with_capacity(candidates.len());
+    let mut results: Vec<(String, DetectionFusionConfig, Scorecard)> =
+        Vec::with_capacity(candidates.len());
     for (name, cfg) in candidates {
         let sc = evaluate_suite(&val_pages, &val_corrupted, &cfg);
         results.push((name, cfg, sc));
     }
-    println!("Sweep completed in {:.2}s\n", t_sweep.elapsed().as_secs_f64());
+    println!(
+        "Sweep completed in {:.2}s\n",
+        t_sweep.elapsed().as_secs_f64()
+    );
 
     let baseline_sc = results[0].2.clone();
     print_header();
@@ -2028,7 +2110,11 @@ fn main() -> Result<()> {
 
     // Show all single-factor ablations
     println!("\n--- Single-Factor Ablations ---");
-    for (name, _, sc) in results.iter().skip(1).filter(|(n, _, _)| n.starts_with("ablation:")) {
+    for (name, _, sc) in results
+        .iter()
+        .skip(1)
+        .filter(|(n, _, _)| n.starts_with("ablation:"))
+    {
         print_row(name, sc);
     }
 
@@ -2065,7 +2151,10 @@ fn main() -> Result<()> {
         print_row(&results[idx].0, &results[idx].2);
     }
 
-    println!("\n--- Non-Dominated Pareto Frontier ({} configs) ---", frontier.len());
+    println!(
+        "\n--- Non-Dominated Pareto Frontier ({} configs) ---",
+        frontier.len()
+    );
     print_header();
     for &idx in frontier.iter().take(10) {
         print_row(&results[idx].0, &results[idx].2);
@@ -2082,7 +2171,10 @@ fn main() -> Result<()> {
         .par_iter()
         .map(|p| generate_corrupted_proposals(p, seed, 2.0))
         .collect();
-    println!("\n=== SYNTHETIC ADVERSARIAL STRESS SUITE ONLY ({} layouts) ===", synth_pages.len());
+    println!(
+        "\n=== SYNTHETIC ADVERSARIAL STRESS SUITE ONLY ({} layouts) ===",
+        synth_pages.len()
+    );
     print_header();
     print_row(
         "baseline (synth)",
@@ -2098,7 +2190,10 @@ fn main() -> Result<()> {
     // Strict unseen holdout evaluation on test.coco.json
     if test_path.exists() {
         let t_test = Instant::now();
-        println!("\nLoading UNSEEN test split from {} ...", test_path.display());
+        println!(
+            "\nLoading UNSEEN test split from {} ...",
+            test_path.display()
+        );
         let test_pages = load_coco_split(&test_path, max_pages)?;
         let test_corrupted: Vec<CorruptedPage> = test_pages
             .par_iter()

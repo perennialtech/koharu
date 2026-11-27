@@ -170,8 +170,7 @@ pub fn fuse_detections(
     bubble_threshold: f32,
     config: &DetectionFusionConfig,
 ) -> FusedDetectionLayout {
-    let mut candidates =
-        with_comic_detections_with_config(layout, comic, bubble_threshold, config);
+    let mut candidates = with_comic_detections_with_config(layout, comic, bubble_threshold, config);
     non_maximum_suppression(&mut candidates, config.duplicate_iou);
     let mut detections: Vec<_> = candidates.into_iter().map(|c| c.detection).collect();
     merge_text_blocks_with_config(&mut detections, config);
@@ -693,8 +692,7 @@ fn ellipse_mask_with_threshold(
         Luma([if dx * dx + dy * dy <= 1.0 { u8::MAX } else { 0 }])
     });
     for text in detections.iter().filter(|detection| {
-        detection.label == "text"
-            && containment(bbox, detection.bbox) >= text_containment_threshold
+        detection.label == "text" && containment(bbox, detection.bbox) >= text_containment_threshold
     }) {
         stamp_mask(&mut mask, &text.mask, x, y);
     }
@@ -2232,12 +2230,9 @@ fn merge_text_blocks_with_config(
                     })
                     .filter(|&(_, share)| share >= config.merge_container_containment_threshold)
                     .max_by(|&(left, left_share), &(right, right_share)| {
-                        left_share
-                            .total_cmp(&right_share)
-                            .then_with(|| {
-                                area(detections[right].bbox)
-                                    .total_cmp(&area(detections[left].bbox))
-                            })
+                        left_share.total_cmp(&right_share).then_with(|| {
+                            area(detections[right].bbox).total_cmp(&area(detections[left].bbox))
+                        })
                     })
                     .map(|(bubble, _)| bubble)
             } else {
@@ -4657,8 +4652,14 @@ mod tests {
             ..detection("text", 0.9, [100.0, 100.0, 152.0, 200.0])
         };
         let comic = vec![
-            comic(ComicTextBubbleLabel::TextBubble, [100.0, 100.0, 150.0, 200.0]),
-            comic(ComicTextBubbleLabel::TextBubble, [150.0, 100.0, 260.0, 200.0]),
+            comic(
+                ComicTextBubbleLabel::TextBubble,
+                [100.0, 100.0, 150.0, 200.0],
+            ),
+            comic(
+                ComicTextBubbleLabel::TextBubble,
+                [150.0, 100.0, 260.0, 200.0],
+            ),
         ];
         let comic_refs: Vec<_> = comic.iter().collect();
         super::fit_to_mask_with_config(
@@ -4697,11 +4698,12 @@ mod tests {
         };
         let mut detections = vec![b1, b2, t1, t2];
         super::merge_text_blocks(&mut detections);
-        let texts: Vec<_> = detections
-            .iter()
-            .filter(|d| d.label == "text")
-            .collect();
-        assert_eq!(texts.len(), 2, "texts in distinct diagonal bubbles must not merge");
+        let texts: Vec<_> = detections.iter().filter(|d| d.label == "text").collect();
+        assert_eq!(
+            texts.len(),
+            2,
+            "texts in distinct diagonal bubbles must not merge"
+        );
     }
 
     #[test]
@@ -4726,11 +4728,12 @@ mod tests {
         };
         let mut detections = vec![b1, b2, t1, t2];
         super::merge_text_blocks(&mut detections);
-        let texts: Vec<_> = detections
-            .iter()
-            .filter(|d| d.label == "text")
-            .collect();
-        assert_eq!(texts.len(), 2, "same_text must not merge across distinct bubbles");
+        let texts: Vec<_> = detections.iter().filter(|d| d.label == "text").collect();
+        assert_eq!(
+            texts.len(),
+            2,
+            "same_text must not merge across distinct bubbles"
+        );
     }
 
     #[test]
