@@ -15,6 +15,7 @@ use imageproc::{
     contours::{BorderType, find_contours_with_threshold},
     distance_transform::{Norm, distance_transform},
     geometry::convex_hull,
+    region_labelling::{Connectivity, connected_components},
 };
 use koharu_ml::{
     comic_text_bubble_detector::{
@@ -22,7 +23,8 @@ use koharu_ml::{
     },
     koharu_layout_rfdetr_seg_2xl::{
         GlyphProposal, KoharuLayoutDetection, KoharuLayoutDetections, KoharuLayoutMask,
-        KoharuLayoutRFDetrSeg2XL, KoharuLayoutThresholds, fit_glyph_masks,
+        KoharuLayoutRFDetrSeg2XL, KoharuLayoutThresholds, Typography as GlyphTypography,
+        fit_glyph_masks,
     },
 };
 use koharu_scene::{
@@ -50,6 +52,7 @@ const COLOR_CLUSTER_MIN_DISTANCE_SQUARED: u32 = 32 * 32;
 const COLOR_CLUSTER_COUNT: usize = 4;
 const MIN_EXTREME_COLOR_PIXELS: u32 = 4;
 const MIN_MEASURED_STROKE_WIDTH: u8 = 2;
+const MIN_ENCLOSED_FILL_SHARE: f32 = 0.1;
 const DUPLICATE_IOU: f32 = 0.5;
 const DIALOGUE_MASK_CONTAINMENT_THRESHOLD: f32 = 0.9;
 /// Largest gap, in line thicknesses, between lines of one text block.
@@ -170,12 +173,12 @@ pub fn fuse_detections(
     bubble_threshold: f32,
     config: &DetectionFusionConfig,
 ) -> FusedDetectionLayout {
-    let mut candidates = with_comic_detections_with_config(layout, comic, bubble_threshold, config);
+    let mut candidates = with_comic_detections(layout, comic, bubble_threshold, config);
     non_maximum_suppression(&mut candidates, config.duplicate_iou);
     let mut detections: Vec<_> = candidates.into_iter().map(|c| c.detection).collect();
-    merge_text_blocks_with_config(&mut detections, config);
-    join_split_bubbles_with_config(&mut detections, config);
-    let order = layout_order_with_config(&detections, config);
+    merge_text_blocks(&mut detections, config);
+    join_split_bubbles(&mut detections, config);
+    let order = layout_order(&detections, config);
     FusedDetectionLayout { detections, order }
 }
 
@@ -272,6 +275,7 @@ struct Model {
     bubbles: Arc<Mutex<ComicTextBubbleDetector>>,
     thresholds: KoharuLayoutThresholds,
     bubble_threshold: f32,
+    fusion: DetectionFusionConfig,
 }
 
 impl Model {
@@ -292,13 +296,21 @@ impl Model {
             bubble_threshold: config
                 .bubble_threshold
                 .unwrap_or(ComicTextBubbleDetector::RECOMMENDED_BUBBLE_THRESHOLD),
+            fusion: DetectionFusionConfig::default(),
         })
     }
 
     async fn run(&self, input: StageInput) -> Result<koharu_scene::Patch> {
         let image = input.require_page_image().await?;
         let output = self.detect(image.clone()).await?;
-        build_patch(&input, &image, output, &generation(PRODUCER, MODEL_ID)?).await
+        build_patch(
+            &input,
+            &image,
+            output,
+            &generation(PRODUCER, MODEL_ID)?,
+            &self.fusion,
+        )
+        .await
     }
 
     async fn detect(&self, image: Arc<DynamicImage>) -> Result<Vec<Candidate>> {
@@ -306,6 +318,7 @@ impl Model {
         let bubbles = self.bubbles.clone();
         let thresholds = self.thresholds;
         let bubble_threshold = self.bubble_threshold;
+        let fusion = self.fusion.clone();
         tokio_rayon::spawn(move || {
             let layout = network
                 .lock()
@@ -314,8 +327,16 @@ impl Model {
             let comic = bubbles
                 .lock()
                 .map_err(|_| anyhow!("bubble model lock is poisoned"))?
-                .inference(&image, bubble_threshold.min(COMIC_TEXT_AGREEMENT_THRESHOLD))?;
-            Ok(with_comic_detections(layout, &comic, bubble_threshold))
+                .inference(
+                    &image,
+                    bubble_threshold.min(fusion.comic_text_agreement_threshold),
+                )?;
+            Ok(with_comic_detections(
+                layout,
+                &comic,
+                bubble_threshold,
+                &fusion,
+            ))
         })
         .await
     }
@@ -344,19 +365,6 @@ fn with_comic_detections(
     layout: KoharuLayoutDetections,
     comic: &[ComicTextBubbleDetection],
     bubble_threshold: f32,
-) -> Vec<Candidate> {
-    with_comic_detections_with_config(
-        layout,
-        comic,
-        bubble_threshold,
-        &DetectionFusionConfig::default(),
-    )
-}
-
-fn with_comic_detections_with_config(
-    layout: KoharuLayoutDetections,
-    comic: &[ComicTextBubbleDetection],
-    bubble_threshold: f32,
     config: &DetectionFusionConfig,
 ) -> Vec<Candidate> {
     let KoharuLayoutDetections {
@@ -381,7 +389,7 @@ fn with_comic_detections_with_config(
         if detection.label != "text" && detection.label != "onomatopoeia" {
             continue;
         }
-        fit_to_mask_with_config(detection, &comic_text, config);
+        fit_to_mask(detection, &comic_text, config);
         if detection.label == "onomatopoeia"
             && comic_text.iter().any(|text| {
                 containment(text.bbox, detection.bbox) >= config.comic_text_agreement_containment
@@ -426,7 +434,6 @@ fn with_comic_detections_with_config(
     }
     detections.extend(added_text);
     let mut bubble_detections = Vec::new();
-    let mut matched_proposals = vec![false; proposals.len()];
     for bubble in comic.iter().filter(|bubble| {
         bubble.label == ComicTextBubbleLabel::Bubble && bubble.score > bubble_threshold
     }) {
@@ -436,19 +443,17 @@ fn with_comic_detections_with_config(
         }
         let best_proposal = proposals
             .iter()
-            .enumerate()
-            .filter(|(_, proposal)| proposal.area > 0 && valid_mask(&proposal.mask))
-            .map(|(idx, proposal)| (idx, intersection_over_union(proposal.bbox, bbox), proposal))
-            .filter(|(_, iou, _)| *iou >= config.bubble_mask_min_iou)
-            .max_by(|left, right| left.1.total_cmp(&right.1));
+            .filter(|proposal| proposal.area > 0 && valid_mask(&proposal.mask))
+            .map(|proposal| (intersection_over_union(proposal.bbox, bbox), proposal))
+            .filter(|(iou, _)| *iou >= config.bubble_mask_min_iou)
+            .max_by(|left, right| left.0.total_cmp(&right.0));
         let mask = match best_proposal {
             None => ellipse_mask_with_threshold(
                 bbox,
                 &detections,
                 config.ellipse_text_containment_threshold,
             ),
-            Some((idx, _, proposal)) => {
-                matched_proposals[idx] = true;
+            Some((_, proposal)) => {
                 // Over translucent balloons the proposal mask hugs the
                 // text or loses bites to the artwork behind it, while the
                 // detector's box follows the balloon. The inscribed
@@ -481,8 +486,8 @@ fn with_comic_detections_with_config(
         });
     }
     if let Some(min_score) = config.fallback_rfdetr_bubble_threshold {
-        for (idx, proposal) in proposals.into_iter().enumerate() {
-            if matched_proposals[idx] || proposal.score < min_score || !valid_mask(&proposal.mask) {
+        for proposal in proposals {
+            if proposal.score < min_score || !valid_mask(&proposal.mask) {
                 continue;
             }
             let bbox = clip_bounds(proposal.bbox, page);
@@ -518,7 +523,7 @@ fn with_comic_detections_with_config(
 /// must not take in. The comic detector boxes whole text blocks, so the box
 /// grows to its mask only within the comic text boxes it overlaps, and mask
 /// pixels outside them are dropped. Without such a box the box is kept.
-fn fit_to_mask_with_config(
+fn fit_to_mask(
     detection: &mut KoharuLayoutDetection,
     comic_text: &[&ComicTextBubbleDetection],
     config: &DetectionFusionConfig,
@@ -722,11 +727,12 @@ async fn build_patch(
     image: &DynamicImage,
     output: Vec<Candidate>,
     generation: &Generation,
+    config: &DetectionFusionConfig,
 ) -> Result<koharu_scene::Patch> {
     let page = input.page;
     let mut edit = input.scene.edit_as(generation.clone());
     edit.observe_subtree(page)?;
-    write_page(input, &mut edit, page, image, output, generation)
+    write_page(input, &mut edit, page, image, output, generation, config)
         .await
         .context("failed to write detection output")?;
     finish(edit)
@@ -825,13 +831,14 @@ async fn write_page(
     image: &DynamicImage,
     output: Vec<Candidate>,
     generation: &Generation,
+    config: &DetectionFusionConfig,
 ) -> Result<()> {
     let size = ImageSize {
         width: image.width(),
         height: image.height(),
     };
     let mut candidates = output;
-    non_maximum_suppression(&mut candidates, DUPLICATE_IOU);
+    non_maximum_suppression(&mut candidates, config.duplicate_iou);
     let converted;
     let image = match image {
         DynamicImage::ImageRgb8(image) => image,
@@ -848,12 +855,12 @@ async fn write_page(
     );
     let mut detections: Vec<_> = candidates.into_iter().map(|c| c.detection).collect();
     // A text block can join two balloon lobes even when only one lobe is in scope.
-    merge_text_blocks(&mut detections);
-    join_split_bubbles(&mut detections);
+    merge_text_blocks(&mut detections, config);
+    join_split_bubbles(&mut detections, config);
     if let Some(region) = input.region {
         detections.retain(|detection| intersects(detection.bbox, region));
     }
-    write_regions(input, edit, image, &detections, generation)
+    write_regions(input, edit, image, &detections, generation, config)
         .context("failed to write detected regions")?;
     write_masks(input, edit, page, &detections, size)
         .await
@@ -866,12 +873,13 @@ fn write_regions(
     image: &RgbImage,
     detections: &[KoharuLayoutDetection],
     generation: &Generation,
+    config: &DetectionFusionConfig,
 ) -> Result<()> {
     let mut preserved_balloons = remove_previous_regions(input, edit, generation)
         .context("failed to replace the previous detection regions")?;
     let snapshot = &input.scene;
     let page = input.page;
-    let order = layout_order(detections);
+    let order = layout_order(detections, config);
     let inferred = order
         .par_iter()
         .map(|item| {
@@ -1153,7 +1161,7 @@ fn infer_typography(
         median_color(&background)
     };
     let (mut color, mut stroke_color, mut stroke_width) =
-        infer_text_paint(&pixels, background, local_width, local_height);
+        infer_text_paint(&pixels, background, &measured, local_width, local_height);
     // The clustered paint distinguishes antialias bands and single glyph
     // counters. The source outline resolves the inverse case over dark art,
     // where the glyph fill and the surrounding art can share a palette entry.
@@ -1215,16 +1223,18 @@ fn histogram_median(histogram: &[u32; 256], count: usize) -> u8 {
 // The detector mask may trace glyphs or cover a whole text region. Color alone
 // is also insufficient because a black glyph core can be identical to artwork
 // outside its white outline. A real outline is therefore identified by the
-// topology of a color band enclosing another color, then measured across that
-// exact band. Clustering remains the fallback for unoutlined text.
+// topology of a color band enclosing another color. A ring measurement
+// with matching colors supplies the width because the cluster can extend into
+// nearby artwork. Clustering remains the fallback for unoutlined text.
 fn infer_text_paint(
     pixels: &[MaskPixel],
     background_seed: [u8; 3],
+    measured: &GlyphTypography,
     width: u32,
     height: u32,
 ) -> ([u8; 3], Option<[u8; 3]>, Option<f32>) {
     let clusters = color_clusters(pixels, background_seed);
-    if let Some(outline) = infer_outline(&clusters, background_seed, width, height) {
+    if let Some(outline) = infer_outline(&clusters, background_seed, measured, width, height) {
         return (
             outline.fill_color,
             Some(outline.stroke_color),
@@ -1251,10 +1261,19 @@ fn infer_text_paint(
         .copied()
         .min_by_key(|index| color_distance_squared(clusters[*index].color, background_seed))
         .unwrap();
+    // Once glyph ink is separated from its outline, the complementary tone
+    // can be the outline itself.
+    let paper = measured.paper.filter(|_| measured.outline.is_none());
     let fill = nonempty
         .iter()
         .copied()
-        .filter(|index| *index != background_index)
+        .filter(|&index| {
+            index != background_index
+                && paper.is_none_or(|paper| {
+                    color_distance_squared(clusters[index].color, paper)
+                        >= COLOR_CLUSTER_MIN_DISTANCE_SQUARED
+                })
+        })
         .max_by_key(|index| cluster_ink_score(&clusters[*index], background_seed));
     let color = fill
         .map(|index| representative_ink_color(&clusters[index]))
@@ -1273,6 +1292,7 @@ struct OutlinePaint {
 fn infer_outline(
     clusters: &[ColorCluster; COLOR_CLUSTER_COUNT],
     background: [u8; 3],
+    measured: &GlyphTypography,
     width: u32,
     height: u32,
 ) -> Option<OutlinePaint> {
@@ -1289,6 +1309,13 @@ fn infer_outline(
         .filter(|(_, cluster)| !cluster.pixels.is_empty())
         .min_by_key(|(_, cluster)| color_distance_squared(cluster.color, background))
         .map(|(index, _)| index)?;
+    let min_component_pixels = measured
+        .stroke_width
+        .unwrap_or(1.0)
+        .min(measured.size * 0.25)
+        .powi(2)
+        .ceil()
+        .max(1.0) as usize;
     let mut best = None;
     for (stroke_index, stroke_cluster) in clusters.iter().enumerate() {
         if stroke_cluster.pixels.len() < 8 || stroke_index == background_index {
@@ -1299,13 +1326,47 @@ fn infer_outline(
             if fill_index == stroke_index || fill_cluster.pixels.is_empty() {
                 continue;
             }
-            let enclosed_fill = fill_cluster
+            let min_supported =
+                ((fill_cluster.pixels.len() as f32 * MIN_ENCLOSED_FILL_SHARE).ceil() as usize)
+                    .max(8);
+            let mut enclosed_fill = fill_cluster
                 .pixels
                 .iter()
                 .copied()
                 .filter(|pixel| !outside[pixel.y as usize * width as usize + pixel.x as usize])
                 .collect::<Vec<_>>();
-            if enclosed_fill.len() < 8 {
+            if enclosed_fill
+                .iter()
+                .filter(|pixel| pixel.inside_mask)
+                .count()
+                < min_supported
+            {
+                continue;
+            }
+            // Small counters and artwork specks do not count as glyph fill.
+            let mut fill = GrayImage::new(width, height);
+            for pixel in &enclosed_fill {
+                fill.put_pixel(pixel.x, pixel.y, Luma([255]));
+            }
+            let components = connected_components(&fill, Connectivity::Eight, Luma([0]));
+            let mut support = BTreeMap::<u32, (usize, usize)>::new();
+            for pixel in &enclosed_fill {
+                let (total, masked) = support
+                    .entry(components[(pixel.x, pixel.y)][0])
+                    .or_default();
+                *total += 1;
+                *masked += usize::from(pixel.inside_mask);
+            }
+            enclosed_fill.retain(|pixel| {
+                let (total, masked) = support[&components[(pixel.x, pixel.y)][0]];
+                masked >= min_component_pixels && masked * 2 >= total
+            });
+            if enclosed_fill
+                .iter()
+                .filter(|pixel| pixel.inside_mask)
+                .count()
+                < min_supported
+            {
                 continue;
             }
             let stroke_pixels = enclosing_cluster_pixels(
@@ -1323,13 +1384,32 @@ fn infer_outline(
             let fill_color = median_pixel_color(&enclosed_fill);
             let stroke_color = median_pixel_color(&stroke_pixels);
             let contrast = color_distance_squared(fill_color, stroke_color);
+            let fill_matches_surround =
+                color_distance_squared(fill_color, background) < COLOR_CLUSTER_MIN_DISTANCE_SQUARED;
+            let fill_matches_paper = measured.paper.is_some_and(|paper| {
+                color_distance_squared(fill_color, paper) < COLOR_CLUSTER_MIN_DISTANCE_SQUARED
+            });
+            let corroborated_outline = measured
+                .ink
+                .zip(measured.outline)
+                .filter(|&(ink, outline)| {
+                    color_distance_squared(fill_color, ink) < COLOR_CLUSTER_MIN_DISTANCE_SQUARED
+                        && color_distance_squared(stroke_color, outline.color)
+                            < COLOR_CLUSTER_MIN_DISTANCE_SQUARED
+                })
+                .map(|(_, outline)| outline);
             if contrast < COLOR_CLUSTER_MIN_DISTANCE_SQUARED
-                || color_distance_squared(fill_color, background)
-                    < COLOR_CLUSTER_MIN_DISTANCE_SQUARED
                 || color_distance_squared(stroke_color, background)
                     < COLOR_CLUSTER_MIN_DISTANCE_SQUARED
                 || color_lies_between(stroke_color, fill_color, background)
-                || color_lies_between(fill_color, stroke_color, background)
+                || (!fill_matches_surround
+                    && color_lies_between(fill_color, stroke_color, background))
+                || ((fill_matches_surround || fill_matches_paper) && corroborated_outline.is_none())
+                // Thick counters can enclose the exact exterior paper color.
+                || (fill_color == background
+                    && measured
+                        .stroke_width
+                        .is_some_and(|w| w >= 0.6 * measured.size))
             {
                 continue;
             }
@@ -1352,7 +1432,7 @@ fn infer_outline(
             let candidate = OutlinePaint {
                 fill_color: normalized_fill,
                 stroke_color: normalized_stroke,
-                stroke_width,
+                stroke_width: corroborated_outline.map_or(stroke_width, |outline| outline.width),
                 score: f64::from(contrast) * enclosed * enclosed / fill_cluster.pixels.len() as f64,
             };
             if best.is_none_or(|current: OutlinePaint| candidate.score > current.score) {
@@ -2195,36 +2275,25 @@ fn non_maximum_suppression(detections: &mut Vec<Candidate>, threshold: f32) {
 /// that mostly overlap, and neighbouring lines of one paragraph (separated by
 /// less than a line's thickness and running mostly side by side), become one
 /// block. Neighbouring lines in different bubbles stay apart.
-fn merge_text_blocks(detections: &mut Vec<KoharuLayoutDetection>) {
-    merge_text_blocks_with_config(detections, &DetectionFusionConfig::default());
-}
-
-fn merge_text_blocks_with_config(
-    detections: &mut Vec<KoharuLayoutDetection>,
-    config: &DetectionFusionConfig,
-) {
+fn merge_text_blocks(detections: &mut Vec<KoharuLayoutDetection>, config: &DetectionFusionConfig) {
     let texts = indices_with_label(detections, "text");
     let bubbles = indices_with_label(detections, "bubble");
-    let container = texts
-        .iter()
-        .map(|&text| {
-            if config.use_mask_containment_for_merge {
+    let container = if config.use_mask_containment_for_merge {
+        let bubbles = bubbles
+            .iter()
+            .map(|&index| (index, foreground_mask(&detections[index].mask)))
+            .collect::<Vec<_>>();
+        texts
+            .iter()
+            .map(|&index| {
+                let text = &detections[index];
+                let text_mask = MaskWindow::new(&text.mask, text.bbox);
                 bubbles
                     .iter()
-                    .copied()
-                    .map(|bubble| {
-                        let has_fg = |d: &KoharuLayoutDetection| {
-                            valid_mask(&d.mask)
-                                && (d.area > 0 || d.mask.pixels.iter().any(|&value| value != 0))
-                        };
-                        let share = if has_fg(&detections[bubble]) && has_fg(&detections[text]) {
-                            mask_containment(
-                                &detections[bubble].mask,
-                                &detections[text].mask,
-                                detections[text].bbox,
-                            )
-                        } else {
-                            containment(detections[bubble].bbox, detections[text].bbox)
+                    .map(|&(bubble, mask)| {
+                        let share = match (mask, text_mask.as_ref()) {
+                            (Some(mask), Some(text)) => mask_containment(mask, text),
+                            _ => containment(detections[bubble].bbox, text.bbox),
                         };
                         (bubble, share)
                     })
@@ -2235,7 +2304,12 @@ fn merge_text_blocks_with_config(
                         })
                     })
                     .map(|(bubble, _)| bubble)
-            } else {
+            })
+            .collect::<Vec<_>>()
+    } else {
+        texts
+            .iter()
+            .map(|&text| {
                 bubbles
                     .iter()
                     .copied()
@@ -2246,9 +2320,9 @@ fn merge_text_blocks_with_config(
                     .min_by(|&left, &right| {
                         area(detections[left].bbox).total_cmp(&area(detections[right].bbox))
                     })
-            }
-        })
-        .collect::<Vec<_>>();
+            })
+            .collect()
+    };
     let mut parent = (0..texts.len()).collect::<Vec<_>>();
     fn root(parent: &mut [usize], mut index: usize) -> usize {
         while parent[index] != index {
@@ -2278,7 +2352,7 @@ fn merge_text_blocks_with_config(
                     config.same_text_min_containment,
                 ))
                 || (container[first] == container[second]
-                    && neighbouring_lines_with_config(first_bounds, second_bounds, config))
+                    && neighbouring_lines(first_bounds, second_bounds, config))
             {
                 let (first, second) = (root(&mut parent, first), root(&mut parent, second));
                 parent[second] = first;
@@ -2303,24 +2377,23 @@ fn merge_text_blocks_with_config(
 /// joins their text into one block that neither half contains, so the block
 /// would be set as free text over the balloon's edge. Bubbles that each hold
 /// part of such a block, and together hold all of it, become one bubble.
-fn join_split_bubbles(detections: &mut Vec<KoharuLayoutDetection>) {
-    join_split_bubbles_with_config(detections, &DetectionFusionConfig::default());
-}
-
-fn join_split_bubbles_with_config(
-    detections: &mut Vec<KoharuLayoutDetection>,
-    config: &DetectionFusionConfig,
-) {
+fn join_split_bubbles(detections: &mut Vec<KoharuLayoutDetection>, config: &DetectionFusionConfig) {
     let bubbles = indices_with_label(detections, "bubble");
+    let bubble_masks = bubbles
+        .iter()
+        .filter_map(|&bubble| foreground_mask(&detections[bubble].mask))
+        .collect::<Vec<_>>();
     let mut used = vec![false; detections.len()];
     let mut groups = Vec::new();
     for text in indices_with_label(detections, "text") {
         let text = &detections[text];
-        let contains = |bubble: &KoharuLayoutDetection| {
-            mask_containment(&bubble.mask, &text.mask, text.bbox)
-                >= config.dialogue_mask_containment_threshold
+        let Some(text_mask) = MaskWindow::new(&text.mask, text.bbox) else {
+            continue;
         };
-        if bubbles.iter().any(|&bubble| contains(&detections[bubble])) {
+        let contains = |bubble| {
+            mask_containment(bubble, &text_mask) >= config.dialogue_mask_containment_threshold
+        };
+        if bubble_masks.iter().copied().any(contains) {
             continue;
         }
         let parts = bubbles
@@ -2332,7 +2405,11 @@ fn join_split_bubbles_with_config(
                         >= config.split_bubble_min_share
             })
             .collect::<Vec<_>>();
-        if parts.len() < 2 || !contains(&union_detection(detections, &parts)) {
+        if parts.len() < 2 {
+            continue;
+        }
+        let union = union_detection(detections, &parts);
+        if !contains(&union.mask) {
             continue;
         }
         for &part in &parts {
@@ -2414,11 +2491,7 @@ fn same_text_with_threshold(first: [f32; 4], second: [f32; 4], threshold: f32) -
     intersection_area(first, second) >= area(first).min(area(second)) * threshold
 }
 
-fn neighbouring_lines_with_config(
-    first: [f32; 4],
-    second: [f32; 4],
-    config: &DetectionFusionConfig,
-) -> bool {
+fn neighbouring_lines(first: [f32; 4], second: [f32; 4], config: &DetectionFusionConfig) -> bool {
     let width = |bounds: [f32; 4]| bounds[2] - bounds[0];
     let height = |bounds: [f32; 4]| bounds[3] - bounds[1];
     let vertical = |bounds: [f32; 4]| height(bounds) > width(bounds);
@@ -2446,16 +2519,15 @@ pub struct LayoutItem {
 
 /// Panel hierarchy and gutter cuts follow koharu_layout_highres/order.rs
 /// (1235d5c8, f72997e4). A fused balloon groups its dialogue into one subtree.
-fn layout_order(detections: &[KoharuLayoutDetection]) -> Vec<LayoutItem> {
-    layout_order_with_config(detections, &DetectionFusionConfig::default())
-}
-
-fn layout_order_with_config(
+fn layout_order(
     detections: &[KoharuLayoutDetection],
     config: &DetectionFusionConfig,
 ) -> Vec<LayoutItem> {
     let panels = indices_with_label(detections, "panel");
-    let bubbles = indices_with_label(detections, "bubble");
+    let bubbles = indices_with_label(detections, "bubble")
+        .into_iter()
+        .filter_map(|index| foreground_mask(&detections[index].mask).map(|mask| (index, mask)))
+        .collect::<Vec<_>>();
     let mut children = vec![Vec::new(); detections.len()];
     let mut roots = Vec::new();
     let mut other_regions = Vec::new();
@@ -2471,33 +2543,22 @@ fn layout_order_with_config(
                 })
                 .min_by(|&a, &b| area(detections[a].bbox).total_cmp(&area(detections[b].bbox))),
             "text" => {
-                let bubble_match = if config.prefer_higher_bubble_containment {
-                    bubbles
+                let bubble_match = MaskWindow::new(&detection.mask, bbox).and_then(|text_mask| {
+                    let containing = bubbles
                         .iter()
-                        .copied()
-                        .map(|bubble| {
-                            (
-                                bubble,
-                                mask_containment(&detections[bubble].mask, &detection.mask, bbox),
-                            )
-                        })
-                        .filter(|&(_, share)| share >= config.dialogue_mask_containment_threshold)
-                        .max_by(|&(a, a_share), &(b, b_share)| {
+                        .map(|&(bubble, mask)| (bubble, mask_containment(mask, &text_mask)))
+                        .filter(|&(_, share)| share >= config.dialogue_mask_containment_threshold);
+                    if config.prefer_higher_bubble_containment {
+                        containing.max_by(|&(a, a_share), &(b, b_share)| {
                             a_share
                                 .total_cmp(&b_share)
                                 .then_with(|| detections[b].area.cmp(&detections[a].area))
                         })
-                        .map(|(bubble, _)| bubble)
-                } else {
-                    bubbles
-                        .iter()
-                        .copied()
-                        .filter(|&bubble| {
-                            mask_containment(&detections[bubble].mask, &detection.mask, bbox)
-                                >= config.dialogue_mask_containment_threshold
-                        })
-                        .min_by_key(|&bubble| detections[bubble].area)
-                };
+                    } else {
+                        containing.min_by_key(|&(bubble, _)| detections[bubble].area)
+                    }
+                    .map(|(bubble, _)| bubble)
+                });
                 bubble_match.or_else(|| holding_panel(detections, bbox, &panels))
             }
             "bubble" => holding_panel(detections, bbox, &panels),
@@ -2691,53 +2752,69 @@ fn containment(container: [f32; 4], value: [f32; 4]) -> f32 {
     intersection_area(container, value) / value_area
 }
 
-fn mask_containment(
-    container: &KoharuLayoutMask,
-    value: &KoharuLayoutMask,
-    bounds: [f32; 4],
-) -> f32 {
-    if !valid_mask(container) || !valid_mask(value) {
-        return 0.0;
-    }
+fn foreground_mask(mask: &KoharuLayoutMask) -> Option<&KoharuLayoutMask> {
+    (valid_mask(mask) && mask.pixels.iter().any(|&pixel| pixel != 0)).then_some(mask)
+}
 
-    if !bounds.iter().all(|value| value.is_finite()) {
-        return 0.0;
+struct MaskWindow<'a> {
+    mask: &'a KoharuLayoutMask,
+    bounds: [u32; 4],
+    foreground: usize,
+}
+
+impl<'a> MaskWindow<'a> {
+    fn new(mask: &'a KoharuLayoutMask, bounds: [f32; 4]) -> Option<Self> {
+        if !valid_mask(mask) {
+            return None;
+        }
+        let [left, top, right, bottom] = covering_pixels(bounds.map(f64::from));
+        let left = left.max(mask.x);
+        let top = top.max(mask.y);
+        let right = right.min(mask.x.saturating_add(mask.width));
+        let bottom = bottom.min(mask.y.saturating_add(mask.height));
+        if left >= right || top >= bottom {
+            return None;
+        }
+        let foreground = (top..bottom)
+            .map(|y| {
+                mask_row(mask, y, left, right)
+                    .iter()
+                    .filter(|&&p| p != 0)
+                    .count()
+            })
+            .sum();
+        (foreground != 0).then_some(Self {
+            mask,
+            bounds: [left, top, right, bottom],
+            foreground,
+        })
     }
-    let value_right = value.x.saturating_add(value.width);
-    let value_bottom = value.y.saturating_add(value.height);
-    let left = bounds[0]
-        .floor()
-        .max(value.x as f32)
-        .min(value_right as f32) as u32;
-    let top = bounds[1]
-        .floor()
-        .max(value.y as f32)
-        .min(value_bottom as f32) as u32;
-    let right = bounds[2].ceil().max(value.x as f32).min(value_right as f32) as u32;
-    let bottom = bounds[3]
-        .ceil()
-        .max(value.y as f32)
-        .min(value_bottom as f32) as u32;
+}
+
+fn mask_row(mask: &KoharuLayoutMask, y: u32, left: u32, right: u32) -> &[u8] {
+    let row = (y - mask.y) as usize * mask.width as usize;
+    &mask.pixels[row + (left - mask.x) as usize..row + (right - mask.x) as usize]
+}
+
+fn mask_containment(container: &KoharuLayoutMask, text: &MaskWindow<'_>) -> f32 {
+    let [left, top, right, bottom] = text.bounds;
+    let left = left.max(container.x);
+    let top = top.max(container.y);
+    let right = right.min(container.x.saturating_add(container.width));
+    let bottom = bottom.min(container.y.saturating_add(container.height));
     if left >= right || top >= bottom {
         return 0.0;
     }
-
-    let mut value_area = 0usize;
-    let mut intersection = 0usize;
-    for y in top..bottom {
-        for x in left..right {
-            if !value.contains(x, y) {
-                continue;
-            }
-            value_area += 1;
-            intersection += usize::from(container.contains(x, y));
-        }
-    }
-    if value_area == 0 {
-        0.0
-    } else {
-        intersection as f32 / value_area as f32
-    }
+    let intersection: usize = (top..bottom)
+        .map(|y| {
+            mask_row(text.mask, y, left, right)
+                .iter()
+                .zip(mask_row(container, y, left, right))
+                .filter(|&(&text, &bubble)| text != 0 && bubble != 0)
+                .count()
+        })
+        .sum();
+    intersection as f32 / text.foreground as f32
 }
 
 fn intersection_over_union(left: [f32; 4], right: [f32; 4]) -> f32 {
@@ -2825,8 +2902,8 @@ mod tests {
     };
 
     use super::{
-        DIALOGUE_MASK_CONTAINMENT_THRESHOLD, DetectionModel, ImageSize,
-        KoharuLayoutRFDetrSeg2XLConfig, MaskPixel, Processor, RegionOutput, StageInput,
+        DIALOGUE_MASK_CONTAINMENT_THRESHOLD, DetectionFusionConfig, DetectionModel, ImageSize,
+        KoharuLayoutRFDetrSeg2XLConfig, MaskPixel, MaskWindow, Processor, RegionOutput, StageInput,
         StageProcessor, color_palette, generation, infer_typography, layout_order,
         mask_containment, mask_for, mask_geometry, non_maximum_suppression, normalize_text_color,
         write_region,
@@ -2844,10 +2921,15 @@ mod tests {
         KoharuLayoutDetections {
             image_width: layout.image_width,
             image_height: layout.image_height,
-            detections: super::with_comic_detections(layout, comic, threshold)
-                .into_iter()
-                .map(|c| c.detection)
-                .collect(),
+            detections: super::with_comic_detections(
+                layout,
+                comic,
+                threshold,
+                &DetectionFusionConfig::default(),
+            )
+            .into_iter()
+            .map(|c| c.detection)
+            .collect(),
         }
     }
 
@@ -2941,6 +3023,7 @@ mod tests {
                 })
                 .collect(),
             &generation(super::PRODUCER, super::MODEL_ID)?,
+            &DetectionFusionConfig::default(),
         )
         .await?;
         let snapshot = session.commit(patch).await?.snapshot;
@@ -3101,7 +3184,13 @@ mod tests {
             .unwrap();
         assert!(bubble.mask.contains(30, 50));
         assert!(!bubble.mask.contains(11, 2));
-        assert_eq!(mask_containment(&bubble.mask, &text.mask, text.bbox), 1.0);
+        assert_eq!(
+            mask_containment(
+                &bubble.mask,
+                &MaskWindow::new(&text.mask, text.bbox).unwrap()
+            ),
+            1.0
+        );
     }
 
     #[test]
@@ -3215,6 +3304,7 @@ mod tests {
                 [50., 10., 70., 30.],
             )],
             0.5,
+            &DetectionFusionConfig::default(),
         );
         super::fit_glyph_masks(
             candidates
@@ -3275,8 +3365,16 @@ mod tests {
                 comic(ComicTextBubbleLabel::TextBubble, [60., 50., 85., 70.]),
             ],
             0.5,
+            &DetectionFusionConfig::default(),
         );
-        let patch = super::build_patch(&input, &image, candidates, &detector).await?;
+        let patch = super::build_patch(
+            &input,
+            &image,
+            candidates,
+            &detector,
+            &DetectionFusionConfig::default(),
+        )
+        .await?;
         let snapshot = session.commit(patch).await?.snapshot;
         let regions: Vec<_> = snapshot
             .children(page)?
@@ -3300,7 +3398,14 @@ mod tests {
                 .origin,
             Origin::Generated(_)
         ));
-        let patch = super::build_patch(&input, &image, vec![], &detector).await?;
+        let patch = super::build_patch(
+            &input,
+            &image,
+            vec![],
+            &detector,
+            &DetectionFusionConfig::default(),
+        )
+        .await?;
         let snapshot = session.commit(patch).await?.snapshot;
         assert_eq!(snapshot.component::<OcrAnalysis>(edited)?, Some(correction));
         assert!(snapshot.entity(untouched).is_err());
@@ -3383,7 +3488,14 @@ mod tests {
                     detection,
                 })
                 .collect();
-            let patch = super::build_patch(&input, &image, output, &detector).await?;
+            let patch = super::build_patch(
+                &input,
+                &image,
+                output,
+                &detector,
+                &DetectionFusionConfig::default(),
+            )
+            .await?;
             input.scene = session.commit(patch).await?.snapshot;
             let snapshot = &input.scene;
             let group = snapshot.page(page)?.text_group()?.unwrap();
@@ -3496,6 +3608,7 @@ mod tests {
                     detection: text.clone(),
                 }],
                 &generation,
+                &DetectionFusionConfig::default(),
             )
             .await?;
             input.scene = session.commit(patch).await?.snapshot;
@@ -3564,12 +3677,14 @@ mod tests {
                     [40., 20., 67., 70.],
                 )],
                 0.5,
+                &DetectionFusionConfig::default(),
             );
             let patch = super::build_patch(
                 &input,
                 &source,
                 layout,
                 &generation(super::PRODUCER, super::MODEL_ID)?,
+                &DetectionFusionConfig::default(),
             )
             .await?;
             input.scene = session.commit(patch).await?.snapshot;
@@ -3964,7 +4079,7 @@ mod tests {
             detection("bubble", 0.9, [860.0, 3281.0, 1289.0, 4894.0]),
         ];
 
-        super::merge_text_blocks(&mut detections);
+        super::merge_text_blocks(&mut detections, &DetectionFusionConfig::default());
 
         let mut texts = detections
             .iter()
@@ -4010,7 +4125,7 @@ mod tests {
             masked("text", [100.0, 100.0, 300.0, 300.0]),
         ];
 
-        super::join_split_bubbles(&mut detections);
+        super::join_split_bubbles(&mut detections, &DetectionFusionConfig::default());
 
         let mut bubbles = detections
             .iter()
@@ -4053,7 +4168,7 @@ mod tests {
             .collect();
         non_maximum_suppression(&mut candidates, 0.5);
         let mut detections = candidates.into_iter().map(|c| c.detection).collect();
-        super::merge_text_blocks(&mut detections);
+        super::merge_text_blocks(&mut detections, &DetectionFusionConfig::default());
 
         let text = detections
             .iter()
@@ -4076,6 +4191,26 @@ mod tests {
     }
 
     #[test]
+    fn neighboring_lines_merge_in_free_text_or_a_shared_bubble() {
+        let lines = vec![
+            boxed_detection("text", 0.9, [20.0, 20.0, 60.0, 30.0]),
+            boxed_detection("text", 0.9, [20.0, 32.0, 60.0, 42.0]),
+        ];
+        let config = DetectionFusionConfig::default();
+        let mut detections = lines.clone();
+        super::merge_text_blocks(&mut detections, &config);
+        assert_eq!(detections.len(), 1);
+        assert_eq!(detections[0].bbox, [20.0, 20.0, 60.0, 42.0]);
+
+        detections = lines;
+        detections.push(boxed_detection("bubble", 0.9, [10.0, 10.0, 70.0, 52.0]));
+        super::merge_text_blocks(&mut detections, &config);
+        assert_eq!(detections.len(), 2);
+        let paragraph = detections.iter().find(|d| d.label == "text").unwrap();
+        assert_eq!(paragraph.bbox, [20.0, 20.0, 60.0, 42.0]);
+    }
+
+    #[test]
     fn paragraph_union_keeps_mask_pixels_outside_the_box() {
         let mut detections = vec![
             KoharuLayoutDetection {
@@ -4088,7 +4223,7 @@ mod tests {
             },
         ];
 
-        super::merge_text_blocks(&mut detections);
+        super::merge_text_blocks(&mut detections, &DetectionFusionConfig::default());
 
         let [paragraph] = detections.as_slice() else {
             panic!("expected one paragraph");
@@ -4167,8 +4302,14 @@ mod tests {
         ]);
 
         let bounds = [0.0, 0.0, 5.0, 5.0];
-        assert_eq!(mask_containment(&bubble, &dialogue, bounds), 1.0);
-        assert!(mask_containment(&bubble, &crossing, bounds) < DIALOGUE_MASK_CONTAINMENT_THRESHOLD);
+        assert_eq!(
+            mask_containment(&bubble, &MaskWindow::new(&dialogue, bounds).unwrap()),
+            1.0
+        );
+        assert!(
+            mask_containment(&bubble, &MaskWindow::new(&crossing, bounds).unwrap())
+                < DIALOGUE_MASK_CONTAINMENT_THRESHOLD
+        );
     }
 
     #[test]
@@ -4196,8 +4337,16 @@ mod tests {
         };
 
         let bounds = [5.0, 5.0, 7.0, 7.0];
-        assert_eq!(mask_containment(&valid, &malformed, bounds), 0.0);
-        assert_eq!(mask_containment(&valid, &different_size, bounds), 1.0);
+        assert!(MaskWindow::new(&malformed, bounds).is_none());
+        let sparse = KoharuLayoutMask {
+            pixels: vec![0, 0, 0, 1],
+            ..valid.clone()
+        };
+        assert!(MaskWindow::new(&sparse, [5.0, 5.0, 6.0, 6.0]).is_none());
+        let window = MaskWindow::new(&different_size, bounds).unwrap();
+        assert_eq!(mask_containment(&valid, &window), 1.0);
+        let disjoint = KoharuLayoutMask { x: 20, ..valid };
+        assert_eq!(mask_containment(&disjoint, &window), 0.0);
     }
 
     fn boxed_detection(label: &str, score: f32, bbox: [f32; 4]) -> KoharuLayoutDetection {
@@ -4222,7 +4371,7 @@ mod tests {
             boxed_detection("bubble", 0.7, [120.0, 100.0, 190.0, 160.0]),
         ];
 
-        let text_scores = layout_order(&detections)
+        let text_scores = layout_order(&detections, &DetectionFusionConfig::default())
             .into_iter()
             .filter_map(|item| {
                 let detection = &detections[item.index];
@@ -4243,7 +4392,7 @@ mod tests {
             boxed_detection("text", 0.1, [20.0, 0.0, 180.0, 20.0]),
         ];
 
-        let text_scores = layout_order(&detections)
+        let text_scores = layout_order(&detections, &DetectionFusionConfig::default())
             .into_iter()
             .filter_map(|item| {
                 let detection = &detections[item.index];
@@ -4262,7 +4411,7 @@ mod tests {
             detection("bubble", 0.9, [60.0, 11.0, 90.0, 42.0]),
             detection("bubble", 0.9, [10.0, 50.0, 40.0, 81.0]),
         ];
-        let order: Vec<_> = layout_order(&detections)
+        let order: Vec<_> = layout_order(&detections, &DetectionFusionConfig::default())
             .iter()
             .map(|item| item.index)
             .collect();
@@ -4277,7 +4426,7 @@ mod tests {
             detection("text", 0.9, [10.0, 20.0, 50.0, 30.0]),
         ];
         // Each has one predecessor. The highest centre breaks the cycle.
-        let order: Vec<_> = layout_order(&detections)
+        let order: Vec<_> = layout_order(&detections, &DetectionFusionConfig::default())
             .iter()
             .map(|item| item.index)
             .collect();
@@ -4297,7 +4446,7 @@ mod tests {
             detection("text", 0.8, [30.0, 0.0, 60.0, 10.0]),
         ];
         // The right margin caption follows both insets, before the left panel.
-        let order: Vec<_> = layout_order(&detections)
+        let order: Vec<_> = layout_order(&detections, &DetectionFusionConfig::default())
             .iter()
             .map(|item| item.index)
             .collect();
@@ -4316,7 +4465,7 @@ mod tests {
         ];
         // The lower-left panel spans half the right balloon's height. The
         // page's vertical gutter puts the balloon before both left panels.
-        let order: Vec<_> = layout_order(&detections)
+        let order: Vec<_> = layout_order(&detections, &DetectionFusionConfig::default())
             .iter()
             .map(|item| item.index)
             .collect();
@@ -4333,7 +4482,7 @@ mod tests {
             boxed_detection("text", 0.9, [65.0, 60.0, 85.0, 80.0]),
             boxed_detection("onomatopoeia", 0.9, [95.0, 5.0, 115.0, 95.0]),
         ];
-        let order = layout_order(&detections);
+        let order = layout_order(&detections, &DetectionFusionConfig::default());
         let dialogue: Vec<_> = order
             .iter()
             .filter(|item| detections[item.index].label == "text")
@@ -4453,13 +4602,15 @@ mod tests {
 
     #[test]
     fn outlined_text_roles_do_not_flip_with_inverse_luminance() {
-        let (image, detection) = outlined_text(3, [255, 255, 255], [0, 0, 0]);
+        for background in [[16, 24, 88], [150, 170, 190]] {
+            let (image, detection) = outlined_text_on_background(3, [255; 3], [0; 3], background);
 
-        let inferred = infer_typography(&image, &detection).unwrap();
+            let inferred = infer_typography(&image, &detection).unwrap();
 
-        assert_eq!(inferred.color, [255, 255, 255]);
-        assert_eq!(inferred.stroke_color, Some([0, 0, 0]));
-        assert_eq!(inferred.stroke_width, Some(3.0));
+            assert_eq!(inferred.color, [255; 3]);
+            assert_eq!(inferred.stroke_color, Some([0; 3]));
+            assert_eq!(inferred.stroke_width, Some(3.0));
+        }
     }
 
     #[test]
@@ -4470,6 +4621,76 @@ mod tests {
         let inferred = infer_typography(&image, &detection).unwrap();
 
         assert_eq!(inferred.color, [0, 0, 0]);
+        assert_eq!(inferred.stroke_color, None);
+        assert_eq!(inferred.stroke_width, None);
+    }
+
+    #[test]
+    fn white_exclamation_marks_keep_their_black_outline_on_off_white_paper() {
+        let mut image = RgbImage::from_pixel(80, 60, Rgb([243; 3]));
+        for left in [20, 35, 50] {
+            for (top, bottom) in [(14, 32), (39, 43)] {
+                for y in top - 2..bottom + 2 {
+                    for x in left - 2..left + 6 {
+                        let fill = (left..left + 4).contains(&x) && (top..bottom).contains(&y);
+                        image.put_pixel(x, y, Rgb([if fill { 255 } else { 0 }; 3]));
+                    }
+                }
+            }
+        }
+        let detection = boxed_detection("text", 0.9, [18.0, 12.0, 56.0, 45.0]);
+
+        let inferred = infer_typography(&image, &detection).unwrap();
+
+        assert_eq!(inferred.color, [255; 3]);
+        assert_eq!(inferred.stroke_color, Some([0; 3]));
+        assert_eq!(inferred.stroke_width, Some(2.0));
+    }
+
+    #[test]
+    fn small_ellipsis_dots_keep_their_white_outline() {
+        let mut image = RgbImage::from_pixel(40, 24, Rgb([16, 24, 88]));
+        for left in [9, 17, 25] {
+            for y in 8..15 {
+                for x in left - 2..left + 4 {
+                    let fill = (left..left + 2).contains(&x) && (10..13).contains(&y);
+                    image.put_pixel(x, y, Rgb([if fill { 0 } else { 255 }; 3]));
+                }
+            }
+        }
+        let detection = boxed_detection("text", 0.9, [7.0, 8.0, 29.0, 15.0]);
+
+        let inferred = infer_typography(&image, &detection).unwrap();
+
+        assert_eq!(inferred.color, [0; 3]);
+        assert_eq!(inferred.stroke_color, Some([255; 3]));
+    }
+
+    #[test]
+    fn tiny_paper_pockets_in_dark_ink_do_not_become_outlined_fill() {
+        let surround = [104, 163, 210];
+        let paper = [248; 3];
+        let image = RgbImage::from_fn(112, 104, |x, y| {
+            let inside_box = (6..106).contains(&x) && (6..98).contains(&y);
+            let pocket = (22..25).contains(&x) && (32..36).contains(&y);
+            let ring = (16..32).contains(&x) && (24..44).contains(&y);
+            let letters = (4..80).contains(&y)
+                && [(44..52), (58..66), (72..80), (86..94)]
+                    .iter()
+                    .any(|run| run.contains(&x));
+            let edge_stroke = (16..19).contains(&x) && (4..24).contains(&y);
+            Rgb(if (ring && !pocket) || edge_stroke || letters {
+                [0; 3]
+            } else if !inside_box {
+                surround
+            } else {
+                paper
+            })
+        });
+        let detection = boxed_detection("text", 0.9, [6.0, 6.0, 106.0, 98.0]);
+        let inferred = infer_typography(&image, &detection).unwrap();
+
+        assert_eq!(inferred.color, [0; 3]);
         assert_eq!(inferred.stroke_color, None);
         assert_eq!(inferred.stroke_width, None);
     }
@@ -4517,6 +4738,57 @@ mod tests {
 
         assert_eq!(inferred.color, [0, 0, 0]);
         assert_eq!(inferred.stroke_color, Some([255, 255, 255]));
+    }
+
+    #[test]
+    fn high_resolution_outline_keeps_its_width_where_it_touches_light_art() {
+        let background = [16, 24, 88];
+        let mut image = RgbImage::from_pixel(4961, 7016, Rgb(background));
+        let (left, top, right, bottom) = (2300_u32, 3300_u32, 2420_u32, 3580_u32);
+        let outline = 15;
+        let art = 41..44;
+        let art_reach = art.end - 1;
+        for y in top - outline..bottom + outline {
+            for x in left - art_reach..right + art_reach {
+                let dx = left.saturating_sub(x) + x.saturating_sub(right - 1);
+                let dy = top.saturating_sub(y) + y.saturating_sub(bottom - 1);
+                let connected_art = dy == 0 && (art.contains(&dx) || y == (top + bottom) / 2);
+                let color = if dx == 0 && dy == 0 {
+                    [0; 3]
+                } else if dx * dx + dy * dy <= outline * outline || connected_art {
+                    [255; 3]
+                } else {
+                    continue;
+                };
+                image.put_pixel(x, y, Rgb(color));
+            }
+        }
+        let detection = KoharuLayoutDetection {
+            mask: full_mask(left, top, right - left, bottom - top).into(),
+            ..detection(
+                "text",
+                0.9,
+                [
+                    (left - art_reach) as f32,
+                    (top - outline) as f32,
+                    (right + art_reach) as f32,
+                    (bottom + outline) as f32,
+                ],
+            )
+        };
+
+        let measured = detection.mask.typography(&image).unwrap();
+        assert_eq!(measured.ink, Some([0; 3]));
+        let band = measured
+            .outline
+            .unwrap_or_else(|| panic!("expected an outline in {measured:?}"));
+        assert_eq!(band.color, [255; 3]);
+        assert_eq!(band.width, 15.0);
+
+        let inferred = infer_typography(&image, &detection).unwrap();
+        assert_eq!(inferred.color, [0; 3]);
+        assert_eq!(inferred.stroke_color, Some([255; 3]));
+        assert_eq!(inferred.stroke_width, Some(15.0));
     }
 
     #[test]
@@ -4651,7 +4923,7 @@ mod tests {
             mask: full_mask(100, 100, 160, 100).into(),
             ..detection("text", 0.9, [100.0, 100.0, 152.0, 200.0])
         };
-        let comic = vec![
+        let comic = [
             comic(
                 ComicTextBubbleLabel::TextBubble,
                 [100.0, 100.0, 150.0, 200.0],
@@ -4661,12 +4933,8 @@ mod tests {
                 [150.0, 100.0, 260.0, 200.0],
             ),
         ];
-        let comic_refs: Vec<_> = comic.iter().collect();
-        super::fit_to_mask_with_config(
-            &mut leaky,
-            &comic_refs,
-            &super::DetectionFusionConfig::default(),
-        );
+        let comic_refs = comic.each_ref();
+        super::fit_to_mask(&mut leaky, &comic_refs, &DetectionFusionConfig::default());
         assert!(
             leaky.bbox[2] <= 155.0,
             "grazing neighbor comic box should not expand bbox into neighbor: {:?}",
@@ -4697,7 +4965,7 @@ mod tests {
             ..detection("bubble", 0.9, b2_box)
         };
         let mut detections = vec![b1, b2, t1, t2];
-        super::merge_text_blocks(&mut detections);
+        super::merge_text_blocks(&mut detections, &DetectionFusionConfig::default());
         let texts: Vec<_> = detections.iter().filter(|d| d.label == "text").collect();
         assert_eq!(
             texts.len(),
@@ -4727,7 +4995,7 @@ mod tests {
             ..detection("text", 0.9, [156.0, 80.0, 180.0, 140.0])
         };
         let mut detections = vec![b1, b2, t1, t2];
-        super::merge_text_blocks(&mut detections);
+        super::merge_text_blocks(&mut detections, &DetectionFusionConfig::default());
         let texts: Vec<_> = detections.iter().filter(|d| d.label == "text").collect();
         assert_eq!(
             texts.len(),
@@ -4791,7 +5059,7 @@ mod tests {
             ..detection("text", 0.9, [100.0, 120.0, 200.0, 170.0])
         };
         let detections = vec![b0, b1, text];
-        let order = layout_order(&detections);
+        let order = layout_order(&detections, &DetectionFusionConfig::default());
         let text_item = order.iter().find(|item| item.index == 2).unwrap();
         assert_eq!(text_item.bubble, Some(1));
     }
