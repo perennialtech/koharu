@@ -37,6 +37,7 @@ pub(super) struct Outlined {
 pub(super) fn outlined(
     page: &RgbImage,
     block: &Mask,
+    pre_closed: &Mask,
     ink: &GrayImage,
     corner: [u32; 2],
     size: impl Fn(&GrayImage) -> f32,
@@ -46,7 +47,13 @@ pub(super) fn outlined(
     // only their counters.
     [true, false].into_iter().find_map(|enclosed| {
         let tone = |x: u32, y: u32| (ink.get_pixel(x, y).0[0] == 0) == enclosed;
-        let parts = Parts::within(block, &tone, scaled(3.0, page.width(), page.height()));
+        let parts = Parts::within(
+            block,
+            pre_closed,
+            corner,
+            &tone,
+            scaled(3.0, page.width(), page.height()),
+        );
         let whole = parts.shape(|_| true);
         let glyphs = parts.banded(block, &tone);
         if count(&glyphs) < 16 || !enclosed && 2 * count(&glyphs) < count(ink) {
@@ -116,9 +123,16 @@ struct Parts {
 impl Parts {
     /// `tone`'s parts inside `block` that don't reach its edge, at least
     /// `least` pixels long.
-    fn within(block: &Mask, tone: &impl Fn(u32, u32) -> bool, least: u32) -> Self {
+    fn within(
+        block: &Mask,
+        pre_closed: &Mask,
+        corner: [u32; 2],
+        tone: &impl Fn(u32, u32) -> bool,
+        least: u32,
+    ) -> Self {
         let (width, height) = (block.width, block.height);
         let inside = |x: u32, y: u32| block.pixels[(y * width + x) as usize] != 0;
+        let in_pre_closed = |x: u32, y: u32| pre_closed.contains(corner[0] + x, corner[1] + y);
         let shape = GrayImage::from_fn(width, height, |x, y| {
             Luma([u8::from(inside(x, y) && tone(x, y)) * u8::MAX])
         });
@@ -135,6 +149,7 @@ impl Parts {
                 || y == 0
                 || x + 1 == width
                 || y + 1 == height
+                || !in_pre_closed(x, y)
                 || (y - 1..=y + 1).any(|y| (x - 1..=x + 1).any(|x| !inside(x, y)));
             let ([x0, y0, x1, y1], area) = parts[label].get_or_insert(([x, y, x, y], 0));
             (*x0, *y0) = ((*x0).min(x), (*y0).min(y));
@@ -337,5 +352,77 @@ mod tests {
             assert_eq!((found.ink, found.outline), (Some(ink), None));
             assert_eq!(found.size, 20.0);
         }
+    }
+
+    #[test]
+    fn high_res_outlined_columns_do_not_bridge_dark_art_gutters() {
+        // Three vertical columns of white-outlined black glyphs separated by
+        // 36px dark-art gutters on a 4961x7016 page, with light art bridging
+        // the gutter at the top and bottom. An uncapped scaled(6.0) closing
+        // (41px radius) would trap the dark-art gutters and merge all columns.
+        let mut page = RgbImage::from_pixel(4961, 7016, Rgb([20, 20, 20]));
+        let col_xs = [2100u32, 2280, 2460];
+        let glyph_w = 120u32;
+        let outline_w = 12u32;
+        let row_ys = [3000u32, 3160, 3320, 3480];
+
+        // Light art bars near top and bottom spanning across the gutters.
+        for y in (2990..3010).chain(3590..3610) {
+            for x in 2080..2600 {
+                page.put_pixel(x, y, Rgb(WHITE));
+            }
+        }
+        // Draw white outlines first, then black glyphs inside.
+        for &cx in &col_xs {
+            for &ry in &row_ys {
+                for y in ry - outline_w..ry + glyph_w + outline_w {
+                    for x in cx - outline_w..cx + glyph_w + outline_w {
+                        page.put_pixel(x, y, Rgb(WHITE));
+                    }
+                }
+            }
+        }
+        for &cx in &col_xs {
+            for &ry in &row_ys {
+                for y in ry..ry + glyph_w {
+                    for x in cx..cx + glyph_w {
+                        let stroke = x < cx + 20
+                            || x >= cx + glyph_w - 20
+                            || y < ry + 20
+                            || y >= ry + glyph_w - 20;
+                        if stroke {
+                            page.put_pixel(x, y, Rgb(BLACK));
+                        }
+                    }
+                }
+            }
+        }
+
+        let (mx, my, mw, mh) = (2080u32, 2980u32, 520u32, 640u32);
+        let mut pixels = vec![0u8; (mw * mh) as usize];
+        for &cx in &col_xs {
+            for &ry in &row_ys {
+                for y in ry - outline_w..ry + glyph_w + outline_w {
+                    for x in cx - outline_w..cx + glyph_w + outline_w {
+                        pixels[((y - my) * mw + (x - mx)) as usize] = u8::MAX;
+                    }
+                }
+            }
+        }
+        let mask = Mask {
+            x: mx,
+            y: my,
+            width: mw,
+            height: mh,
+            pixels,
+        };
+        let found = mask.typography(&page).expect("outlined high-res columns");
+        assert!(found.vertical, "expected vertical columns: {found:?}");
+        assert!(
+            (105.0..=145.0).contains(&found.size),
+            "expected single-column size ~120px, got {}px ({found:?})",
+            found.size
+        );
+        assert!(found.outline.is_some(), "expected white outline: {found:?}");
     }
 }
