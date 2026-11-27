@@ -178,7 +178,7 @@ mod tests {
             Stage::ALL.map(|stage| stages.model(stage)),
             [
                 "koharu-layout-rfdetr-seg-2xl",
-                "paddleocr-vl-1.6",
+                "hayai-ocr",
                 "translator",
                 "lama",
             ]

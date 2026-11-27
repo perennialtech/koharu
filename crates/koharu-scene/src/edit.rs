@@ -66,6 +66,38 @@ impl Edit {
         self.observe_component(ComponentOwner::Entity(entity), key::<T>()?)
     }
 
+    /// Reads and observes the ordered entities with this component on the base page.
+    pub fn observe_entities_with<T: Component>(&mut self, page: EntityId) -> Result<Vec<EntityId>> {
+        let key = key::<T>()?;
+        let entities = self.base.state.page(page)?.entities_with(&key);
+        self.observations.insert(Observation::PageEntitiesWith {
+            page,
+            key,
+            entities: entities.clone(),
+        });
+        Ok(entities)
+    }
+
+    /// Reads and observes the ordered sources of incoming relations of this kind.
+    pub fn observe_relation_sources<R: RelationSpec>(
+        &mut self,
+        target: EntityId,
+    ) -> Result<Vec<EntityId>> {
+        self.base.entity(target)?;
+        let kind = R::kind();
+        let sources: Vec<_> = self
+            .base
+            .relations_to(target, Some(&kind))
+            .map(|relation| relation.value().source)
+            .collect();
+        self.observations.insert(Observation::RelationSources {
+            target,
+            kind,
+            sources: sources.clone(),
+        });
+        Ok(sources)
+    }
+
     /// Observes the complete typed asset collection owned by an entity.
     pub fn observe_assets(&mut self, entity: EntityId) -> Result<()> {
         self.observe_component(ComponentOwner::Entity(entity), key::<Assets>()?)
