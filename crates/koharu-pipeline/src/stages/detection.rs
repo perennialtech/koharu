@@ -171,7 +171,9 @@ struct Model {
 impl Model {
     async fn load(device: koharu_ml::Device, config: &DetectionModel) -> Result<Self> {
         let DetectionModel::KoharuLayoutRFDetrSeg2XL(config) = config;
-        let network = KoharuLayoutRFDetrSeg2XL::load(device.clone()).await?;
+        let network = KoharuLayoutRFDetrSeg2XL::load(device.clone())
+            .await?
+            .with_bubble_proposals();
         let bubbles = ComicTextBubbleDetector::load(device).await?;
         let mut thresholds = network.recommended_thresholds();
         thresholds.text = config.text_threshold.unwrap_or(thresholds.text);
@@ -283,7 +285,7 @@ fn with_comic_detections(
             score: text.score,
             bbox,
             area: mask.width * mask.height,
-            mask,
+            mask: mask.into(),
         });
     }
     detections.extend(added_text);
@@ -323,7 +325,7 @@ fn with_comic_detections(
             score: bubble.score,
             bbox,
             area: mask.pixels.iter().filter(|value| **value != 0).count() as u32,
-            mask,
+            mask: mask.into(),
         });
     }
     detections.extend(bubble_detections);
@@ -375,7 +377,8 @@ fn fit_to_mask(detection: &mut KoharuLayoutDetection, comic_text: &[&ComicTextBu
     detection.mask = clip_mask(
         &mask,
         [x as f32, y as f32, mask_right as f32, mask_bottom as f32],
-    );
+    )
+    .into();
     detection.area = detection
         .mask
         .pixels
@@ -491,30 +494,10 @@ fn ellipse_mask(bbox: [f32; 4], detections: &[KoharuLayoutDetection]) -> KoharuL
     }
 }
 
-struct DetectedRegion<'a> {
-    entity: EntityId,
-    mask: &'a KoharuLayoutMask,
-    area: u32,
-}
-
-struct DetectedText<'a> {
-    entity: EntityId,
-    mask: &'a KoharuLayoutMask,
-    bounds: [f32; 4],
-    content: EntityId,
-    layer: EntityId,
-}
-
-enum RegionOutput<'a> {
-    Bubble(DetectedRegion<'a>),
-    Text(DetectedText<'a>),
+enum RegionOutput {
+    Bubble(EntityId),
+    TextLayer(EntityId),
     Other,
-}
-
-#[derive(Default)]
-struct PageRegions<'a> {
-    bubbles: Vec<DetectedRegion<'a>>,
-    texts: Vec<DetectedText<'a>>,
 }
 
 #[derive(Clone, Copy)]
@@ -592,7 +575,6 @@ async fn write_page(
     non_maximum_suppression(&mut detections, 0.5);
     merge_text_blocks(&mut detections);
     join_split_bubbles(&mut detections);
-    sort_by_layout(&mut detections);
 
     let converted;
     let image = match image {
@@ -602,27 +584,26 @@ async fn write_page(
             &converted
         }
     };
-    let regions = write_regions(&input.scene, edit, page, image, &detections, generation)
+    write_regions(&input.scene, edit, page, image, &detections, generation)
         .context("failed to write detected regions")?;
-    link_dialogue_regions(edit, &regions, generation)
-        .context("failed to associate detected text with dialogue regions")?;
     write_masks(input, edit, page, &detections, size)
         .await
         .context("failed to write detection masks")
 }
 
-fn write_regions<'a>(
+fn write_regions(
     snapshot: &koharu_scene::Snapshot,
     edit: &mut koharu_scene::Edit,
     page: EntityId,
     image: &RgbImage,
-    detections: &'a [KoharuLayoutDetection],
+    detections: &[KoharuLayoutDetection],
     generation: &Generation,
-) -> Result<PageRegions<'a>> {
-    let mut regions = PageRegions::default();
-    let inferred = detections
+) -> Result<()> {
+    let order = layout_order(detections);
+    let inferred = order
         .par_iter()
-        .map(|detection| {
+        .map(|item| {
+            let detection = &detections[item.index];
             (detection.label == "text")
                 .then(|| infer_typography(image, detection))
                 .flatten()
@@ -637,31 +618,41 @@ fn write_regions<'a>(
     } else {
         None
     };
-    for (index, (detection, inferred)) in detections.iter().zip(inferred).enumerate() {
-        match write_region(edit, page, detection, inferred, generation)
-            .with_context(|| format!("failed to write {} detection {index}", detection.label))?
-        {
-            RegionOutput::Bubble(bubble) => regions.bubbles.push(bubble),
-            RegionOutput::Text(text) => {
+    let mut bubble_entities = vec![None; detections.len()];
+    for (item, inferred) in order.into_iter().zip(inferred) {
+        let detection = &detections[item.index];
+        let bubble = item
+            .bubble
+            .map(|index| bubble_entities[index].expect("balloon precedes its text"));
+        match write_region(edit, page, detection, inferred, bubble, generation).with_context(
+            || {
+                format!(
+                    "failed to write {} detection {}",
+                    detection.label, item.index
+                )
+            },
+        )? {
+            RegionOutput::Bubble(entity) => bubble_entities[item.index] = Some(entity),
+            RegionOutput::TextLayer(layer) => {
                 if let Some(group) = managed_text_group {
-                    edit.move_entity(text.layer, Some(group), At::End)
+                    edit.move_entity(layer, Some(group), At::End)
                         .context("failed to place the detected text layer in its group")?;
                 }
-                regions.texts.push(text);
             }
             RegionOutput::Other => {}
         }
     }
-    Ok(regions)
+    Ok(())
 }
 
-fn write_region<'a>(
+fn write_region(
     edit: &mut koharu_scene::Edit,
     page: EntityId,
-    detection: &'a KoharuLayoutDetection,
+    detection: &KoharuLayoutDetection,
     inferred: Option<InferredTypography>,
+    bubble: Option<EntityId>,
     generation: &Generation,
-) -> Result<RegionOutput<'a>> {
+) -> Result<RegionOutput> {
     let entity = edit
         .add_entity(page, At::End)
         .context("failed to create a detected region")?;
@@ -700,11 +691,7 @@ fn write_region<'a>(
     .context("failed to set detection analysis")?;
     if detection.label != "text" {
         return Ok(if detection.label == "bubble" {
-            RegionOutput::Bubble(DetectedRegion {
-                entity,
-                mask: &detection.mask,
-                area: detection.area,
-            })
+            RegionOutput::Bubble(entity)
         } else {
             RegionOutput::Other
         });
@@ -721,8 +708,6 @@ fn write_region<'a>(
             angle_degrees: None,
         },
     )?;
-    write_text_role(edit, content, "dev.koharu.text.free-text", generation)
-        .context("failed to set the detected text role")?;
     edit.set(
         layer,
         &Typography {
@@ -746,60 +731,22 @@ fn write_region<'a>(
     edit.relate::<RecognizedFrom>(content, entity)
         .context("failed to associate detected text content with its region")?;
 
-    Ok(RegionOutput::Text(DetectedText {
-        entity,
-        mask: &detection.mask,
-        bounds: detection.bbox,
-        content,
-        layer,
-    }))
-}
-
-fn link_dialogue_regions(
-    edit: &mut koharu_scene::Edit,
-    regions: &PageRegions<'_>,
-    generation: &Generation,
-) -> Result<()> {
-    for text in &regions.texts {
-        let bubble = containing_bubble(&regions.bubbles, text);
-        if let Some(bubble) = bubble {
-            edit.relate::<Inside>(text.entity, bubble.entity)?;
-            edit.relate::<FlowsIn>(text.layer, bubble.entity)?;
-            write_text_role(edit, text.content, "dev.koharu.text.dialogue", generation)?;
-        } else {
-            edit.relate::<FitsTo>(text.layer, text.entity)?;
-        }
-    }
-    Ok(())
-}
-
-fn containing_bubble<'regions, 'detections>(
-    bubbles: &'regions [DetectedRegion<'detections>],
-    text: &DetectedText<'detections>,
-) -> Option<&'regions DetectedRegion<'detections>> {
-    bubbles
-        .iter()
-        .filter(|bubble| {
-            mask_containment(bubble.mask, text.mask, text.bounds)
-                >= DIALOGUE_MASK_CONTAINMENT_THRESHOLD
-        })
-        .min_by_key(|bubble| bubble.area)
-}
-
-fn write_text_role(
-    edit: &mut koharu_scene::Edit,
-    entity: EntityId,
-    role: &str,
-    generation: &Generation,
-) -> Result<()> {
+    let role = if let Some(bubble) = bubble {
+        edit.relate::<Inside>(entity, bubble)?;
+        edit.relate::<FlowsIn>(layer, bubble)?;
+        "dev.koharu.text.dialogue"
+    } else {
+        edit.relate::<FitsTo>(layer, entity)?;
+        "dev.koharu.text.free-text"
+    };
     edit.set(
-        entity,
+        content,
         &TextRole {
             origin: Origin::Generated(generation.clone()),
             role: role.to_owned(),
         },
     )?;
-    Ok(())
+    Ok(RegionOutput::TextLayer(layer))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -2228,7 +2175,8 @@ fn union_detection(detections: &[KoharuLayoutDetection], group: &[usize]) -> Koh
             width,
             height,
             pixels,
-        },
+        }
+        .into(),
     }
 }
 
@@ -2257,67 +2205,60 @@ fn neighbouring_lines(first: [f32; 4], second: [f32; 4]) -> bool {
     gap <= line * TEXT_BLOCK_GAP && shared >= shorter * 0.5
 }
 
-fn sort_by_layout(detections: &mut Vec<KoharuLayoutDetection>) {
-    let order = layout_order(detections);
-    let mut values = std::mem::take(detections)
-        .into_iter()
-        .map(Some)
-        .collect::<Vec<_>>();
-    *detections = order
-        .into_iter()
-        .map(|index| {
-            values[index]
-                .take()
-                .expect("layout order contains each detection once")
-        })
-        .collect();
+struct LayoutItem {
+    index: usize,
+    /// The glyph-mask parent, visited before this text so its scene ID is available.
+    bubble: Option<usize>,
 }
 
-fn layout_order(detections: &[KoharuLayoutDetection]) -> Vec<usize> {
+/// Panel hierarchy and gutter cuts follow koharu_layout_highres/order.rs
+/// (1235d5c8, f72997e4). A fused balloon groups its dialogue into one subtree.
+fn layout_order(detections: &[KoharuLayoutDetection]) -> Vec<LayoutItem> {
     let panels = indices_with_label(detections, "panel");
     let bubbles = indices_with_label(detections, "bubble");
-    let texts = indices_with_label(detections, "text");
-
-    let mut panel_for_bubble = vec![None; detections.len()];
-    for &bubble in &bubbles {
-        panel_for_bubble[bubble] = best_container(detections, bubble, &panels);
-    }
-    let mut bubble_for_text = vec![None; detections.len()];
-    let mut panel_for_text = vec![None; detections.len()];
-    for &text in &texts {
-        let bubble = best_container(detections, text, &bubbles);
-        bubble_for_text[text] = bubble;
-        panel_for_text[text] = bubble
-            .and_then(|bubble| panel_for_bubble[bubble])
-            .or_else(|| best_container(detections, text, &panels));
-    }
-
-    let mut parent = vec![None; detections.len()];
-    for bubble in bubbles {
-        parent[bubble] = panel_for_bubble[bubble];
-    }
-    for text in texts {
-        parent[text] = bubble_for_text[text].or(panel_for_text[text]);
-    }
-
-    let mut roots = Vec::new();
     let mut children = vec![Vec::new(); detections.len()];
-    for (index, parent) in parent.into_iter().enumerate() {
+    let mut roots = Vec::new();
+    let mut other_regions = Vec::new();
+    for (index, detection) in detections.iter().enumerate() {
+        let bbox = detection.bbox;
+        let parent = match detection.label.as_str() {
+            "panel" => panels
+                .iter()
+                .copied()
+                .filter(|&outer| {
+                    let outer = detections[outer].bbox;
+                    area(outer) > area(bbox) && containment(outer, bbox) >= 0.9
+                })
+                .min_by(|&a, &b| area(detections[a].bbox).total_cmp(&area(detections[b].bbox))),
+            "text" => bubbles
+                .iter()
+                .copied()
+                .filter(|&bubble| {
+                    mask_containment(&detections[bubble].mask, &detection.mask, bbox)
+                        >= DIALOGUE_MASK_CONTAINMENT_THRESHOLD
+                })
+                .min_by_key(|&bubble| detections[bubble].area)
+                .or_else(|| holding_panel(detections, bbox, &panels)),
+            "bubble" => holding_panel(detections, bbox, &panels),
+            // Untranslated sound effects and other analysis-only regions
+            // have scene geometry but do not participate in dialogue order.
+            _ => {
+                other_regions.push(LayoutItem {
+                    index,
+                    bubble: None,
+                });
+                continue;
+            }
+        };
         if let Some(parent) = parent {
             children[parent].push(index);
         } else {
             roots.push(index);
         }
     }
-    sort_spatial(detections, &mut roots);
-    for siblings in &mut children {
-        sort_spatial(detections, siblings);
-    }
-
     let mut order = Vec::with_capacity(detections.len());
-    for root in roots {
-        append_layout_subtree(root, &children, &mut order);
-    }
+    read_siblings(detections, roots, &mut children, None, &mut order);
+    order.extend(other_regions);
     order
 }
 
@@ -2329,36 +2270,156 @@ fn indices_with_label(detections: &[KoharuLayoutDetection], label: &str) -> Vec<
         .collect()
 }
 
-fn append_layout_subtree(index: usize, children: &[Vec<usize>], order: &mut Vec<usize>) {
-    order.push(index);
-    for &child in &children[index] {
-        append_layout_subtree(child, children, order);
+/// Prefer the panel holding the largest share, then the smallest inset.
+fn holding_panel(
+    detections: &[KoharuLayoutDetection],
+    bbox: [f32; 4],
+    panels: &[usize],
+) -> Option<usize> {
+    let holding = panels
+        .iter()
+        .map(|&panel| (panel, containment(detections[panel].bbox, bbox)))
+        .filter(|&(_, share)| share >= 0.25)
+        .max_by(|&(a, a_share), &(b, b_share)| {
+            a_share
+                .total_cmp(&b_share)
+                .then_with(|| area(detections[b].bbox).total_cmp(&area(detections[a].bbox)))
+        });
+    if let Some((panel, _)) = holding {
+        return Some(panel);
+    }
+    let distance = |panel: usize| {
+        let other = detections[panel].bbox;
+        let dx = (other[0] - bbox[2]).max(bbox[0] - other[2]).max(0.0);
+        let dy = (other[1] - bbox[3]).max(bbox[1] - other[3]).max(0.0);
+        dx.hypot(dy)
+    };
+    let spanned = |panel: usize| {
+        let other = detections[panel].bbox;
+        (other[3].min(bbox[3]) - other[1].max(bbox[1])) / (bbox[3] - bbox[1]).max(f32::EPSILON)
+    };
+    let nearest = |a: &usize, b: &usize| distance(*a).total_cmp(&distance(*b));
+    // A caption beside a panel belongs to that row. Above or below its
+    // nearest panel it occupies the gutter and is read at page level.
+    if spanned(panels.iter().copied().min_by(nearest)?) <= 0.0 {
+        return None;
+    }
+    // A margin item may be separated from the panel by up to the narrower
+    // box's width. A missing panel can otherwise pull dialogue across a page.
+    panels
+        .iter()
+        .copied()
+        .filter(|&panel| {
+            let other = detections[panel].bbox;
+            spanned(panel) >= 0.5 && distance(panel) <= (bbox[2] - bbox[0]).min(other[2] - other[0])
+        })
+        .min_by(nearest)
+}
+
+fn read_siblings(
+    detections: &[KoharuLayoutDetection],
+    items: Vec<usize>,
+    children: &mut [Vec<usize>],
+    bubble: Option<usize>,
+    order: &mut Vec<LayoutItem>,
+) {
+    for index in gutter_order(detections, items) {
+        order.push(LayoutItem { index, bubble });
+        let nested = std::mem::take(&mut children[index]);
+        if !nested.is_empty() {
+            let bubble = (detections[index].label == "bubble").then_some(index);
+            read_siblings(detections, nested, children, bubble, order);
+        }
     }
 }
 
-fn sort_spatial(detections: &[KoharuLayoutDetection], indices: &mut [usize]) {
-    indices.sort_by(|&left, &right| {
-        detection_order(&detections[left], &detections[right])
-            .then_with(|| detections[right].score.total_cmp(&detections[left].score))
-            .then_with(|| left.cmp(&right))
-    });
+/// Split at horizontal gutters before vertical gutters, recursively within
+/// each row or column. Touching edges also separate adjacent panels.
+fn gutter_order(detections: &[KoharuLayoutDetection], mut items: Vec<usize>) -> Vec<usize> {
+    if items.len() < 2 {
+        return items;
+    }
+    for axis in [1, 0] {
+        let mut sorted = items.clone();
+        sorted.sort_by(|&a, &b| detections[a].bbox[axis].total_cmp(&detections[b].bbox[axis]));
+        let mut groups: Vec<Vec<usize>> = Vec::new();
+        let mut end = f32::NEG_INFINITY;
+        for index in sorted {
+            let bbox = detections[index].bbox;
+            match groups.last_mut() {
+                Some(group) if bbox[axis] < end => group.push(index),
+                _ => groups.push(vec![index]),
+            }
+            end = end.max(bbox[axis + 2]);
+        }
+        if groups.len() > 1 {
+            if axis == 0 {
+                groups.reverse();
+            }
+            return groups
+                .into_iter()
+                .flat_map(|group| gutter_order(detections, group))
+                .collect();
+        }
+    }
+
+    // Pairwise preferences can cycle. Read the item with the fewest unread
+    // predecessors, then remove its vote from the remaining items.
+    let mut unread: Vec<_> = items
+        .iter()
+        .map(|&index| {
+            let earlier = items
+                .iter()
+                .filter(|&&other| {
+                    other != index && reads_before(detections[other].bbox, detections[index].bbox)
+                })
+                .count();
+            (index, earlier)
+        })
+        .collect();
+    for next in &mut items {
+        let position = (0..unread.len())
+            .min_by(|&a, &b| {
+                let ((a, a_count), (b, b_count)) = (unread[a], unread[b]);
+                let (left, right) = (detections[a].bbox, detections[b].bbox);
+                a_count
+                    .cmp(&b_count)
+                    .then_with(|| (left[1] + left[3]).total_cmp(&(right[1] + right[3])))
+                    .then_with(|| (right[0] + right[2]).total_cmp(&(left[0] + left[2])))
+                    .then_with(|| a.cmp(&b))
+            })
+            .expect("one unread item per remaining slot");
+        *next = unread.swap_remove(position).0;
+        for (other, earlier) in &mut unread {
+            *earlier -= usize::from(reads_before(
+                detections[*next].bbox,
+                detections[*other].bbox,
+            ));
+        }
+    }
+    items
 }
 
-fn best_container(
-    detections: &[KoharuLayoutDetection],
-    value: usize,
-    candidates: &[usize],
-) -> Option<usize> {
-    candidates
-        .iter()
-        .copied()
-        .filter(|&candidate| containment(detections[candidate].bbox, detections[value].bbox) >= 0.5)
-        .min_by(|&left, &right| {
-            area(detections[left].bbox)
-                .total_cmp(&area(detections[right].bbox))
-                .then_with(|| detection_order(&detections[left], &detections[right]))
-                .then_with(|| left.cmp(&right))
-        })
+/// Shrink overlapping boxes until an axis separates them.
+fn reads_before(a: [f32; 4], b: [f32; 4]) -> bool {
+    for erosion in [0.0, 0.1, 0.2, 0.3, 0.4, 0.5] {
+        let erode = |[x1, y1, x2, y2]: [f32; 4]| {
+            let dx = (x2 - x1).max(0.0) * erosion;
+            let dy = (y2 - y1).max(0.0) * erosion;
+            [x1 + dx, y1 + dy, x2 - dx, y2 - dy]
+        };
+        let (a, b) = (erode(a), erode(b));
+        if a[3] <= b[1] || b[3] <= a[1] {
+            return a[3] <= b[1];
+        }
+        if a[0] >= b[2] || b[0] >= a[2] {
+            return a[0] >= b[2];
+        }
+    }
+    (a[1] + a[3])
+        .total_cmp(&(b[1] + b[3]))
+        .then_with(|| (b[0] + b[2]).total_cmp(&(a[0] + a[2])))
+        .is_lt()
 }
 
 fn containment(container: [f32; 4], value: [f32; 4]) -> f32 {
@@ -2446,17 +2507,15 @@ mod tests {
     };
     use koharu_ml::koharu_layout_rfdetr_seg_2xl::{KoharuLayoutDetection, KoharuLayoutMask};
     use koharu_scene::{
-        At, BubbleRegion, FitsTo, FlowsIn, Geometry, Inside, Origin, PageDraft, Session,
-        TextLayout, TextLayoutKind, TextRegion, Typography, WritingMode,
+        At, Geometry, Inside, PageDraft, Session, TextRegion, Typography, WritingMode,
     };
 
     use super::{
-        DIALOGUE_MASK_CONTAINMENT_THRESHOLD, DetectedRegion, DetectedText, DetectionModel,
-        ImageSize, KoharuLayoutRFDetrSeg2XLConfig, MaskPixel, PageRegions, Processor, RegionOutput,
-        StageInput, StageProcessor, closed_mask_for, color_palette, euclidean_morphology,
-        generation, infer_typography, layout_order, link_dialogue_regions, mask_containment,
-        mask_for, mask_geometry, non_maximum_suppression, normalize_text_color,
-        with_comic_detections, write_region,
+        DIALOGUE_MASK_CONTAINMENT_THRESHOLD, DetectionModel, ImageSize,
+        KoharuLayoutRFDetrSeg2XLConfig, MaskPixel, Processor, RegionOutput, StageInput,
+        StageProcessor, closed_mask_for, color_palette, euclidean_morphology, generation,
+        infer_typography, layout_order, mask_containment, mask_for, mask_geometry,
+        non_maximum_suppression, normalize_text_color, with_comic_detections, write_region,
     };
     use koharu_ml::{
         comic_text_bubble_detector::{ComicTextBubbleDetection, ComicTextBubbleLabel},
@@ -2517,90 +2576,80 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn joined_text_uses_balloon_flow_semantics() {
-        let mut session = Session::memory().await.unwrap();
-        let bubble_mask = KoharuLayoutMask {
-            x: 0,
-            y: 0,
-            width: 1,
-            height: 1,
-            pixels: vec![u8::MAX],
-        };
-        let text_mask = bubble_mask.clone();
-        let generation = generation(super::PRODUCER, super::MODEL_ID).unwrap();
-        let mut ids = None;
-        let patch = session
-            .snapshot()
-            .patch(|edit| {
-                let page = edit.add_page(PageDraft::new("page", 100.0, 100.0), At::End)?;
-                let bubble = edit.add_analysis_region::<BubbleRegion>(
-                    page,
-                    At::End,
-                    &Geometry::rectangle(10.0, 10.0, 80.0, 80.0),
-                    None,
-                )?;
-                let region = edit.add_analysis_region::<TextRegion>(
-                    page,
-                    At::End,
-                    &Geometry::rectangle(30.0, 30.0, 20.0, 20.0),
-                    None,
-                )?;
-                let content = edit.add_text_content(page, At::End)?;
-                let layer = edit.add_text_layer(
-                    page,
-                    At::End,
-                    content,
-                    &TextLayout {
-                        origin: Origin::User,
-                        kind: TextLayoutKind::Paragraph,
-                        angle_degrees: None,
-                    },
-                )?;
-                link_dialogue_regions(
-                    edit,
-                    &PageRegions {
-                        bubbles: vec![DetectedRegion {
-                            entity: bubble,
-                            mask: &bubble_mask,
-                            area: 1,
-                        }],
-                        texts: vec![DetectedText {
-                            entity: region,
-                            mask: &text_mask,
-                            bounds: [0.0, 0.0, 1.0, 1.0],
-                            content,
-                            layer,
-                        }],
-                    },
-                    &generation,
-                )
-                .unwrap();
-                ids = Some((bubble, region, layer));
-                Ok(())
-            })
-            .unwrap();
-        let snapshot = session.commit(patch).await.unwrap().snapshot;
-        let (bubble, region, layer) = ids.unwrap();
+    async fn reading_order_and_flow_use_the_balloon_holding_the_glyphs() -> anyhow::Result<()> {
+        // The text box is entirely in the left balloon's box, but its ink is
+        // in the right balloon. The left balloon starts one pixel higher.
+        let mut left = detection("bubble", 0.75, [5.0, 10.0, 65.0, 90.0]);
+        left.mask = full_mask(5, 10, 45, 80).into();
+        left.area = 45 * 80;
+        let mut right = detection("bubble", 0.85, [55.0, 11.0, 95.0, 91.0]);
+        right.mask = full_mask(55, 11, 40, 80).into();
+        right.area = 40 * 80;
+        let mut text = detection("text", 0.65, [10.0, 30.0, 65.0, 60.0]);
+        text.mask = full_mask(61, 35, 3, 10).into();
+        text.area = 3 * 10;
+        let mut caption = detection("text", 0.55, [5.0, 93.0, 24.0, 99.0]);
+        caption.mask = full_mask(5, 93, 19, 6).into();
+        caption.area = 19 * 6;
 
+        let mut session = Session::memory().await?;
+        let mut page = None;
+        let create = session.snapshot().patch(|edit| {
+            page = Some(edit.add_page(PageDraft::new("page", 100.0, 100.0), At::End)?);
+            Ok(())
+        })?;
+        let snapshot = session.commit(create).await?.snapshot;
+        let page = page.unwrap();
+        let input = StageInput::new(snapshot, page, None, None, Default::default(), None);
+        let patch = super::build_patch(
+            &input,
+            &image::DynamicImage::new_rgb8(100, 100),
+            KoharuLayoutDetections {
+                image_width: 100,
+                image_height: 100,
+                detections: vec![caption, left, text, right],
+            },
+            &generation(super::PRODUCER, super::MODEL_ID)?,
+        )
+        .await?;
+        let snapshot = session.commit(patch).await?.snapshot;
+        let regions: Vec<_> = snapshot
+            .children(page)?
+            .filter_map(|id| snapshot.analysis_region(id).ok())
+            .collect();
+        let scores: Vec<_> = regions
+            .iter()
+            .map(|region| region.detection().unwrap().unwrap().labels[0].confidence)
+            .collect();
+        assert_eq!(scores, [0.85, 0.65, 0.75, 0.55]);
+
+        let layers: Vec<_> = snapshot
+            .page(page)?
+            .text_group()?
+            .unwrap()
+            .text_layers()?
+            .collect();
+        let [dialogue, free] = layers[..] else {
+            panic!("expected two text layers")
+        };
         assert_eq!(
-            snapshot
-                .relation_from::<FlowsIn>(layer)
-                .unwrap()
-                .unwrap()
-                .value()
-                .target,
-            bubble
+            dialogue.content()?.source_region()?.unwrap().id(),
+            regions[1].id()
         );
-        assert!(snapshot.relation_from::<FitsTo>(layer).unwrap().is_none());
+        assert_eq!(dialogue.balloon_target()?.unwrap().id(), regions[0].id());
+        assert!(dialogue.fit_target()?.is_none());
         assert_eq!(
             snapshot
-                .relations_from_as::<Inside>(region)
+                .relations_from_as::<Inside>(regions[1].id())
                 .next()
                 .unwrap()
                 .value()
                 .target,
-            bubble
+            regions[0].id()
         );
+        assert_eq!(free.fit_target()?.unwrap().id(), regions[3].id());
+        assert!(free.balloon_target()?.is_none());
+        Ok(())
     }
 
     fn detection(label: &str, score: f32, bbox: [f32; 4]) -> KoharuLayoutDetection {
@@ -2616,7 +2665,8 @@ mod tests {
                 width: 1,
                 height: 1,
                 pixels: vec![0],
-            },
+            }
+            .into(),
         }
     }
 
@@ -2642,7 +2692,7 @@ mod tests {
     fn detected_bubbles_replace_layout_bubbles_and_reuse_overlapping_masks() {
         // The proposal spans a second lobe to the right of the detected box.
         let mut proposal = detection("bubble", 0.1, [10.0, 10.0, 70.0, 90.0]);
-        proposal.mask = full_mask(12, 12, 56, 76);
+        proposal.mask = full_mask(12, 12, 56, 76).into();
         proposal.area = 56 * 76;
         let unmatched = detection("bubble", 0.9, [100.0, 0.0, 120.0, 20.0]);
         let layout = KoharuLayoutDetections {
@@ -2692,7 +2742,7 @@ mod tests {
     fn unmatched_detected_bubbles_use_an_ellipse_that_contains_their_text() {
         // A tall text column whose corners fall outside the inscribed ellipse.
         let mut text = detection("text", 0.9, [20.0, 5.0, 40.0, 95.0]);
-        text.mask = full_mask(20, 5, 20, 90);
+        text.mask = full_mask(20, 5, 20, 90).into();
         let layout = KoharuLayoutDetections {
             image_width: 100,
             image_height: 100,
@@ -2734,7 +2784,7 @@ mod tests {
             for y in (0..90).chain(200..300) {
                 mask.pixels[y * 20..y * 20 + 20].fill(u8::MAX);
             }
-            text.mask = mask;
+            text.mask = mask.into();
             KoharuLayoutDetections {
                 image_width: 100,
                 image_height: 400,
@@ -2762,9 +2812,9 @@ mod tests {
     #[test]
     fn onomatopoeia_that_the_comic_detector_boxes_as_text_becomes_text() {
         let mut aside = detection("onomatopoeia", 0.5, [10.0, 10.0, 30.0, 60.0]);
-        aside.mask = full_mask(10, 10, 20, 50);
+        aside.mask = full_mask(10, 10, 20, 50).into();
         let mut effect = detection("onomatopoeia", 0.5, [100.0, 10.0, 160.0, 60.0]);
-        effect.mask = full_mask(100, 10, 60, 50);
+        effect.mask = full_mask(100, 10, 60, 50).into();
         let layout = KoharuLayoutDetections {
             image_width: 200,
             image_height: 100,
@@ -2786,7 +2836,7 @@ mod tests {
     #[test]
     fn confident_comic_text_that_layout_missed_becomes_text() {
         let mut column = detection("text", 0.9, [10.0, 10.0, 30.0, 90.0]);
-        column.mask = full_mask(10, 10, 20, 80);
+        column.mask = full_mask(10, 10, 20, 80).into();
         let layout = KoharuLayoutDetections {
             image_width: 200,
             image_height: 100,
@@ -2921,7 +2971,8 @@ mod tests {
                     width,
                     height,
                     pixels,
-                },
+                }
+                .into(),
             },
         )
     }
@@ -2969,7 +3020,8 @@ mod tests {
                     width,
                     height,
                     pixels,
-                },
+                }
+                .into(),
             },
         )
     }
@@ -3006,7 +3058,8 @@ mod tests {
                     width,
                     height,
                     pixels,
-                },
+                }
+                .into(),
             },
         )
     }
@@ -3059,7 +3112,8 @@ mod tests {
                     width,
                     height,
                     pixels,
-                },
+                }
+                .into(),
             },
         )
     }
@@ -3083,11 +3137,12 @@ mod tests {
         let mut layer = None;
         let patch = snapshot
             .patch(|edit| {
-                let output = write_region(edit, page, &detection, inferred, &generation).unwrap();
-                let RegionOutput::Text(text) = output else {
+                let output =
+                    write_region(edit, page, &detection, inferred, None, &generation).unwrap();
+                let RegionOutput::TextLayer(entity) = output else {
                     panic!("expected a text region");
                 };
-                layer = Some(text.layer);
+                layer = Some(entity);
                 Ok(())
             })
             .unwrap();
@@ -3112,7 +3167,7 @@ mod tests {
         let column = |bbox: [f32; 4]| {
             let [left, top, right, bottom] = bbox.map(|value| value as u32);
             KoharuLayoutDetection {
-                mask: full_mask(left, top, right - left, bottom - top),
+                mask: full_mask(left, top, right - left, bottom - top).into(),
                 ..detection("text", 0.9, bbox)
             }
         };
@@ -3165,7 +3220,7 @@ mod tests {
         let masked = |label: &str, bbox: [f32; 4]| {
             let [left, top, right, bottom] = bbox.map(|value| value as u32);
             KoharuLayoutDetection {
-                mask: full_mask(left, top, right - left, bottom - top),
+                mask: full_mask(left, top, right - left, bottom - top).into(),
                 ..detection(label, 0.9, bbox)
             }
         };
@@ -3200,11 +3255,11 @@ mod tests {
     fn overlapping_text_keeps_both_masks_while_nms_suppresses_duplicate_bubbles() {
         let mut detections = vec![
             KoharuLayoutDetection {
-                mask: full_mask(110, 10, 30, 80),
+                mask: full_mask(110, 10, 30, 80).into(),
                 ..detection("text", 0.8, [0.0, 0.0, 150.0, 100.0])
             },
             KoharuLayoutDetection {
-                mask: full_mask(10, 10, 80, 80),
+                mask: full_mask(10, 10, 80, 80).into(),
                 ..detection("text", 0.9, [0.0, 0.0, 100.0, 100.0])
             },
             detection("bubble", 0.7, [0.0, 0.0, 100.0, 100.0]),
@@ -3239,11 +3294,11 @@ mod tests {
     fn paragraph_union_keeps_mask_pixels_outside_the_box() {
         let mut detections = vec![
             KoharuLayoutDetection {
-                mask: full_mask(7, 11, 8, 30),
+                mask: full_mask(7, 11, 8, 30).into(),
                 ..detection("text", 0.9, [10.0, 10.0, 40.0, 50.0])
             },
             KoharuLayoutDetection {
-                mask: full_mask(65, 12, 10, 28),
+                mask: full_mask(65, 12, 10, 28).into(),
                 ..detection("text", 0.8, [40.0, 10.0, 70.0, 50.0])
             },
         ];
@@ -3273,7 +3328,8 @@ mod tests {
                 width: 1,
                 height: 1,
                 pixels: vec![value],
-            },
+            }
+            .into(),
         };
         let detections = vec![
             detection("bubble", 0, 0),
@@ -3377,7 +3433,8 @@ mod tests {
                 width,
                 height,
                 pixels,
-            },
+            }
+            .into(),
         };
         let detections = vec![
             local(0, 0, 4, 4, vec![255; 16]),
@@ -3425,7 +3482,8 @@ mod tests {
                         width,
                         height,
                         pixels,
-                    },
+                    }
+                    .into(),
                 });
             }
             let radius = (case % 5 + 1) as u8;
@@ -3480,23 +3538,33 @@ mod tests {
         }
     }
 
+    fn boxed_detection(label: &str, score: f32, bbox: [f32; 4]) -> KoharuLayoutDetection {
+        let mask = super::box_mask(bbox);
+        KoharuLayoutDetection {
+            area: mask.width * mask.height,
+            mask: mask.into(),
+            ..detection(label, score, bbox)
+        }
+    }
+
     #[test]
     fn layout_order_follows_panels_then_bubbles_then_their_text() {
         let detections = vec![
-            detection("text", 0.63, [20.0, 30.0, 70.0, 70.0]),
-            detection("bubble", 0.7, [10.0, 20.0, 80.0, 80.0]),
-            detection("panel", 0.9, [100.0, 0.0, 200.0, 200.0]),
-            detection("text", 0.62, [130.0, 110.0, 180.0, 150.0]),
-            detection("bubble", 0.8, [120.0, 20.0, 190.0, 80.0]),
-            detection("panel", 0.9, [0.0, 0.0, 95.0, 200.0]),
-            detection("text", 0.61, [130.0, 30.0, 180.0, 70.0]),
-            detection("bubble", 0.7, [120.0, 100.0, 190.0, 160.0]),
+            boxed_detection("text", 0.63, [20.0, 30.0, 70.0, 70.0]),
+            boxed_detection("bubble", 0.7, [10.0, 20.0, 80.0, 80.0]),
+            boxed_detection("panel", 0.9, [100.0, 0.0, 200.0, 200.0]),
+            boxed_detection("text", 0.62, [130.0, 110.0, 180.0, 150.0]),
+            boxed_detection("bubble", 0.8, [120.0, 20.0, 190.0, 80.0]),
+            boxed_detection("panel", 0.9, [0.0, 0.0, 95.0, 200.0]),
+            boxed_detection("text", 0.61, [130.0, 30.0, 180.0, 70.0]),
+            boxed_detection("bubble", 0.7, [120.0, 100.0, 190.0, 160.0]),
         ];
 
         let text_scores = layout_order(&detections)
             .into_iter()
-            .filter_map(|index| {
-                (detections[index].label == "text").then_some(detections[index].score)
+            .filter_map(|item| {
+                let detection = &detections[item.index];
+                (detection.label == "text").then_some(detection.score)
             })
             .collect::<Vec<_>>();
 
@@ -3506,21 +3574,111 @@ mod tests {
     #[test]
     fn layout_order_merges_containers_and_text_at_each_spatial_level() {
         let detections = vec![
-            detection("panel", 0.9, [0.0, 40.0, 200.0, 240.0]),
-            detection("bubble", 0.8, [100.0, 120.0, 190.0, 210.0]),
-            detection("text", 0.3, [120.0, 140.0, 180.0, 190.0]),
-            detection("text", 0.2, [20.0, 60.0, 180.0, 90.0]),
-            detection("text", 0.1, [20.0, 0.0, 180.0, 20.0]),
+            boxed_detection("panel", 0.9, [0.0, 40.0, 200.0, 240.0]),
+            boxed_detection("bubble", 0.8, [100.0, 120.0, 190.0, 210.0]),
+            boxed_detection("text", 0.3, [120.0, 140.0, 180.0, 190.0]),
+            boxed_detection("text", 0.2, [20.0, 60.0, 180.0, 90.0]),
+            boxed_detection("text", 0.1, [20.0, 0.0, 180.0, 20.0]),
         ];
 
         let text_scores = layout_order(&detections)
             .into_iter()
-            .filter_map(|index| {
-                (detections[index].label == "text").then_some(detections[index].score)
+            .filter_map(|item| {
+                let detection = &detections[item.index];
+                (detection.label == "text").then_some(detection.score)
             })
             .collect::<Vec<_>>();
 
         assert_eq!(text_scores, [0.1, 0.2, 0.3]);
+    }
+
+    #[test]
+    fn staggered_balloons_read_right_to_left_within_each_row() {
+        let detections = [
+            detection("bubble", 0.9, [10.0, 10.0, 40.0, 40.0]),
+            detection("bubble", 0.9, [60.0, 55.0, 90.0, 85.0]),
+            detection("bubble", 0.9, [60.0, 11.0, 90.0, 42.0]),
+            detection("bubble", 0.9, [10.0, 50.0, 40.0, 81.0]),
+        ];
+        let order: Vec<_> = layout_order(&detections)
+            .iter()
+            .map(|item| item.index)
+            .collect();
+        assert_eq!(order, [2, 0, 1, 3]);
+    }
+
+    #[test]
+    fn overlapping_siblings_with_cyclic_preferences_are_each_read_once() {
+        let detections = [
+            detection("text", 0.9, [30.0, 20.0, 40.0, 40.0]),
+            detection("text", 0.9, [20.0, 0.0, 30.0, 40.0]),
+            detection("text", 0.9, [10.0, 20.0, 50.0, 30.0]),
+        ];
+        // Each has one predecessor. The highest centre breaks the cycle.
+        let order: Vec<_> = layout_order(&detections)
+            .iter()
+            .map(|item| item.index)
+            .collect();
+        assert_eq!(order, [1, 2, 0]);
+    }
+
+    #[test]
+    fn inset_panels_and_margin_captions_read_with_their_panel() {
+        let detections = [
+            detection("panel", 0.9, [0.0, 20.0, 90.0, 220.0]),
+            detection("panel", 0.9, [100.0, 21.0, 200.0, 220.0]),
+            detection("panel", 0.9, [110.0, 70.0, 185.0, 185.0]),
+            detection("panel", 0.9, [115.0, 90.0, 145.0, 130.0]),
+            detection("text", 0.8, [120.0, 100.0, 140.0, 120.0]),
+            detection("text", 0.8, [150.0, 80.0, 180.0, 125.0]),
+            detection("text", 0.8, [205.0, 190.0, 215.0, 215.0]),
+            detection("text", 0.8, [30.0, 0.0, 60.0, 10.0]),
+        ];
+        // The right margin caption follows both insets, before the left panel.
+        let order: Vec<_> = layout_order(&detections)
+            .iter()
+            .map(|item| item.index)
+            .collect();
+        assert_eq!(order, [7, 1, 2, 5, 3, 4, 6, 0]);
+    }
+
+    #[test]
+    fn balloon_across_a_missing_panel_reads_at_page_level() {
+        let detections = [
+            boxed_detection("panel", 0.9, [0.0, 1.0, 513.0, 494.0]),
+            boxed_detection("text", 0.9, [342.0, 63.0, 488.0, 337.0]),
+            boxed_detection("panel", 0.9, [0.0, 503.0, 226.0, 933.0]),
+            boxed_detection("text", 0.9, [162.0, 502.0, 199.0, 672.0]),
+            boxed_detection("bubble", 0.9, [939.0, 191.0, 1148.0, 851.0]),
+            boxed_detection("text", 0.9, [1009.0, 299.0, 1079.0, 778.0]),
+        ];
+        // The lower-left panel spans half the right balloon's height. The
+        // page's vertical gutter puts the balloon before both left panels.
+        let order: Vec<_> = layout_order(&detections)
+            .iter()
+            .map(|item| item.index)
+            .collect();
+        assert_eq!(order, [4, 5, 0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn untranslated_sound_effect_keeps_the_gutter_between_dialogue_rows_open() {
+        let detections = [
+            boxed_detection("panel", 0.9, [0.0, 0.0, 120.0, 100.0]),
+            boxed_detection("bubble", 0.9, [10.0, 10.0, 40.0, 40.0]),
+            boxed_detection("text", 0.9, [15.0, 15.0, 35.0, 35.0]),
+            boxed_detection("bubble", 0.9, [60.0, 55.0, 90.0, 85.0]),
+            boxed_detection("text", 0.9, [65.0, 60.0, 85.0, 80.0]),
+            boxed_detection("onomatopoeia", 0.9, [95.0, 5.0, 115.0, 95.0]),
+        ];
+        let order = layout_order(&detections);
+        let dialogue: Vec<_> = order
+            .iter()
+            .filter(|item| detections[item.index].label == "text")
+            .map(|item| (item.index, item.bubble))
+            .collect();
+        assert_eq!(dialogue, [(2, Some(1)), (4, Some(3))]);
+        assert_eq!(order.iter().filter(|item| item.index == 5).count(), 1);
     }
 
     #[test]
@@ -3581,7 +3739,8 @@ mod tests {
                 width,
                 height,
                 pixels,
-            },
+            }
+            .into(),
         };
 
         let inferred = infer_typography(&image, &detection).unwrap();
@@ -3688,7 +3847,8 @@ mod tests {
                 width,
                 height,
                 pixels,
-            },
+            }
+            .into(),
         };
 
         let inferred = infer_typography(&image, &detection).unwrap();
