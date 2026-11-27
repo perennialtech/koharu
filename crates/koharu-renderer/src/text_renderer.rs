@@ -208,6 +208,7 @@ impl TextRenderer {
             .with_fallback_fonts(&fonts[1..])
             .with_writing_mode(descriptor.writing_mode)
             .with_alignment(descriptor.alignment)
+            .with_hyphenation_policy(HyphenationPolicy::LastResort)
             .with_line_height(descriptor.line_height)
             .with_spacing(descriptor.letter_spacing, descriptor.word_spacing)
             .with_cjk_punctuation_layout(
@@ -235,9 +236,6 @@ impl TextRenderer {
         if let Some(language) = &descriptor.language {
             layout = layout.with_hyphenation_language_tag(language.as_str());
         }
-        if descriptor.writing_mode == WritingMode::Horizontal {
-            layout = layout.with_hyphenation_policy(HyphenationPolicy::LastResort);
-        }
         let layout = if descriptor.auto_fit && !descriptor.point_text {
             layout
                 .with_max_font_size(maximum)
@@ -245,26 +243,34 @@ impl TextRenderer {
         } else {
             layout.with_font_size(descriptor.font_size.unwrap_or(maximum))
         };
-        let budgeted = descriptor
-            .source_area
-            .filter(|_| !is_bubble_text && descriptor.auto_fit && !descriptor.point_text)
-            .and_then(|area| {
-                self.budgeted_layout(&layout, &descriptor.text, bounds, area, [minimum, maximum])
-            });
-        let mut run = budgeted.map_or_else(|| self.layout(&layout, &descriptor.text), Ok);
-        // Free text that cannot fit at the readable size would spill onto
-        // neighbouring text, which leaves both unreadable. Shrinking it keeps
-        // the rest of the page legible; the diagnostic still reports it.
-        if !is_bubble_text
-            && descriptor.auto_fit
-            && !descriptor.point_text
-            && run.as_ref().is_ok_and(|run| {
-                run.overflowed() || run.width > bounds.width || run.height > bounds.height
-            })
-        {
-            run = self.layout(&layout.with_min_font_size(1.0), &descriptor.text);
-        }
-        let layout = run.map_err(|source| Error::Layout {
+        let fit = || -> Result<_> {
+            if !descriptor.auto_fit || descriptor.point_text {
+                return self.layout(&layout, &descriptor.text);
+            }
+            if let Some(area) = descriptor.source_area.filter(|_| !is_bubble_text)
+                && let Some(run) = self.budgeted_layout(
+                    &layout,
+                    &descriptor.text,
+                    bounds,
+                    area,
+                    [minimum, maximum],
+                )?
+            {
+                return Ok(run);
+            }
+            let run = self.layout(&layout, &descriptor.text)?;
+            if !run.overflowed() {
+                return Ok(run);
+            }
+            // A below-floor setting is a final fallback. The descriptor's
+            // readable size still governs the diagnostic for the chosen run.
+            let low = if is_bubble_text { 0.5 } else { 1.0 };
+            self.layout(
+                &layout.with_max_font_size(minimum).with_min_font_size(low),
+                &descriptor.text,
+            )
+        };
+        let layout = fit().map_err(|source| Error::Layout {
             entity: descriptor.entity,
             source,
         })?;
@@ -364,8 +370,8 @@ impl TextRenderer {
     /// block fits the area, and the largest of those wins; among sizes less
     /// than a pixel apart, the narrowest wrap wins. The block area is
     /// measured on the laid-out lines, so a short phrase can take one line
-    /// while a long one stays a block of the source's size. Words are broken
-    /// only when no wrap fits whole words. Returns `None` when `bounds` is no
+    /// while a long one stays a block of the source's size. Compare whole
+    /// words across all wraps before trying hyphens. Returns `None` when `bounds` is no
     /// larger than `area` or nothing fits at `minimum`.
     fn budgeted_layout<'a>(
         &self,
@@ -374,31 +380,32 @@ impl TextRenderer {
         bounds: LayoutBox,
         area: f32,
         [minimum, maximum]: [f32; 2],
-    ) -> Option<LayoutRun<'a>> {
+    ) -> Result<Option<LayoutRun<'a>>> {
         const STEPS: u8 = 8;
         let narrowest = area / bounds.height;
         if narrowest >= bounds.width {
-            return None;
+            return Ok(None);
         }
         let ratio = bounds.width / narrowest;
         let widths =
             (0..=STEPS).map(|step| narrowest * ratio.powf(f32::from(step) / f32::from(STEPS)));
-        let fit = |layout: &TextLayout<'a>| {
+        layout.fit_with_word_breaks(text, minimum, maximum, |layout, low, high| {
             let mut best: Option<LayoutRun<'a>> = None;
             for width in widths.clone() {
                 let wrapped = layout.clone().with_max_width(width);
                 let fits = |run: &LayoutRun<'_>| {
-                    !run.overflowed()
+                    layout.accepts(run)
                         && run.width <= width
                         && run.height <= bounds.height
                         && run.width * run.height <= area
                 };
-                let Ok(Some(run)) = largest_fitting_font_size(
-                    minimum,
-                    maximum,
+                let Some(run) = largest_fitting_font_size(
+                    low,
+                    high,
                     |size| self.layout(&wrapped.clone().with_font_size(size), text),
                     fits,
-                ) else {
+                )?
+                else {
                     continue;
                 };
                 if best
@@ -408,12 +415,8 @@ impl TextRenderer {
                     best = Some(run);
                 }
             }
-            best
-        };
-        fit(&layout
-            .clone()
-            .with_hyphenation_policy(HyphenationPolicy::Disabled))
-        .or_else(|| fit(layout))
+            Ok(best)
+        })
     }
 }
 
@@ -544,9 +547,8 @@ mod tests {
     use super::*;
     use crate::fonts::FontSystem;
 
-    #[test]
-    fn automatic_size_follows_the_source_lettering_and_balloon_extent() {
-        let mut descriptor = TextNodeDescriptor {
+    fn descriptor() -> TextNodeDescriptor {
+        TextNodeDescriptor {
             entity: EntityId::new(),
             text: "Hi".to_owned(),
             language: None,
@@ -571,7 +573,12 @@ mod tests {
             word_spacing: 0.0,
             text_inset: [0.0; 4],
             point_text: false,
-        };
+        }
+    }
+
+    #[test]
+    fn automatic_size_follows_the_source_lettering_and_balloon_extent() {
+        let mut descriptor = descriptor();
         let bounds = LayoutBox {
             x: 0.0,
             y: 0.0,
@@ -583,6 +590,66 @@ mod tests {
         assert_eq!(automatic_maximum(&descriptor, bounds, true), 240.0);
         descriptor.source_font_size = Some(80.0);
         assert_eq!(automatic_maximum(&descriptor, bounds, false), 80.0);
+    }
+
+    #[tokio::test]
+    async fn automatic_balloon_fits_below_the_floor_and_reports_its_final_size() {
+        let family = FontSystem::new()
+            .first_font()
+            .unwrap()
+            .family_name()
+            .to_owned();
+        let fonts = Fonts::new();
+        fonts
+            .prepare(&[crate::fonts::FontRequest {
+                family: family.clone(),
+                weight: None,
+                style: None,
+            }])
+            .await
+            .unwrap();
+        let mut descriptor = TextNodeDescriptor {
+            text: "Wide\nWide\nWide".to_owned(),
+            width: 80.0,
+            height: 60.0,
+            balloon_contour: Some(vec![(0.0, 0.0), (80.0, 0.0), (80.0, 60.0), (0.0, 60.0)]),
+            minimum_font_size: 36.0,
+            font_size: Some(36.0),
+            preferred_font: Some(family),
+            ..descriptor()
+        };
+        let render = |desc: &TextNodeDescriptor| {
+            TextRenderer::new().render_descriptor(desc, &fonts).unwrap()
+        };
+        let automatic = render(&descriptor);
+        assert!(matches!(automatic.diagnostics.as_slice(),
+            [RenderDiagnostic::TextBelowReadableSize { font_size, minimum_font_size, .. }]
+            if *font_size == automatic.metadata.font_size && *font_size < *minimum_font_size));
+        descriptor.auto_fit = false;
+        let fixed = render(&descriptor);
+        assert_eq!(fixed.metadata.font_size, 36.0);
+        assert!(matches!(
+            fixed.diagnostics.as_slice(),
+            [RenderDiagnostic::TextOverflow { .. }]
+        ));
+
+        descriptor.auto_fit = true;
+        descriptor.text_inset = [4.0; 4];
+        descriptor.balloon_contour = Some(vec![(0.0, 0.0), (5.0, 0.0), (5.0, 60.0), (0.0, 60.0)]);
+        let impossible = render(&descriptor);
+        assert!(matches!(
+            impossible.diagnostics.as_slice(),
+            [
+                RenderDiagnostic::TextBelowReadableSize { .. },
+                RenderDiagnostic::TextOverflow { .. }
+            ]
+        ));
+
+        descriptor.point_text = true;
+        descriptor.balloon_contour = None;
+        let point = render(&descriptor);
+        assert_eq!(point.metadata.font_size, 36.0);
+        assert!(point.diagnostics.is_empty());
     }
 
     #[test]
@@ -606,6 +673,7 @@ mod tests {
         let room = renderer.layout(&layout, text).unwrap();
         let budgeted = renderer
             .budgeted_layout(&layout, text, bounds, area, [9.0, 200.0])
+            .unwrap()
             .unwrap();
 
         assert!(room.width * room.height > area);

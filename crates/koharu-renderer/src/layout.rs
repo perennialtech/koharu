@@ -22,6 +22,9 @@ use crate::{
 };
 
 const HYPHENATION_MIN_WORD_LEN: usize = 5;
+const CENTRAL_HYPHEN_MIN_WORD_LEN: usize = 6;
+const WHOLE_WORD_TARGET_SHARE: f32 = 0.9;
+const MINIMUM_HYPHENATED_GAIN: f32 = 1.1;
 const COMPACT_HYPHENATION_FRAGMENT_LEN: usize = 2;
 const LINE_BREAK_HYPHEN_PENALTY: f32 = 2_000.0;
 const LINE_BREAK_OVERFLOW_MULTIPLIER: f32 = 10_000.0;
@@ -34,6 +37,8 @@ pub enum HyphenationPolicy {
     Disabled,
     /// Use a discretionary hyphen only when the unhyphenated text overflows.
     LastResort,
+    /// Try one central word break to recover font size.
+    Central,
     /// Consider discretionary hyphens during normal line optimization.
     #[default]
     Normal,
@@ -65,6 +70,7 @@ pub struct LayoutLine<'a> {
     pub range: Range<usize>,
     /// Total advance (width for horizontal, height for vertical) of this line.
     pub advance: f32,
+    hyphenated: bool,
     /// Baseline position for this line (x, y).
     pub baseline: (f32, f32),
 }
@@ -138,6 +144,8 @@ struct LineBreakMeasure {
 struct LineProfile {
     /// Available extent on the inline axis: X for horizontal text, Y for vertical text.
     width: f32,
+    /// Start of the usable inline room in balloon coordinates.
+    start: Option<f32>,
     center_offset: f32,
     block_baseline: f32,
 }
@@ -168,6 +176,14 @@ struct ComicBalloon {
     height: f32,
     contour: Vec<(f32, f32)>,
     minimum_air: f32,
+}
+
+struct BalloonProfiles {
+    bands: Vec<Vec<(f32, f32)>>,
+    baselines: Vec<f32>,
+    inline_center: f32,
+    alignment: TextAlign,
+    axes: Vec<f32>,
 }
 
 #[derive(Clone)]
@@ -363,6 +379,17 @@ impl<'a> TextLayout<'a> {
 
     pub fn run(&self, text: &str) -> Result<LayoutRun<'a>> {
         if let Some(font_size) = self.font_size {
+            // Even an unused discretionary break divides a shaping run and
+            // can change kerning or ligatures across that boundary.
+            if self.hyphenation_policy == HyphenationPolicy::LastResort {
+                let whole = self
+                    .clone()
+                    .with_hyphenation_policy(HyphenationPolicy::Disabled)
+                    .run_with_size(text, font_size)?;
+                if !whole.overflowed() {
+                    return Ok(whole);
+                }
+            }
             return self.run_with_size(text, font_size);
         }
 
@@ -376,45 +403,73 @@ impl<'a> TextLayout<'a> {
             .unwrap_or(maximum.min(1.0))
             .max(0.5)
             .min(maximum);
-        if self.hyphenation_policy == HyphenationPolicy::LastResort {
-            let mut unhyphenated = self.clone();
-            unhyphenated.hyphenation_policy = HyphenationPolicy::Disabled;
-            let clean = unhyphenated.largest_fit(text, minimum, maximum)?;
-            // Avoiding a word break is no longer useful once it pins the text to
-            // the configured readability floor. Compare raster-size buckets so
-            // hyphenation must recover a visible pixel, not a tuned percentage.
-            if clean
-                .as_ref()
-                .is_some_and(|best| best.font_size.floor() > minimum.floor())
-            {
-                return Ok(clean.unwrap());
-            }
-            let hyphenated = self.largest_fit(text, minimum, maximum)?;
-            match (clean, hyphenated) {
-                (Some(clean), Some(hyphenated))
-                    if hyphenated.font_size.floor() > clean.font_size.floor() =>
-                {
-                    return Ok(hyphenated);
-                }
-                (Some(clean), _) => return Ok(clean),
-                (None, Some(hyphenated)) => return Ok(hyphenated),
-                (None, None) => {}
-            }
-        } else if let Some(best) = self.largest_fit(text, minimum, maximum)? {
+        if let Some(best) =
+            self.fit_with_word_breaks(text, minimum, maximum, |layout, low, high| {
+                layout.largest_fit(text, low, high)
+            })?
+        {
             return Ok(best);
         }
         self.run_with_size(text, minimum)
     }
 
+    /// Try every room with whole words before spending one hyphen on a size
+    /// gain. All legal breaks remain available if no whole-word setting fits.
+    pub(crate) fn fit_with_word_breaks(
+        &self,
+        text: &str,
+        minimum: f32,
+        maximum: f32,
+        mut fit: impl FnMut(&Self, f32, f32) -> Result<Option<LayoutRun<'a>>>,
+    ) -> Result<Option<LayoutRun<'a>>> {
+        if self.hyphenation_policy == HyphenationPolicy::Disabled {
+            return fit(self, minimum, maximum);
+        }
+        let words = self
+            .clone()
+            .with_hyphenation_policy(HyphenationPolicy::Disabled);
+        let clean = fit(&words, minimum, maximum)?;
+        let threshold = WHOLE_WORD_TARGET_SHARE * maximum;
+        if clean.as_ref().is_some_and(|run| run.font_size >= threshold) {
+            return Ok(clean);
+        }
+        let least = clean
+            .as_ref()
+            .map_or(minimum, |run| run.font_size * MINIMUM_HYPHENATED_GAIN);
+        let central = self
+            .clone()
+            .with_hyphenation_policy(HyphenationPolicy::Central);
+        if central
+            .line_breaker()
+            .line_segments(text)
+            .iter()
+            .any(|s| s.break_suffix.is_some())
+            && let Some(broken) = fit(&central, least, maximum)?
+        {
+            // A search returns the fitting side of its bracket. At the cutoff,
+            // test the exact size before trading a whole word for a hyphen.
+            if clean.is_some()
+                && let Some(at_threshold) = fit(&words, threshold, threshold)?
+            {
+                return Ok(Some(at_threshold));
+            }
+            return Ok(Some(broken));
+        }
+        if clean.is_some() {
+            return Ok(clean);
+        }
+        fit(self, minimum, maximum)
+    }
+
+    pub(crate) fn accepts(&self, run: &LayoutRun<'_>) -> bool {
+        !run.overflowed()
+            && (self.hyphenation_policy != HyphenationPolicy::Central
+                || run.lines.iter().filter(|line| line.hyphenated).count() <= 1)
+    }
+
     /// The largest size in `minimum..=maximum` whose layout fits, if any does.
     fn largest_fit(&self, text: &str, minimum: f32, maximum: f32) -> Result<Option<LayoutRun<'a>>> {
-        let max_height = self.max_height.unwrap_or(f32::INFINITY);
-        let max_width = self.max_width.unwrap_or(f32::INFINITY);
-        let fits = |layout: &LayoutRun<'_>| {
-            !layout.overflowed()
-                && layout.width <= max_width + f32::EPSILON
-                && layout.height <= max_height + f32::EPSILON
-        };
+        let fits = |run: &LayoutRun<'_>| self.accepts(run);
 
         if self.comic_balloon.is_some() {
             // A balloon's usable width changes when the text reflows to a different
@@ -453,25 +508,35 @@ impl<'a> TextLayout<'a> {
         Ok(Some(best))
     }
 
+    fn line_breaker(&self) -> LineBreaker {
+        let breaker = LineBreaker::new();
+        if self.hyphenation_policy == HyphenationPolicy::Disabled {
+            return breaker;
+        }
+        let central = self.hyphenation_policy == HyphenationPolicy::Central;
+        let minimum_length = if central {
+            CENTRAL_HYPHEN_MIN_WORD_LEN
+        } else {
+            HYPHENATION_MIN_WORD_LEN
+        };
+        let mut options = HyphenationOptions::new(self.hyphenation_lang, minimum_length);
+        if self.comic_balloon.is_some() {
+            options = options.with_fragment_bounds(
+                options
+                    .minimum_prefix_length
+                    .min(COMPACT_HYPHENATION_FRAGMENT_LEN),
+                options
+                    .minimum_suffix_length
+                    .min(COMPACT_HYPHENATION_FRAGMENT_LEN),
+            );
+        }
+        options.central_only = central;
+        breaker.with_hyphenation(options)
+    }
+
     fn run_with_size(&self, text: &str, font_size: f32) -> Result<LayoutRun<'a>> {
         let shaper = TextShaper::new();
-        let mut line_breaker = LineBreaker::new();
-        if !self.writing_mode.is_vertical()
-            && self.hyphenation_policy != HyphenationPolicy::Disabled
-            && let Some(lang) = self.hyphenation_lang
-        {
-            let (minimum_prefix_length, minimum_suffix_length) = lang.bounds();
-            let options = HyphenationOptions::new(lang, HYPHENATION_MIN_WORD_LEN);
-            let options = if self.comic_balloon.is_some() {
-                options.with_fragment_bounds(
-                    minimum_prefix_length.min(COMPACT_HYPHENATION_FRAGMENT_LEN),
-                    minimum_suffix_length.min(COMPACT_HYPHENATION_FRAGMENT_LEN),
-                )
-            } else {
-                options
-            };
-            line_breaker = line_breaker.with_hyphenation(options);
-        }
+        let line_breaker = self.line_breaker();
         // Use real font metrics for consistent line sizing across modes.
         let font_ref = self.font.skrifa_ref()?;
         let metrics = font_ref.metrics(Size::new(font_size), self.font.location());
@@ -514,7 +579,9 @@ impl<'a> TextLayout<'a> {
                                   cluster: usize|
          -> Result<ShapedBreakSuffix<'a>> {
             let mut suffix_options = options.clone();
-            suffix_options.direction = if level.is_rtl() {
+            suffix_options.direction = if self.writing_mode.is_vertical() {
+                harfrust::Direction::TopToBottom
+            } else if level.is_rtl() {
                 harfrust::Direction::RightToLeft
             } else {
                 harfrust::Direction::LeftToRight
@@ -527,7 +594,11 @@ impl<'a> TextLayout<'a> {
                 for glyph in &mut shaped.glyphs {
                     glyph.cluster += cluster as u32;
                 }
-                advance += shaped.x_advance.abs();
+                advance += if self.writing_mode.is_vertical() {
+                    shaped.y_advance.abs()
+                } else {
+                    shaped.x_advance.abs()
+                };
                 runs.push(LineRun { shaped, level });
             }
 
@@ -787,8 +858,10 @@ impl<'a> TextLayout<'a> {
             let extent = inline_extent + PAD * 2.0;
             (extent, PAD, extent * 0.5, extent - PAD)
         });
+        let mut earliest = f32::NEG_INFINITY;
+        let mut latest = f32::INFINITY;
         if let Some((_, inline_start, inline_center, inline_end)) = inline_box {
-            for line in &mut lines {
+            for (line, profile) in lines.iter_mut().zip(&line_profiles) {
                 if let Some((min_x, min_y, max_x, max_y)) =
                     self.ink_bounds(font_size, std::slice::from_ref(line))
                 {
@@ -802,6 +875,10 @@ impl<'a> TextLayout<'a> {
                         TextAlign::Center => inline_center - center,
                         TextAlign::Right => inline_end - maximum,
                     };
+                    if let Some(start) = profile.start {
+                        earliest = earliest.max(start - (minimum + offset));
+                        latest = latest.min(start + profile.width - (maximum + offset));
+                    }
                     if self.writing_mode.is_vertical() {
                         line.baseline.1 += offset;
                     } else {
@@ -852,9 +929,25 @@ impl<'a> TextLayout<'a> {
             }
 
             if let Some(balloon) = &self.comic_balloon {
-                let inline_offset = line_profiles
+                let axis_offset = line_profiles
                     .first()
                     .map_or(0.0, |profile| profile.center_offset);
+                // Centre an edge-aligned block as far as the individual
+                // lines' ink can travel together inside their rooms.
+                let default_start = if self.writing_mode.is_vertical() {
+                    (balloon.height - height) * 0.5
+                } else {
+                    (balloon.width - width) * 0.5
+                };
+                let inline_offset = match effective_alignment {
+                    TextAlign::Left | TextAlign::Justify => {
+                        (default_start + axis_offset).min(latest).max(earliest) - default_start
+                    }
+                    TextAlign::Right => {
+                        (default_start + axis_offset).max(earliest).min(latest) - default_start
+                    }
+                    TextAlign::Center => axis_offset,
+                };
                 if self.writing_mode.is_vertical() {
                     let default_left = (balloon.width - width) * 0.5;
                     placement_offset_x = min_x - default_left;
@@ -974,6 +1067,7 @@ impl<'a> TextLayout<'a> {
                 );
                 line_profiles.push(LineProfile {
                     width: max_extent,
+                    start: None,
                     center_offset: 0.0,
                     block_baseline: 0.0,
                 });
@@ -998,7 +1092,7 @@ impl<'a> TextLayout<'a> {
             comic_line_breaks(
                 &measures,
                 balloon,
-                self.writing_mode,
+                (self.writing_mode, self.alignment.unwrap_or(TextAlign::Left)),
                 line_height,
                 line_ink,
                 (balloon_air_x, balloon_air_y),
@@ -1011,6 +1105,7 @@ impl<'a> TextLayout<'a> {
                 breaks: vec![segments.len()],
                 profiles: vec![LineProfile {
                     width: measures.iter().map(|measure| measure.advance).sum(),
+                    start: None,
                     center_offset: 0.0,
                     block_baseline: 0.0,
                 }],
@@ -1067,6 +1162,7 @@ impl<'a> TextLayout<'a> {
                     .copied()
                     .unwrap_or(LineProfile {
                         width: max_extent,
+                        start: None,
                         center_offset: 0.0,
                         block_baseline: 0.0,
                     }),
@@ -1092,6 +1188,7 @@ impl<'a> TextLayout<'a> {
             return next_offset;
         }
 
+        let hyphenated = break_suffix.is_some();
         if let Some(mut suffix) = break_suffix {
             runs.append(&mut suffix.runs);
         }
@@ -1101,6 +1198,7 @@ impl<'a> TextLayout<'a> {
 
         let mut line = LayoutLine {
             range: offset..visible_end,
+            hyphenated,
             ..Default::default()
         };
 
@@ -1439,6 +1537,7 @@ fn optimal_uniform_line_breaks(
             breaks: vec![len],
             profiles: vec![LineProfile {
                 width: max_extent,
+                start: None,
                 center_offset: 0.0,
                 block_baseline: 0.0,
             }],
@@ -1491,6 +1590,7 @@ fn optimal_uniform_line_breaks(
             breaks: vec![len],
             profiles: vec![LineProfile {
                 width: max_extent,
+                start: None,
                 center_offset: 0.0,
                 block_baseline: 0.0,
             }],
@@ -1512,6 +1612,7 @@ fn optimal_uniform_line_breaks(
                 breaks: vec![len],
                 profiles: vec![LineProfile {
                     width: max_extent,
+                    start: None,
                     center_offset: 0.0,
                     block_baseline: 0.0,
                 }],
@@ -1526,6 +1627,7 @@ fn optimal_uniform_line_breaks(
     let profiles = vec![
         LineProfile {
             width: max_extent,
+            start: None,
             center_offset: 0.0,
             block_baseline: 0.0,
         };
@@ -1542,7 +1644,7 @@ fn optimal_uniform_line_breaks(
 fn comic_line_breaks(
     segments: &[LineBreakMeasure],
     balloon: &ComicBalloon,
-    writing_mode: WritingMode,
+    (writing_mode, alignment): (WritingMode, TextAlign),
     line_height: f32,
     line_ink: InkBand,
     air: (f32, f32),
@@ -1577,31 +1679,61 @@ fn comic_line_breaks(
         return fallback;
     }
 
+    // A mandatory break on the final segment already ends the last line.
+    let minimum_lines = 1 + segments[..segments.len() - 1]
+        .iter()
+        .filter(|segment| segment.is_mandatory)
+        .count();
     let select = |allow_hyphenation: bool| {
-        (1..=maximum_lines)
-            .flat_map(|line_count| {
-                balloon
-                    .line_profile_candidates(
-                        writing_mode,
-                        line_count,
-                        line_height,
-                        line_ink,
-                        air_x,
-                        air_y,
+        let mut fallback: Option<LineBreakResult> = None;
+        for line_count in minimum_lines..=maximum_lines {
+            let geometry = balloon.line_profiles(
+                writing_mode,
+                alignment,
+                line_count,
+                line_height,
+                line_ink,
+                air,
+            );
+            for profiles in geometry.ranked() {
+                let Some(result) =
+                    exact_profiled_line_breaks(segments, profiles, allow_hyphenation, true)
+                else {
+                    continue;
+                };
+                if !result.overflowed {
+                    return Some(result);
+                }
+                // A cheaper break can overflow even when another break fits on this axis.
+                if alignment == TextAlign::Center
+                    && let Some(fit) = exact_profiled_line_breaks(
+                        segments,
+                        result.profiles.clone(),
+                        allow_hyphenation,
+                        false,
                     )
-                    .into_iter()
-                    .filter_map(move |profiles| {
-                        let result =
-                            exact_profiled_line_breaks(segments, profiles, allow_hyphenation)?;
-                        Some(result)
-                    })
-            })
-            .min_by(|left, right| {
-                left.overflowed
-                    .cmp(&right.overflowed)
-                    .then_with(|| left.profiles.len().cmp(&right.profiles.len()))
-                    .then_with(|| left.cost.total_cmp(&right.cost))
-            })
+                {
+                    return Some(fit);
+                }
+                if fallback
+                    .as_ref()
+                    .is_none_or(|best| line_count == best.profiles.len() && result.cost < best.cost)
+                {
+                    fallback = Some(result);
+                }
+            }
+            if let Some(axis) = geometry.feasible_center(segments, allow_hyphenation)
+                && let Some(fit) = exact_profiled_line_breaks(
+                    segments,
+                    geometry.at_axis(axis),
+                    allow_hyphenation,
+                    false,
+                )
+            {
+                return Some(fit);
+            }
+        }
+        fallback
     };
 
     if policy == HyphenationPolicy::LastResort
@@ -1622,10 +1754,47 @@ fn comic_line_breaks(
     })
 }
 
+fn line_choices(
+    segments: &[LineBreakMeasure],
+    start: usize,
+    last_end: usize,
+    max_width: f32,
+    allow_hyphenation: bool,
+) -> impl Iterator<Item = (usize, f32, bool)> {
+    let mut ends = start + 1..=last_end;
+    let mut advance = 0.0;
+    let mut finished = false;
+    std::iter::from_fn(move || {
+        if finished {
+            return None;
+        }
+        for end in ends.by_ref() {
+            let segment = segments[end - 1];
+            advance += segment.advance;
+            let suffix = if end < segments.len() {
+                segment.break_suffix_advance
+            } else {
+                0.0
+            };
+            if suffix > 0.0 && !allow_hyphenation {
+                continue;
+            }
+            finished = segment.is_mandatory || advance > max_width;
+            return Some((
+                end,
+                advance - segment.trailing_advance + suffix,
+                suffix > 0.0,
+            ));
+        }
+        None
+    })
+}
+
 fn exact_profiled_line_breaks(
     segments: &[LineBreakMeasure],
     profiles: Vec<LineProfile>,
     allow_hyphenation: bool,
+    allow_overflow: bool,
 ) -> Option<LineBreakResult> {
     let len = segments.len();
     let line_count = profiles.len();
@@ -1642,21 +1811,14 @@ fn exact_profiled_line_breaks(
             if !dp[line][start].is_finite() {
                 continue;
             }
-            let mut advance = 0.0f32;
             let last_end = len - remaining_lines;
-            for end in start + 1..=last_end {
-                advance += segments[end - 1].advance;
-                let suffix = if end < len {
-                    segments[end - 1].break_suffix_advance
-                } else {
-                    0.0
-                };
-                let hyphenated_break = end < len && suffix > 0.0;
-                if hyphenated_break && !allow_hyphenation {
+            let width = profiles[line].width.max(1.0);
+            for (end, line_advance, hyphenated_break) in
+                line_choices(segments, start, last_end, width, allow_hyphenation)
+            {
+                if !allow_overflow && line_advance > profiles[line].width + f32::EPSILON {
                     continue;
                 }
-                let line_advance = advance - segments[end - 1].trailing_advance + suffix;
-                let width = profiles[line].width.max(1.0);
                 let overflow = (line_advance - width).max(0.0) / width;
                 let slack = (width - line_advance).max(0.0) / width;
                 let mut cost = dp[line][start]
@@ -1671,9 +1833,6 @@ fn exact_profiled_line_breaks(
                 if cost < dp[line + 1][end] {
                     dp[line + 1][end] = cost;
                     previous[line + 1][end] = Some(start);
-                }
-                if segments[end - 1].is_mandatory || advance > width {
-                    break;
                 }
             }
         }
@@ -1746,145 +1905,62 @@ impl ComicBalloon {
         }
     }
 
-    #[cfg(test)]
     fn line_profiles(
         &self,
         writing_mode: WritingMode,
+        alignment: TextAlign,
         line_count: usize,
         line_height: f32,
         line_ink: InkBand,
-        air_x: f32,
-        air_y: f32,
-    ) -> Option<Vec<LineProfile>> {
-        self.line_profile_candidates(
-            writing_mode,
-            line_count,
-            line_height,
-            line_ink,
-            air_x,
-            air_y,
-        )
-        .into_iter()
-        .next()
-    }
-
-    fn line_profile_candidates(
-        &self,
-        writing_mode: WritingMode,
-        line_count: usize,
-        line_height: f32,
-        line_ink: InkBand,
-        air_x: f32,
-        air_y: f32,
-    ) -> Vec<Vec<LineProfile>> {
-        let vertical = writing_mode.is_vertical();
-        let (block_extent, inline_extent, block_air, inline_air) = if vertical {
+        (air_x, air_y): (f32, f32),
+    ) -> BalloonProfiles {
+        let (block_extent, inline_extent, block_air, inline_air) = if writing_mode.is_vertical() {
             (self.width, self.height, air_x, air_y)
         } else {
             (self.height, self.width, air_y, air_x)
         };
-        let inline_radius = inline_extent * 0.5 - inline_air;
-        let block_size = line_ink.thickness() + line_count.saturating_sub(1) as f32 * line_height;
-        if inline_radius <= 0.0 {
-            return Vec::new();
-        }
-        let Some(block_origin) =
-            self.centered_block_origin(writing_mode, block_extent, block_air, block_size)
-        else {
-            return Vec::new();
-        };
-        self.line_profiles_at_origin(
-            writing_mode,
-            line_count,
-            line_height,
-            line_ink,
-            block_extent,
-            inline_extent,
-            block_air,
-            inline_air,
-            block_origin,
-        )
-        .into_iter()
-        .collect()
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn line_profiles_at_origin(
-        &self,
-        writing_mode: WritingMode,
-        line_count: usize,
-        line_height: f32,
-        line_ink: InkBand,
-        block_extent: f32,
-        inline_extent: f32,
-        block_air: f32,
-        inline_air: f32,
-        block_origin: f32,
-    ) -> Option<Vec<LineProfile>> {
         let inline_center = inline_extent * 0.5;
-        let mut spans = Vec::with_capacity(line_count);
-        for line in 0..line_count {
-            let block_index = if writing_mode == WritingMode::VerticalRl {
-                line_count - line - 1
-            } else {
-                line
-            };
-            let baseline = block_origin + line_ink.before + block_index as f32 * line_height;
-            let band_start = baseline - line_ink.before;
-            let mut left = f32::NEG_INFINITY;
-            let mut right = f32::INFINITY;
-            // Intersect the contour across the glyph ink band. Leading belongs between
-            // baselines and must not consume inline space at a balloon's tapered ends.
-            for sample in 0..=4 {
-                let block = band_start + line_ink.thickness() * sample as f32 / 4.0;
-                let (sample_left, sample_right) = self.inline_span(
-                    writing_mode,
-                    block,
-                    block_extent,
-                    inline_extent,
-                    block_air,
-                    inline_air,
-                )?;
-                left = left.max(sample_left);
-                right = right.min(sample_right);
+        let inline_radius = inline_center - inline_air;
+        let block_size = line_ink.thickness() + line_count.saturating_sub(1) as f32 * line_height;
+        let mut bands = Vec::with_capacity(line_count);
+        let mut baselines = Vec::with_capacity(line_count);
+        if inline_radius > 0.0
+            && let Some(origin) =
+                self.centered_block_origin(writing_mode, block_extent, block_air, block_size)
+        {
+            for line in 0..line_count {
+                let index = if writing_mode.is_vertical() {
+                    line_count - 1 - line
+                } else {
+                    line
+                };
+                let start = origin + index as f32 * line_height;
+                let end = start + line_ink.thickness();
+                baselines.push(start + line_ink.before);
+                let spans = if self.contour.len() >= 3 {
+                    self.band_spans(writing_mode, start, end, inline_air)
+                } else {
+                    let radius = block_extent * 0.5 - block_air;
+                    let distance = (block_extent * 0.5 - start).max(end - block_extent * 0.5);
+                    let fraction = (distance / radius).clamp(0.0, 1.0);
+                    let half = inline_radius * (1.0 - fraction * fraction).sqrt();
+                    vec![(inline_center - half, inline_center + half)]
+                };
+                bands.push(spans);
             }
-            if right <= left {
-                return None;
-            }
-            spans.push((left, right, baseline));
         }
 
-        // A phrase has one visual axis. The contour controls the usable width of
-        // each line, while the common center keeps the setting typographically
-        // coherent instead of producing a zig-zag paragraph.
-        let common_left = spans
-            .iter()
-            .map(|(left, _, _)| *left)
-            .fold(f32::NEG_INFINITY, f32::max);
-        let common_right = spans
-            .iter()
-            .map(|(_, right, _)| *right)
-            .fold(f32::INFINITY, f32::min);
-        if common_right <= common_left {
-            return None;
+        let mut axes = balloon_axes(&bands);
+        if alignment != TextAlign::Center {
+            axes.truncate(1);
         }
-        let contour_center = spans
-            .iter()
-            .map(|(left, right, _)| (left + right) * 0.5)
-            .sum::<f32>()
-            / spans.len() as f32;
-        let shared_center = contour_center.clamp(common_left, common_right);
-        spans
-            .into_iter()
-            .map(|(left, right, block_baseline)| {
-                let half_width = (shared_center - left).min(right - shared_center);
-                (half_width > 0.0).then_some(LineProfile {
-                    width: half_width * 2.0,
-                    center_offset: shared_center - inline_center,
-                    block_baseline,
-                })
-            })
-            .collect()
+        BalloonProfiles {
+            bands,
+            baselines,
+            inline_center,
+            alignment,
+            axes,
+        }
     }
 
     fn centered_block_origin(
@@ -1911,44 +1987,186 @@ impl ComicBalloon {
             .then_some(first + (last - first - block_size) * 0.5)
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn inline_span(
-        &self,
-        writing_mode: WritingMode,
-        block: f32,
-        block_extent: f32,
-        inline_extent: f32,
-        block_air: f32,
-        inline_air: f32,
-    ) -> Option<(f32, f32)> {
-        if self.contour.len() >= 3 {
-            return self.contour_inline_span(writing_mode, block, inline_air);
+    /// Intersect every component across the ink band before choosing a room. A
+    /// concave contour can change which component is widest halfway through.
+    fn band_spans(&self, mode: WritingMode, start: f32, end: f32, air: f32) -> Vec<(f32, f32)> {
+        let first = start.next_up().min(end);
+        let last = end.next_down().max(start);
+        let mut samples: Vec<_> = (0..5)
+            .map(|i| start + (end - start) * (i as f32 + 0.5) / 5.0)
+            // Sample each boundary from inside the band, including at horizontal contour edges.
+            .chain([first, last])
+            .chain(
+                self.contour
+                    .iter()
+                    .map(|&(x, y)| if mode.is_vertical() { x } else { y })
+                    .filter(|&v| start < v && v < end)
+                    // A horizontal edge can have different spans on either side.
+                    .flat_map(|v| [v.next_down().max(first), v, v.next_up().min(last)]),
+            )
+            .collect();
+        samples.sort_unstable_by(f32::total_cmp);
+        samples.dedup();
+        let mut spans = polygon_inline_spans(&self.contour, mode, samples[0]);
+        for v in samples.into_iter().skip(1) {
+            if spans.is_empty() {
+                break;
+            }
+            spans = intersect_spans(&spans, &polygon_inline_spans(&self.contour, mode, v));
         }
-
-        let block_radius = block_extent * 0.5 - block_air;
-        let inline_radius = inline_extent * 0.5 - inline_air;
-        let normalized_block = ((block - block_extent * 0.5) / block_radius).clamp(-1.0, 1.0);
-        let half_extent = inline_radius * (1.0 - normalized_block * normalized_block).sqrt();
-        (half_extent > 0.0).then_some((
-            inline_extent * 0.5 - half_extent,
-            inline_extent * 0.5 + half_extent,
-        ))
-    }
-
-    fn contour_inline_span(
-        &self,
-        writing_mode: WritingMode,
-        block: f32,
-        inline_air: f32,
-    ) -> Option<(f32, f32)> {
-        polygon_inline_spans(&self.contour, writing_mode, block)
+        spans
             .into_iter()
-            .filter_map(|(left, right)| {
-                let span = (left + inline_air, right - inline_air);
-                (span.1 > span.0).then_some(span)
-            })
-            .max_by(|left, right| (left.1 - left.0).total_cmp(&(right.1 - right.0)))
+            .map(|(left, right)| (left + air, right - air))
+            .filter(|(left, right)| right > left)
+            .collect()
     }
+}
+
+impl BalloonProfiles {
+    fn ranked(&self) -> impl Iterator<Item = Vec<LineProfile>> {
+        self.axes.iter().map(|&axis| self.at_axis(axis))
+    }
+
+    fn at_axis(&self, axis: f32) -> Vec<LineProfile> {
+        let spans: Vec<_> = self
+            .bands
+            .iter()
+            .map(|band| {
+                band.iter()
+                    .copied()
+                    .find(|&(left, right)| left < axis && axis < right)
+                    .unwrap_or((axis, axis))
+            })
+            .collect();
+        let shared_start = spans
+            .iter()
+            .map(|span| span.0)
+            .fold(f32::NEG_INFINITY, f32::max);
+        let shared_end = spans
+            .iter()
+            .map(|span| span.1)
+            .fold(f32::INFINITY, f32::min);
+        spans
+            .into_iter()
+            .zip(&self.baselines)
+            .map(|((left, right), &block_baseline)| {
+                let (start, width) = match self.alignment {
+                    TextAlign::Center => {
+                        let reach = (axis - left).min(right - axis);
+                        (axis - reach, 2.0 * reach)
+                    }
+                    TextAlign::Left | TextAlign::Justify => (shared_start, right - shared_start),
+                    TextAlign::Right => (left, shared_end - left),
+                };
+                LineProfile {
+                    width,
+                    start: Some(start),
+                    center_offset: axis - self.inline_center,
+                    block_baseline,
+                }
+            })
+            .collect()
+    }
+
+    fn feasible_center(
+        &self,
+        segments: &[LineBreakMeasure],
+        allow_hyphenation: bool,
+    ) -> Option<f32> {
+        if self.alignment != TextAlign::Center || self.axes.len() < 2 {
+            return None;
+        }
+        // For each possible line break, retain the union of axes that fit all
+        // lines up to it. A closed interval allows an exact-width fit at one axis.
+        let len = segments.len();
+        let mut feasible = vec![Vec::new(); len + 1];
+        feasible[0].push((f32::NEG_INFINITY, f32::INFINITY));
+        for (line, band) in self.bands.iter().enumerate() {
+            let max_width = band.iter().map(|(l, r)| r - l).reduce(f32::max)?;
+            let last_end = len - (self.bands.len() - line - 1);
+            let mut next = vec![Vec::new(); len + 1];
+            for (start, prior) in feasible[..last_end].iter().enumerate() {
+                if prior.is_empty() {
+                    continue;
+                }
+                for (end, width, _) in
+                    line_choices(segments, start, last_end, max_width, allow_hyphenation)
+                {
+                    for &(left, right) in band {
+                        for &(lo, hi) in prior {
+                            let lo = lo.max(left + width * 0.5);
+                            let hi = hi.min(right - width * 0.5);
+                            if lo <= hi {
+                                next[end].push((lo, hi));
+                            }
+                        }
+                    }
+                }
+            }
+            for intervals in &mut next {
+                intervals.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
+                intervals.dedup_by(|later, earlier| {
+                    if later.0 > earlier.1 {
+                        return false;
+                    }
+                    earlier.1 = earlier.1.max(later.1);
+                    true
+                });
+            }
+            feasible = next;
+        }
+        let &(lo, hi) = feasible[len].first()?;
+        Some(lo.midpoint(hi))
+    }
+}
+
+fn intersect_spans(a: &[(f32, f32)], b: &[(f32, f32)]) -> Vec<(f32, f32)> {
+    a.iter()
+        .flat_map(|&(left, right)| {
+            b.iter().filter_map(move |&(start, end)| {
+                let overlap = (left.max(start), right.min(end));
+                (overlap.0 < overlap.1).then_some(overlap)
+            })
+        })
+        .collect()
+}
+
+fn balloon_axes(bands: &[Vec<(f32, f32)>]) -> Vec<f32> {
+    // Include the common span's middle: two overlapping bands need not
+    // contain each other's midpoint.
+    let Some((first, rest)) = bands.split_first() else {
+        return Vec::new();
+    };
+    let common = rest
+        .iter()
+        .fold(first.clone(), |common, band| intersect_spans(&common, band));
+    let mut candidates: Vec<_> = bands
+        .iter()
+        .flatten()
+        .chain(&common)
+        .map(|(left, right)| (left + right) * 0.5)
+        .collect();
+    candidates.sort_unstable_by(f32::total_cmp);
+    candidates.dedup();
+    let mut ranked: Vec<_> = candidates
+        .into_iter()
+        .map(|axis| {
+            let mut reached = 0;
+            let mut total = 0.0_f32;
+            for band in bands {
+                if let Some(&(left, right)) = band
+                    .iter()
+                    .find(|&&(left, right)| left < axis && axis < right)
+                {
+                    reached += 1;
+                    total += (axis - left).min(right - axis);
+                }
+            }
+            (reached, total, axis)
+        })
+        .collect();
+    ranked.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.total_cmp(&b.1)));
+    ranked.into_iter().rev().map(|(_, _, axis)| axis).collect()
 }
 
 fn polygon_inline_spans(
@@ -2342,15 +2560,17 @@ mod tests {
         let profiles = balloon
             .line_profiles(
                 WritingMode::Horizontal,
+                TextAlign::Center,
                 5,
                 16.0,
                 InkBand {
                     before: 8.0,
                     after: 8.0,
                 },
-                10.0,
-                10.0,
+                (10.0, 10.0),
             )
+            .ranked()
+            .next()
             .unwrap();
 
         assert!(profiles[0].width < profiles[1].width);
@@ -2365,15 +2585,17 @@ mod tests {
         let profiles = balloon
             .line_profiles(
                 WritingMode::VerticalRl,
+                TextAlign::Center,
                 5,
                 16.0,
                 InkBand {
                     before: 8.0,
                     after: 8.0,
                 },
-                10.0,
-                10.0,
+                (10.0, 10.0),
             )
+            .ranked()
+            .next()
             .unwrap();
 
         assert!(profiles[0].width < profiles[1].width);
@@ -2393,15 +2615,17 @@ mod tests {
         let profiles = balloon
             .line_profiles(
                 WritingMode::Horizontal,
+                TextAlign::Center,
                 5,
                 16.0,
                 InkBand {
                     before: 8.0,
                     after: 8.0,
                 },
-                10.0,
-                10.0,
+                (10.0, 10.0),
             )
+            .ranked()
+            .next()
             .unwrap();
 
         for profile in profiles {
@@ -2417,21 +2641,171 @@ mod tests {
             vec![(100.0, 0.0), (200.0, 60.0), (100.0, 120.0), (0.0, 60.0)],
             0.0,
         );
-        let profile = balloon
-            .line_profiles(
-                WritingMode::Horizontal,
-                1,
-                80.0,
-                InkBand {
-                    before: 20.0,
-                    after: 20.0,
-                },
-                0.0,
-                10.0,
-            )
-            .unwrap()[0];
+        let result = comic_line_breaks(
+            &[LineBreakMeasure {
+                advance: 140.0,
+                trailing_advance: 0.0,
+                break_suffix_advance: 0.0,
+                break_penalty: 0.0,
+                is_mandatory: false,
+            }],
+            &balloon,
+            (WritingMode::Horizontal, TextAlign::Center),
+            80.0,
+            InkBand {
+                before: 20.0,
+                after: 20.0,
+            },
+            (0.0, 10.0),
+            HyphenationPolicy::Disabled,
+        );
 
-        assert!((130.0..=135.0).contains(&profile.width));
+        assert_approx_eq(result.profiles[0].width, 200.0 * 40.0 / 60.0);
+        assert!(result.overflowed);
+    }
+
+    #[test]
+    fn centered_forced_lines_fit_the_common_span_at_full_size() -> anyhow::Result<()> {
+        let font = any_system_font();
+        let size = 16.0;
+        let air = 20.0;
+        let width = 149.0 + air * 2.0;
+        let height = 144.0;
+        // Relative to the air margin, the first two spans are [0, 100] and the third is [49, 149].
+        let layout = TextLayout::new(&font)
+            .with_line_height(2.0)
+            .with_alignment(TextAlign::Center)
+            .with_max_width(width)
+            .with_max_height(height)
+            .with_comic_balloon(
+                width,
+                height,
+                vec![
+                    (0.0, 0.0),
+                    (100.0 + air * 2.0, 0.0),
+                    (100.0 + air * 2.0, 88.0),
+                    (width, 88.0),
+                    (width, height),
+                    (49.0, height),
+                    (49.0, 88.0),
+                    (0.0, 88.0),
+                ],
+                air,
+            );
+
+        for builder in [
+            layout.clone().with_font_size(size),
+            layout.with_min_font_size(8.0).with_max_font_size(size),
+        ] {
+            let run = builder.run("WW\nWW\nWW")?;
+            assert!(!run.overflowed());
+            assert_eq!(run.lines.len(), 3);
+            assert_eq!(run.font_size, size);
+            assert_approx_eq(width * 0.5 + run.placement_offset_x() - air, 74.5);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn centered_balloon_prefers_a_fitting_break_over_a_natural_pause() {
+        let text = "Go to bed. Now!";
+        let segments: Vec<_> = LineBreaker::new()
+            .line_segments(text)
+            .into_iter()
+            .map(|segment| {
+                let word = &text[segment.range];
+                LineBreakMeasure {
+                    advance: word.len() as f32 * 10.0,
+                    trailing_advance: (word.len() - word.trim_end().len()) as f32 * 10.0,
+                    break_suffix_advance: 0.0,
+                    break_penalty: comic_break_penalty(text, segment.next_offset),
+                    is_mandatory: segment.is_mandatory,
+                }
+            })
+            .collect();
+        let balloon = comic_balloon(
+            99.0,
+            40.0,
+            vec![(0.0, 0.0), (99.0, 0.0), (99.0, 40.0), (0.0, 40.0)],
+            0.0,
+        );
+        let result = comic_line_breaks(
+            &segments,
+            &balloon,
+            (WritingMode::Horizontal, TextAlign::Center),
+            20.0,
+            InkBand {
+                before: 5.0,
+                after: 5.0,
+            },
+            (0.0, 0.0),
+            HyphenationPolicy::Disabled,
+        );
+
+        assert!(!result.overflowed, "chosen breaks: {:?}", result.breaks);
+        assert_eq!(result.breaks, [2, 4]);
+    }
+
+    #[test]
+    fn unequal_centered_lines_fit_between_the_span_midpoints() {
+        let balloon = comic_balloon(
+            140.0,
+            40.0,
+            vec![
+                (0.0, 0.0),
+                (100.0, 0.0),
+                (100.0, 20.0),
+                (140.0, 20.0),
+                (140.0, 40.0),
+                (40.0, 40.0),
+                (40.0, 20.0),
+                (0.0, 20.0),
+            ],
+            0.0,
+        );
+        let measure = |advance, is_mandatory| LineBreakMeasure {
+            advance,
+            trailing_advance: 0.0,
+            break_suffix_advance: 0.0,
+            break_penalty: 0.0,
+            is_mandatory,
+        };
+        for (segments, breaks, axis) in [
+            (vec![measure(80.0, true), measure(36.0, true)], [1, 2], 59.0),
+            (
+                vec![measure(80.0, true), measure(40.0, false)],
+                [1, 2],
+                60.0,
+            ),
+            // The optional break after the first segment leaves the second line too wide.
+            (
+                vec![
+                    measure(12.0, false),
+                    measure(68.0, false),
+                    measure(36.0, false),
+                ],
+                [2, 3],
+                59.0,
+            ),
+        ] {
+            let result = comic_line_breaks(
+                &segments,
+                &balloon,
+                (WritingMode::Horizontal, TextAlign::Center),
+                20.0,
+                InkBand {
+                    before: 5.0,
+                    after: 5.0,
+                },
+                (0.0, 0.0),
+                HyphenationPolicy::Disabled,
+            );
+            assert!(!result.overflowed);
+            assert_eq!(result.breaks, breaks);
+            for profile in result.profiles {
+                assert_approx_eq(70.0 + profile.center_offset, axis);
+            }
+        }
     }
 
     #[test]
@@ -2445,15 +2819,17 @@ mod tests {
         let profile = balloon
             .line_profiles(
                 WritingMode::Horizontal,
+                TextAlign::Center,
                 1,
                 16.0,
                 InkBand {
                     before: 8.0,
                     after: 8.0,
                 },
-                10.0,
-                10.0,
+                (10.0, 10.0),
             )
+            .ranked()
+            .next()
             .unwrap()[0];
 
         assert!(profile.center_offset < -20.0);
@@ -2471,28 +2847,32 @@ mod tests {
         let horizontal = balloon
             .line_profiles(
                 WritingMode::Horizontal,
+                TextAlign::Center,
                 4,
                 24.0,
                 InkBand {
                     before: 10.0,
                     after: 10.0,
                 },
-                8.0,
-                8.0,
+                (8.0, 8.0),
             )
+            .ranked()
+            .next()
             .unwrap();
         let vertical = balloon
             .line_profiles(
                 WritingMode::VerticalRl,
+                TextAlign::Center,
                 4,
                 24.0,
                 InkBand {
                     before: 10.0,
                     after: 10.0,
                 },
-                8.0,
-                8.0,
+                (8.0, 8.0),
             )
+            .ranked()
+            .next()
             .unwrap();
 
         for profiles in [&horizontal, &vertical] {
@@ -2524,15 +2904,17 @@ mod tests {
         let profiles = balloon
             .line_profiles(
                 WritingMode::Horizontal,
+                TextAlign::Center,
                 3,
                 20.0,
                 InkBand {
                     before: 10.0,
                     after: 10.0,
                 },
-                0.0,
-                0.0,
+                (0.0, 0.0),
             )
+            .ranked()
+            .next()
             .unwrap();
 
         assert!((profiles[0].block_baseline - 80.0).abs() < 0.01);
@@ -2552,15 +2934,17 @@ mod tests {
         let profiles = balloon
             .line_profiles(
                 WritingMode::Horizontal,
+                TextAlign::Center,
                 3,
                 20.0,
                 InkBand {
                     before: 10.0,
                     after: 10.0,
                 },
-                0.0,
-                0.0,
+                (0.0, 0.0),
             )
+            .ranked()
+            .next()
             .unwrap();
 
         assert!((profiles[0].block_baseline - 80.0).abs() < 0.01);
@@ -2579,15 +2963,24 @@ mod tests {
             before: 5.0,
             after: 5.0,
         };
-        let candidates =
-            balloon.line_profile_candidates(WritingMode::Horizontal, 5, 20.0, line_ink, 0.0, 0.0);
+        let profiles = balloon
+            .line_profiles(
+                WritingMode::Horizontal,
+                TextAlign::Center,
+                5,
+                20.0,
+                line_ink,
+                (0.0, 0.0),
+            )
+            .ranked()
+            .next()
+            .unwrap();
 
-        assert_eq!(candidates.len(), 1);
-        assert!((candidates[0][0].block_baseline - 40.0).abs() < 0.01);
+        assert!((profiles[0].block_baseline - 40.0).abs() < 0.01);
     }
 
     #[test]
-    fn comic_contour_selects_the_widest_concave_span() {
+    fn comic_contour_preserves_disjoint_rooms() {
         let balloon = ComicBalloon {
             width: 100.0,
             height: 100.0,
@@ -2605,9 +2998,132 @@ mod tests {
         };
 
         assert_eq!(
-            balloon.contour_inline_span(WritingMode::Horizontal, 50.0, 0.0),
-            Some((0.0, 40.0))
+            balloon.band_spans(WritingMode::Horizontal, 40.0, 60.0, 0.0),
+            [(0.0, 40.0), (70.0, 100.0)]
         );
+    }
+
+    #[test]
+    fn comic_band_spans_include_the_narrower_contour_edge_at_either_end() {
+        for (narrow, wide) in [(0.0, 60.0), (60.0, 0.0)] {
+            let balloon = comic_balloon(
+                200.0,
+                60.0,
+                vec![(50.0, narrow), (150.0, narrow), (200.0, wide), (0.0, wide)],
+                0.0,
+            );
+            let band = balloon.band_spans(WritingMode::Horizontal, 0.0, 60.0, 0.0);
+            assert_eq!(band.len(), 1);
+            assert_approx_eq(band[0].0, 50.0);
+            assert_approx_eq(band[0].1, 150.0);
+        }
+    }
+
+    #[test]
+    fn ink_band_includes_the_tip_of_a_notch_ending_in_a_horizontal_edge() {
+        let balloon = comic_balloon(
+            100.0,
+            40.0,
+            vec![
+                (0.0, 0.0),
+                (100.0, 0.0),
+                (100.0, 16.0),
+                (60.0, 18.0),
+                (100.0, 18.0),
+                (100.0, 40.0),
+                (0.0, 40.0),
+            ],
+            0.0,
+        );
+
+        let band = balloon.band_spans(WritingMode::Horizontal, 0.0, 40.0, 0.0);
+        assert_eq!(band.len(), 1);
+        assert_approx_eq(band[0].0, 0.0);
+        assert_approx_eq(band[0].1, 60.0);
+    }
+
+    #[test]
+    fn a_concave_band_keeps_continuous_rooms_and_samples_interior_vertices() {
+        // The wider arm switches at y=50. A spike from the right at y=48
+        // narrows the right arm between the five regular samples.
+        let balloon = comic_balloon(
+            100.0,
+            100.0,
+            vec![
+                (0.0, 0.0),
+                (100.0, 0.0),
+                (100.0, 47.0),
+                (85.0, 48.0),
+                (100.0, 49.0),
+                (100.0, 100.0),
+                (60.0, 100.0),
+                (60.0, 50.0),
+                (80.0, 50.0),
+                (80.0, 20.0),
+                (30.0, 20.0),
+                (30.0, 100.0),
+                (0.0, 100.0),
+            ],
+            0.0,
+        );
+        let band = balloon.band_spans(WritingMode::Horizontal, 40.0, 60.0, 0.0);
+        assert_eq!(band, [(0.0, 30.0), (80.0, 85.0)]);
+        assert_eq!(balloon_axes(&[band]).first(), Some(&15.0));
+    }
+
+    #[test]
+    fn edge_aligned_ink_uses_the_long_side_of_a_lopsided_balloon() -> anyhow::Result<()> {
+        let font = any_system_font();
+        let size = 20.0;
+        let text = "WWWWWWWW\nWW";
+        let base = TextLayout::new(&font)
+            .with_font_size(size)
+            .with_line_height(2.0);
+        let measured = base.run(text)?;
+        let wide = measured.lines[0].advance + 3.0 * size;
+        let narrow = measured.lines[1].advance + 3.0 * size;
+        let height = 150.0;
+        for align in [TextAlign::Left, TextAlign::Right] {
+            let mut outline = vec![
+                (0.0, 0.0),
+                (wide, 0.0),
+                (wide, height / 2.0),
+                (narrow, height / 2.0),
+                (narrow, height),
+                (0.0, height),
+            ];
+            if align == TextAlign::Right {
+                for (x, _) in &mut outline {
+                    *x = wide - *x;
+                }
+            }
+            let builder = base
+                .clone()
+                .with_max_width(wide)
+                .with_max_height(height)
+                .with_alignment(align)
+                .with_comic_balloon(wide, height, outline, 0.0);
+            let run = builder.run(text)?;
+            assert!(!run.overflowed());
+            assert_eq!(run.lines.len(), 2);
+            let origin = (wide - run.width) * 0.5 + run.placement_offset_x();
+            let edges = |line: &LayoutLine<'_>| {
+                let (x0, _, x1, _) = builder
+                    .ink_bounds(size, std::slice::from_ref(line))
+                    .unwrap();
+                if align == TextAlign::Left {
+                    (origin + x0, origin + x1)
+                } else {
+                    (wide - origin - x1, wide - origin - x0)
+                }
+            };
+            let (start, far) = edges(&run.lines[0]);
+            let (short_start, short_far) = edges(&run.lines[1]);
+            assert_approx_eq(start, short_start);
+            assert!(start >= 0.0 && far > narrow && far <= wide);
+            assert!(short_far <= narrow);
+        }
+        Ok(())
     }
 
     #[test]
@@ -2620,8 +3136,8 @@ mod tests {
         };
 
         assert_eq!(
-            balloon.contour_inline_span(WritingMode::Horizontal, 50.0, 10.0),
-            Some((60.0, 90.0))
+            balloon.band_spans(WritingMode::Horizontal, 40.0, 60.0, 10.0),
+            [(60.0, 90.0)]
         );
     }
 
@@ -2660,25 +3176,77 @@ mod tests {
     }
 
     #[test]
-    fn comic_auto_fit_uses_a_smaller_clean_setting_before_hyphenating() -> anyhow::Result<()> {
+    fn gain_based_hyphenation_uses_the_words_measured_size() -> anyhow::Result<()> {
         let font = any_system_font();
+        let text = "Incomprehensibilities";
+        let target = 32.0;
         let layout = TextLayout::new(&font)
-            .with_min_font_size(9.0)
-            .with_max_font_size(24.0)
-            .with_hyphenation_policy(HyphenationPolicy::LastResort)
-            .with_alignment(TextAlign::Center)
-            .with_max_width(80.0)
-            .with_max_height(100.0)
-            .with_comic_balloon(
-                80.0,
-                100.0,
-                vec![(0.0, 0.0), (80.0, 0.0), (80.0, 100.0), (0.0, 100.0)],
-                0.0,
-            )
-            .run("prosperity")?;
+            .with_line_height(1.2)
+            .with_hyphenation_language_tag("en")
+            .with_hyphenation_policy(HyphenationPolicy::LastResort);
+        let measured = layout.clone().with_font_size(target).run(text)?;
+        let extent = measured.lines[0].advance.max(measured.width);
+        let room = |ratio| {
+            layout
+                .clone()
+                .with_min_font_size(8.0)
+                .with_max_font_size(target)
+                .with_max_width(ratio * extent)
+                .with_max_height(4.0 * target)
+        };
+        let near = room(0.94).run(text)?;
+        assert!(near.font_size >= 0.9 * target && near.font_size < target);
+        assert_eq!(near.lines.len(), 1);
 
-        assert_eq!(layout.lines.len(), 1);
-        assert!(layout.font_size < 24.0);
+        let cutoff = layout.clone().with_font_size(target * 0.9).run(text)?;
+        let exact = room(1.0)
+            .with_max_width(cutoff.width.max(cutoff.lines[0].advance))
+            .run(text)?;
+        assert_eq!(exact.lines.len(), 1);
+        assert!(exact.font_size >= target * 0.9);
+
+        let narrow = room(0.70);
+        let clean = narrow
+            .clone()
+            .with_hyphenation_policy(HyphenationPolicy::Disabled)
+            .run(text)?;
+        let larger = narrow.run(text)?;
+        assert!(clean.font_size < 0.9 * target);
+        assert!(larger.font_size >= 1.1 * clean.font_size && !larger.overflowed());
+        assert_eq!(larger.lines.len(), 2);
+        assert!(larger.lines[0].hyphenated);
+
+        // Two lines are possible here, but recover only 5% of the clean size.
+        let limited = narrow
+            .clone()
+            .with_font_size(clean.font_size * 1.05)
+            .run(text)?;
+        assert!(limited.lines[0].hyphenated && !limited.overflowed());
+        let modest = narrow.with_max_height(limited.height).run(text)?;
+        assert_eq!(modest.lines.len(), 1);
+        assert_approx_eq(modest.font_size, clean.font_size);
+        Ok(())
+    }
+
+    #[test]
+    fn a_drawn_out_sound_breaks_inside_the_run_to_fit() -> anyhow::Result<()> {
+        let font = any_system_font();
+        let text = "Gwaaaaaaaaah";
+        let base = TextLayout::new(&font)
+            .with_font_size(24.0)
+            .with_hyphenation_policy(HyphenationPolicy::LastResort);
+        let width = base.run(text)?.lines[0].advance;
+        for lang in ["en", "und"] {
+            let layout = base.clone().with_hyphenation_language_tag(lang);
+            let whole = layout.clone().with_max_width(width * 1.1).run(text)?;
+            assert_eq!(whole.lines.len(), 1);
+            let split = layout.with_max_width(width * 0.7).run(text)?;
+            assert!(!split.overflowed());
+            assert_eq!(split.lines.len(), 2);
+            assert!(split.lines[0].hyphenated);
+            assert_eq!(&text[split.lines[0].range.clone()], "Gwaaaa");
+            assert_eq!(&text[split.lines[1].range.clone()], "aaaaah");
+        }
         Ok(())
     }
 
@@ -2769,7 +3337,7 @@ mod tests {
         let horizontal = comic_line_breaks(
             &segments,
             &balloon,
-            WritingMode::Horizontal,
+            (WritingMode::Horizontal, TextAlign::Center),
             24.0,
             InkBand {
                 before: 10.0,
@@ -2787,7 +3355,7 @@ mod tests {
         let vertical = comic_line_breaks(
             &segments,
             &vertical_balloon,
-            WritingMode::VerticalRl,
+            (WritingMode::VerticalRl, TextAlign::Center),
             24.0,
             InkBand {
                 before: 10.0,
@@ -2981,17 +3549,19 @@ mod tests {
         let profiles = vec![
             LineProfile {
                 width: 50.0,
+                start: None,
                 center_offset: 0.0,
                 block_baseline: 0.0,
             },
             LineProfile {
                 width: 25.0,
+                start: None,
                 center_offset: 0.0,
                 block_baseline: 0.0,
             },
         ];
 
-        let result = exact_profiled_line_breaks(&segments, profiles, true).unwrap();
+        let result = exact_profiled_line_breaks(&segments, profiles, true, true).unwrap();
 
         assert_eq!(result.breaks, [1, 3]);
     }
