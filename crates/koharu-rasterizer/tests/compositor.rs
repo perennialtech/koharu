@@ -6,9 +6,10 @@ use std::{
 };
 
 use koharu_rasterizer::{
-    Bounds, LayerId, LayerKind, Point, PreparedContent, PreparedFrame, PreparedFrameBundle,
-    PreparedLayer, PreparedRaster, PreparedRasterTile, PreparedResource, Presentation,
-    RasterOptions, Rasterizer, Revision,
+    Bounds, Frame, LayerId, LayerKind, Point, PreparedContent, PreparedFrame, PreparedFrameBundle,
+    PreparedFrameManifest, PreparedGlyph, PreparedGlyphRun, PreparedLayer, PreparedRaster,
+    PreparedRasterTile, PreparedResource, PreparedResourceStore, PreparedScene,
+    PreparedSceneCommand, Presentation, RasterOptions, Rasterizer, Revision,
 };
 use vello::Scene;
 
@@ -435,4 +436,184 @@ fn native_readback_preserves_straight_alpha_for_transparent_layers() {
             );
         }
     }
+}
+
+fn glyph_frame(font: &PreparedResource, run: PreparedGlyphRun) -> Frame {
+    let (width, height) = (96, 96);
+    let mut layer = tiled_layer(2, font.id(), width, height);
+    layer.kind = LayerKind::Text;
+    layer.content = PreparedContent::Vector(PreparedScene {
+        commands: vec![PreparedSceneCommand::GlyphRun(run)],
+    });
+    let bundle = PreparedFrameBundle {
+        frame: PreparedFrame {
+            revision: Revision::ZERO,
+            page: LayerId::from_bytes([1; 16]),
+            width,
+            height,
+            origin: (0, 0),
+            normalization: vello::kurbo::Affine::IDENTITY.as_coeffs(),
+            layers: vec![layer],
+        },
+        resources: vec![font.clone()],
+    };
+    let mut resources = PreparedResourceStore::default();
+    resources.insert(bundle.resource_packet(font.id()).unwrap());
+    let manifest =
+        PreparedFrameManifest::decode(&bundle.manifest().unwrap().encode().unwrap()).unwrap();
+    manifest.compile(&resources).unwrap()
+}
+
+#[test]
+fn prepared_glyph_borders_grow_the_fill_and_apply_paint_alpha_once() {
+    use vello::{kurbo::Affine, peniko::Style};
+
+    // Glyph 1 has a curved outer contour and a counter.
+    let font = PreparedResource::font(include_bytes!("fixtures/outline.ttf"));
+    let render = |radius: f32, alpha: u8| {
+        let frame = glyph_frame(
+            &font,
+            PreparedGlyphRun {
+                font: font.id(),
+                font_index: 0,
+                font_size: 72.0,
+                normalized_coords: vec![8192],
+                transform: Affine::translate((4.0, 0.0)).as_coeffs(),
+                glyph_transform: Some(Affine::skew(0.1, 0.0).as_coeffs()),
+                hint: false,
+                embolden: [radius; 2],
+                color: [0, 0, 0, alpha],
+                glyphs: vec![PreparedGlyph {
+                    id: 1,
+                    x: 8.0,
+                    y: 78.0,
+                }],
+            },
+        );
+        let commands = frame.composition_commands(1);
+        let [koharu_rasterizer::CompositionCommand::Vector(scene)] = commands.as_slice() else {
+            panic!("expected one vector batch");
+        };
+        let encoding = scene.encoding();
+        let runs = &encoding.resources.glyph_runs;
+        assert!(matches!(runs[0].style, Style::Fill(_)));
+        assert_eq!(runs.len(), if radius > 0.0 { 2 } else { 1 });
+        if radius > 0.0 {
+            let Style::Stroke(stroke) = &runs[1].style else {
+                panic!("expected a glyph stroke")
+            };
+            assert_eq!(
+                (stroke.width, stroke.join),
+                (2.0 * f64::from(radius), vello::kurbo::Join::Round)
+            );
+            for run in runs {
+                assert_eq!(
+                    &encoding.resources.normalized_coords[run.normalized_coords.clone()],
+                    &[8192]
+                );
+            }
+            assert_eq!(runs[0].transform, runs[1].transform);
+            assert_eq!(runs[0].glyph_transform, runs[1].glyph_transform);
+        }
+        assert!(
+            runs.iter()
+                .all(|run| run.font_embolden.amount == vello::kurbo::Diagonal2::new(0.0, 0.0))
+        );
+        assert_eq!(encoding.n_clips > 0, radius > 0.0 && alpha < 255);
+        rasterizer()
+            .rasterize(&frame, RasterOptions::default())
+            .unwrap()
+            .image
+    };
+
+    let fill = render(0.0, 255);
+    let opaque = render(5.0, 255);
+    let translucent = render(5.0, 128);
+    let mut added_pixels = 0;
+    let mut fill_pixels = 0;
+    for ((fill, opaque), translucent) in
+        fill.pixels().zip(opaque.pixels()).zip(translucent.pixels())
+    {
+        if fill[3] == 255 {
+            fill_pixels += 1;
+            assert_eq!(opaque[3], 255);
+        }
+        if fill[3] == 0 && opaque[3] == 255 {
+            added_pixels += 1;
+        }
+        let expected = (u16::from(opaque[3]) * 128 + 127) / 255;
+        assert!(u16::from(translucent[3]).abs_diff(expected) <= 1);
+    }
+    assert!(fill_pixels > 200);
+    assert!(added_pixels > 200);
+}
+
+#[test]
+fn emboldening_a_mixed_run_preserves_colr_and_bitmap_pixels() {
+    let font = PreparedResource::font(include_bytes!("fixtures/mixed-glyphs.ttf"));
+    let render = |radius, alpha, colr_x| {
+        let frame = glyph_frame(
+            &font,
+            PreparedGlyphRun {
+                font: font.id(),
+                font_index: 0,
+                font_size: 24.0,
+                normalized_coords: vec![],
+                transform: vello::kurbo::Affine::IDENTITY.as_coeffs(),
+                glyph_transform: None,
+                hint: false,
+                embolden: [radius; 2],
+                color: [0, 0, 0, alpha],
+                glyphs: vec![
+                    PreparedGlyph {
+                        id: 1,
+                        x: 4.0,
+                        y: 48.0,
+                    },
+                    PreparedGlyph {
+                        id: 2,
+                        x: colr_x,
+                        y: 48.0,
+                    },
+                    PreparedGlyph {
+                        id: 3,
+                        x: 68.0,
+                        y: 48.0,
+                    },
+                ],
+            },
+        );
+        rasterizer()
+            .rasterize(&frame, RasterOptions::default())
+            .unwrap()
+            .image
+    };
+
+    for alpha in [128, 255] {
+        let fill = render(0.0, alpha, 36.0);
+        let bold = render(2.0, alpha, 36.0);
+        let mut outline_grew = false;
+        let mut colr_visible = false;
+        let mut bitmap_visible = false;
+        for (x, y, pixel) in fill.enumerate_pixels() {
+            let emboldened = bold.get_pixel(x, y);
+            if x < 32 {
+                outline_grew |= emboldened[3] > pixel[3];
+            } else {
+                assert_eq!(emboldened, pixel, "color glyph changed at ({x}, {y})");
+                colr_visible |= *pixel == image::Rgba([255, 0, 0, 128]);
+                bitmap_visible |= *pixel == image::Rgba([0, 0, 255, 128]);
+            }
+        }
+        assert!(outline_grew);
+        assert!(colr_visible);
+        assert!(bitmap_visible);
+        assert_eq!(fill.get_pixel(24, 38).0, [0; 4]);
+        assert_eq!(bold.get_pixel(24, 38).0, [0, 0, 0, alpha]);
+    }
+
+    // At this pixel only the stroke covers the background. The later COLR
+    // glyph composites its half-opaque red over the opaque black stroke.
+    let overlap = render(2.0, 255, 8.0);
+    assert_eq!(overlap.get_pixel(24, 38).0, [128, 0, 0, 255]);
 }
