@@ -12,8 +12,21 @@ pub enum Error {
         expected: usize,
         actual: usize,
     },
-    #[error("{provider} quota or rate limit was exceeded")]
-    QuotaExceeded { provider: &'static str },
+    #[error("{provider} returned a blank translation for source segment at index {index}")]
+    BlankTranslation {
+        provider: &'static str,
+        index: usize,
+    },
+    #[error("{provider} quota exhausted: {message}")]
+    QuotaExceeded {
+        provider: &'static str,
+        message: String,
+    },
+    #[error("{provider} temporarily rate limited: {message}")]
+    RateLimited {
+        provider: &'static str,
+        message: String,
+    },
     #[error("{provider} API request failed with HTTP {status}: {message}")]
     Api {
         provider: &'static str,

@@ -69,23 +69,29 @@ impl StageProcessor for Processor {
         if let Some(instructions) = instructions {
             request = request.with_instructions(instructions);
         }
-        if Translator::uses_image(engines, &self.config.generation)
+        if !targets.is_empty()
+            && engines
+                .iter()
+                .any(|&engine| Translator::uses_image(engine, &self.config.generation))
             && let Some(image) = input.images.get(&input.scene, input.page, "source").await?
         {
             request = request.with_image(image);
         }
-        let (engine, translated) = self
+        let result = self
             .translator
             .translate(engines, self.config.generation, request)
             .await?;
         let language = LanguageTag::new(target_language.tag())?;
-        let generated = generation(PRODUCER, engine.into())?;
+        let generated = generation(PRODUCER, result.engine.into())?;
         let mut edit = input.scene.edit_as(generated.clone());
+        if result.used_image {
+            edit.observe_assets(input.page)?;
+        }
         for (entity, _) in &targets {
             edit.observe::<SourceText>(*entity)?;
             edit.observe::<Translation>(*entity)?;
         }
-        for ((entity, source), text) in targets.into_iter().zip(translated) {
+        for ((entity, source), text) in targets.into_iter().zip(result.translations) {
             if input
                 .scene
                 .component::<Translation>(entity)?
