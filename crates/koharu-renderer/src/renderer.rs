@@ -40,7 +40,7 @@ use crate::{
         FrameData, ImageNodeDescriptor, LayerData, LocalTextMetadata, NodeDescriptor, RetainedNode,
         prepare_frame,
     },
-    images::{DecodedImage, ImageCache, decode},
+    images::{DEFAULT_IMAGE_CACHE_BYTES, DecodedImage, ImageCache, decode},
     script::{is_chinese_or_japanese_text, shaping_direction_for_text},
     text_renderer::{StrokeOptions, TextNodeDescriptor, TextRenderer},
 };
@@ -112,7 +112,10 @@ impl Renderer {
                 fonts: Arc::new(Fonts::new()),
                 images: Mutex::new(ImageCache::new()),
                 image_loads: Mutex::new(HashMap::new()),
-                nodes: Mutex::new(NodeCache::new(DEFAULT_RETAINED_NODES)),
+                nodes: Mutex::new(NodeCache::new(
+                    DEFAULT_RETAINED_NODES,
+                    DEFAULT_IMAGE_CACHE_BYTES,
+                )),
                 workers: OnceLock::new(),
             }),
         }
@@ -242,7 +245,7 @@ impl Renderer {
 
     /// Discards retained Vello nodes after their presentation resource lifetime ends.
     pub fn discard_retained_nodes(&self) {
-        self.inner.nodes.lock().entries.clear();
+        self.inner.nodes.lock().clear();
     }
 
     async fn finish(
@@ -256,9 +259,8 @@ impl Renderer {
         let mut pending = Vec::new();
         let mut reused = 0;
         let mut candidates = 0;
-        let clock = {
+        {
             let mut node_cache = self.inner.nodes.lock();
-            let clock = node_cache.next_clock();
 
             for (index, draft) in compiled.layers.iter().enumerate() {
                 let candidate = previous.is_none()
@@ -276,8 +278,7 @@ impl Renderer {
                     reused += 1;
                     continue;
                 }
-                if let Some(node) =
-                    node_cache.get((compiled.page, draft.entity), &draft.descriptor, clock)
+                if let Some(node) = node_cache.get((compiled.page, draft.entity), &draft.descriptor)
                 {
                     nodes[index] = Some(node);
                     reused += 1;
@@ -285,8 +286,7 @@ impl Renderer {
                     pending.push((index, draft.descriptor.clone()));
                 }
             }
-            clock
-        };
+        }
 
         let font_requests = font_requests(&pending);
         self.inner
@@ -317,11 +317,10 @@ impl Renderer {
                 .await?;
             for (index, node) in built {
                 let node = Arc::new(node);
-                self.inner.nodes.lock().insert(
-                    (compiled.page, compiled.layers[index].entity),
-                    node.clone(),
-                    clock,
-                );
+                self.inner
+                    .nodes
+                    .lock()
+                    .insert((compiled.page, compiled.layers[index].entity), node.clone());
                 nodes[index] = Some(node);
             }
         }
@@ -1707,59 +1706,109 @@ struct NodeCache {
     entries: HashMap<(EntityId, EntityId), CachedNode>,
     capacity: usize,
     clock: u64,
+    max_bytes: usize,
+    bytes: usize,
+    // Counts only references held by cached nodes. A blob can be decoded
+    // again while an older node still owns its previous allocation.
+    buffer_refs: HashMap<usize, usize>,
 }
 
 impl NodeCache {
-    fn new(capacity: usize) -> Self {
+    fn new(capacity: usize, max_bytes: usize) -> Self {
         Self {
             entries: HashMap::new(),
             capacity,
             clock: 0,
+            max_bytes,
+            bytes: 0,
+            buffer_refs: HashMap::new(),
         }
     }
 
-    fn next_clock(&mut self) -> u64 {
-        self.clock = self.clock.wrapping_add(1);
-        self.clock
+    fn clear(&mut self) {
+        self.entries.clear();
+        self.buffer_refs.clear();
+        self.bytes = 0;
     }
 
     fn get(
         &mut self,
         key: (EntityId, EntityId),
         descriptor: &NodeDescriptor,
-        clock: u64,
     ) -> Option<Arc<RetainedNode>> {
         let entry = self.entries.get_mut(&key)?;
         if entry.node.descriptor != *descriptor {
             return None;
         }
-        entry.last_used = clock;
+        self.clock = self.clock.wrapping_add(1);
+        entry.last_used = self.clock;
         Some(entry.node.clone())
     }
 
-    fn insert(&mut self, key: (EntityId, EntityId), node: Arc<RetainedNode>, clock: u64) {
+    fn insert(&mut self, key: (EntityId, EntityId), node: Arc<RetainedNode>) {
+        self.remove(key);
         if self.capacity == 0 {
             return;
         }
+        if let Some(image) = &node.image {
+            let buffers = image_buffers(image);
+            if buffers.clone().map(|buffer| buffer.len()).sum::<usize>() > self.max_bytes {
+                return;
+            }
+            for buffer in buffers {
+                let count = self
+                    .buffer_refs
+                    .entry(buffer.as_ptr() as usize)
+                    .or_default();
+                if *count == 0 {
+                    self.bytes += buffer.len();
+                }
+                *count += 1;
+            }
+        }
+        self.clock = self.clock.wrapping_add(1);
         self.entries.insert(
             key,
             CachedNode {
                 node,
-                last_used: clock,
+                last_used: self.clock,
             },
         );
-        while self.entries.len() > self.capacity {
-            let Some(oldest) = self
+        while self.entries.len() > self.capacity || self.bytes > self.max_bytes {
+            let oldest = self
                 .entries
                 .iter()
                 .min_by_key(|(_, entry)| entry.last_used)
                 .map(|(key, _)| *key)
-            else {
-                break;
-            };
-            self.entries.remove(&oldest);
+                .expect("an over-budget cache has an entry");
+            self.remove(oldest);
         }
     }
+
+    fn remove(&mut self, key: (EntityId, EntityId)) {
+        let Some(entry) = self.entries.remove(&key) else {
+            return;
+        };
+        if let Some(image) = &entry.node.image {
+            for buffer in image_buffers(image) {
+                let id = buffer.as_ptr() as usize;
+                let count = self
+                    .buffer_refs
+                    .get_mut(&id)
+                    .expect("a retained image buffer");
+                *count -= 1;
+                if *count == 0 {
+                    self.bytes -= buffer.len();
+                    self.buffer_refs.remove(&id);
+                }
+            }
+        }
+    }
+}
+
+fn image_buffers(image: &RasterImage) -> impl Iterator<Item = &Arc<[u8]>> + Clone {
+    std::iter::once(&image.pixels)
+        .chain((!Arc::ptr_eq(&image.pixels, &image.encoded)).then_some(&image.encoded))
 }
 
 struct AffectedDependencies {
@@ -2099,6 +2148,59 @@ mod tests {
         assert!(Arc::ptr_eq(&renderer.inner, &cloned.inner));
         assert!(!renderer.inner.fonts.is_system_initialized());
         assert!(renderer.inner.workers.get().is_none());
+    }
+
+    #[test]
+    fn retained_images_share_a_byte_budget_and_live_nodes_survive_eviction() {
+        let node = |encoded: Arc<[u8]>, pixels: Arc<[u8]>| {
+            let blob = BlobId::for_bytes(&encoded);
+            let decoded = Arc::new(DecodedImage {
+                width: (pixels.len() / 4) as u32,
+                height: 1,
+                encoded,
+                pixels,
+            });
+            let descriptor = NodeDescriptor::Image(ImageNodeDescriptor {
+                blob,
+                media_type: "image/png".into(),
+                expected_size: None,
+                require_size: None,
+            });
+            Arc::new(
+                build_node(descriptor, &Fonts::new(), &HashMap::from([(blob, decoded)])).unwrap(),
+            )
+        };
+        let page = EntityId::new();
+        let key = || (page, EntityId::new());
+        let (a, alias, b, c) = (key(), key(), key(), key());
+        let mut cache = NodeCache::new(8, 12);
+        let encoded: Arc<[u8]> = Arc::from([1, 2]);
+        let pixels: Arc<[u8]> = Arc::from([0; 4]);
+        let live = node(encoded.clone(), pixels.clone());
+        cache.insert(a, live.clone());
+        cache.insert(alias, node(encoded.clone(), pixels));
+        assert_eq!(cache.bytes, 6);
+        cache.insert(b, node(encoded, Arc::from([0; 4])));
+        assert_eq!(cache.bytes, 10);
+        // A second load of the same blob can own both buffers independently.
+        cache.insert(b, node(Arc::from([1, 2]), Arc::from([0; 4])));
+        assert_eq!(cache.bytes, 12);
+        let newest = node(Arc::from([3, 4]), Arc::from([0; 4]));
+        cache.insert(c, newest.clone());
+        assert!(!cache.entries.contains_key(&a) && !cache.entries.contains_key(&alias));
+        assert!(cache.entries.contains_key(&b));
+        assert_eq!(cache.bytes, 12);
+        assert_eq!(live.image.as_ref().unwrap().pixels(), &[0; 4]);
+
+        cache.insert(b, newest);
+        assert_eq!(cache.bytes, 6);
+        cache.insert(c, node(Arc::from([5, 6]), Arc::from([0; 12])));
+        assert!(!cache.entries.contains_key(&c));
+        assert!(cache.entries.contains_key(&b));
+        assert_eq!(cache.bytes, 6);
+        cache.clear();
+        assert!(cache.buffer_refs.is_empty());
+        assert_eq!(cache.bytes, 0);
     }
 
     #[tokio::test]

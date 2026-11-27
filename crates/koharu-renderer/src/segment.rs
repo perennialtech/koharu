@@ -52,7 +52,9 @@ pub struct LineSegment {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct HyphenationOptions {
     /// Pattern dictionary used to find valid break points.
-    pub language: Lang,
+    pub language: Option<Lang>,
+    /// Offer only the legal break nearest the middle of the word.
+    pub central_only: bool,
     /// Words shorter than this remain intact.
     pub minimum_word_length: usize,
     /// Minimum characters retained before a discretionary break.
@@ -63,10 +65,12 @@ pub struct HyphenationOptions {
 
 impl HyphenationOptions {
     #[must_use]
-    pub fn new(language: Lang, minimum_word_length: usize) -> Self {
-        let (minimum_prefix_length, minimum_suffix_length) = language.bounds();
+    pub fn new(language: Option<Lang>, minimum_word_length: usize) -> Self {
+        let (minimum_prefix_length, minimum_suffix_length) =
+            language.map_or((2, 2), |lang| lang.bounds());
         Self {
             language,
+            central_only: false,
             minimum_word_length,
             minimum_prefix_length,
             minimum_suffix_length,
@@ -185,9 +189,6 @@ impl LineBreaker {
         let Some(config) = self.hyphenation else {
             return vec![segment];
         };
-        if segment.is_mandatory || segment.range.is_empty() {
-            return vec![segment];
-        }
 
         let segment_text = &text[segment.range.clone()];
         let Some((core_start, core_end)) = hyphenatable_word_bounds(segment_text) else {
@@ -195,46 +196,84 @@ impl LineBreaker {
         };
 
         let core = &segment_text[core_start..core_end];
-        if core.chars().count() < config.minimum_word_length {
-            return vec![segment];
+        let mut points = Vec::new();
+        let letters = core.chars().count();
+        if let Some(lang) = config.language
+            && letters >= config.minimum_word_length
+        {
+            let mut offset = 0;
+            let mut prefix = 0;
+            let mut closest = usize::MAX;
+            for syllable in hyphenate_bounded(
+                core,
+                lang,
+                config.minimum_prefix_length,
+                config.minimum_suffix_length,
+            ) {
+                offset += syllable.len();
+                if offset == core.len() {
+                    break;
+                }
+                if config.central_only {
+                    prefix += syllable.chars().count();
+                    let distance = prefix.abs_diff(letters - prefix);
+                    if distance >= closest {
+                        continue;
+                    }
+                    closest = distance;
+                    points.clear();
+                }
+                points.push(offset);
+            }
+        }
+        if points.is_empty() {
+            points.extend(drawn_out_break(core));
         }
 
-        let syllables: Vec<&str> = hyphenate_bounded(
-            core,
-            config.language,
-            config.minimum_prefix_length,
-            config.minimum_suffix_length,
-        )
-        .collect();
-        if syllables.len() <= 1 {
-            return vec![segment];
-        }
-
-        let mut result = Vec::with_capacity(syllables.len());
-        let mut word_offset = 0usize;
-        for (idx, syllable) in syllables.iter().enumerate() {
-            let is_last = idx + 1 == syllables.len();
-            let start = if idx == 0 {
-                segment.range.start
-            } else {
-                segment.range.start + core_start + word_offset
-            };
-            word_offset += syllable.len();
-            let end = if is_last {
-                segment.range.end
-            } else {
-                segment.range.start + core_start + word_offset
-            };
+        let mut result = Vec::with_capacity(points.len() + 1);
+        let word_start = segment.range.start + core_start;
+        let mut start = segment.range.start;
+        for point in points {
+            let end = word_start + point;
             result.push(LineSegment {
                 range: start..end,
-                next_offset: if is_last { segment.next_offset } else { end },
+                next_offset: end,
                 is_mandatory: false,
-                break_suffix: (!is_last).then_some(LineBreakSuffix::Hyphen),
+                break_suffix: Some(LineBreakSuffix::Hyphen),
             });
+            start = end;
         }
-
+        result.push(LineSegment {
+            range: start..segment.range.end,
+            ..segment
+        });
         result
     }
+}
+
+/// Split the longest run of at least four identical letters, leaving at
+/// least two on each side even when no pattern dictionary is available.
+fn drawn_out_break(word: &str) -> Option<usize> {
+    let mut letters = word.char_indices().peekable();
+    let mut longest = 3;
+    let mut point = None;
+    while let Some((start, first)) = letters.next() {
+        let mut length = 1;
+        while letters
+            .next_if(|(_, ch)| ch.to_lowercase().eq(first.to_lowercase()))
+            .is_some()
+        {
+            length += 1;
+        }
+        if length > longest {
+            longest = length;
+            point = word[start..]
+                .char_indices()
+                .nth(length / 2)
+                .map(|(at, _)| start + at);
+        }
+    }
+    point
 }
 
 impl Default for LineBreaker {
@@ -450,7 +489,7 @@ mod tests {
     fn hyphenation_adds_discretionary_segments_to_long_latin_words() {
         let text = "antidisestablishmentarianism";
         let linebreaker =
-            LineBreaker::new().with_hyphenation(HyphenationOptions::new(Lang::English, 8));
+            LineBreaker::new().with_hyphenation(HyphenationOptions::new(Some(Lang::English), 8));
         let segments = linebreaker.line_segments(text);
 
         assert!(
@@ -474,7 +513,7 @@ mod tests {
     fn hyphenation_does_not_invent_breaks_missing_from_the_patterns() {
         let text = "idols";
         let segments = LineBreaker::new()
-            .with_hyphenation(HyphenationOptions::new(Lang::English, 5))
+            .with_hyphenation(HyphenationOptions::new(Some(Lang::English), 5))
             .line_segments(text);
 
         assert_eq!(segments.len(), 1);
@@ -486,7 +525,9 @@ mod tests {
     fn configured_fragment_bounds_relax_language_defaults() {
         let text = "tower within";
         let segments = LineBreaker::new()
-            .with_hyphenation(HyphenationOptions::new(Lang::English, 5).with_fragment_bounds(2, 2))
+            .with_hyphenation(
+                HyphenationOptions::new(Some(Lang::English), 5).with_fragment_bounds(2, 2),
+            )
             .line_segments(text);
         let pieces = segments
             .iter()
@@ -496,6 +537,19 @@ mod tests {
         assert_eq!(pieces, ["tow", "er ", "with", "in"]);
         assert_eq!(segments[0].break_suffix, Some(LineBreakSuffix::Hyphen));
         assert_eq!(segments[2].break_suffix, Some(LineBreakSuffix::Hyphen));
+    }
+
+    #[test]
+    fn a_drawn_out_word_keeps_its_punctuation_and_mandatory_break() {
+        let text = "«ééééMmmmMMM!»\nNext";
+        let segments = LineBreaker::new()
+            .with_hyphenation(HyphenationOptions::new(None, 5))
+            .line_segments(text);
+        assert_eq!(&text[segments[0].range.clone()], "«ééééMmm");
+        assert_eq!(segments[0].break_suffix, Some(LineBreakSuffix::Hyphen));
+        assert_eq!(&text[segments[1].range.clone()], "mMMM!»");
+        assert!(segments[1].is_mandatory);
+        assert_eq!(&text[segments[1].next_offset..], "Next");
     }
 
     #[test]
@@ -565,7 +619,7 @@ mod tests {
     fn hyphenation_supports_unicode_words() {
         let text = "электрификация";
         let linebreaker =
-            LineBreaker::new().with_hyphenation(HyphenationOptions::new(Lang::Russian, 8));
+            LineBreaker::new().with_hyphenation(HyphenationOptions::new(Some(Lang::Russian), 8));
         let segments = linebreaker.line_segments(text);
 
         assert!(
