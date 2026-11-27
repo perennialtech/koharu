@@ -232,13 +232,18 @@ unsafe fn load_once(log: ktrt_log_fn) -> Result<Loaded, String> {
     })
 }
 
+fn error_reason(error: &libloading::Error) -> &dyn std::error::Error {
+    std::error::Error::source(error).unwrap_or(error)
+}
+
 unsafe fn symbol<T: Copy>(library: &Library, name: &[u8]) -> Result<T, String> {
     unsafe { library.get::<T>(name) }
         .map(|symbol| *symbol)
         .map_err(|error| {
             format!(
-                "missing symbol {}: {error}",
-                String::from_utf8_lossy(&name[..name.len() - 1])
+                "missing symbol {}: {}",
+                String::from_utf8_lossy(&name[..name.len() - 1]),
+                error_reason(&error)
             )
         })
 }
@@ -251,12 +256,50 @@ unsafe fn open_loaded(name: &str) -> Result<Library, String> {
     use libloading::os::unix::{Library, RTLD_LAZY};
     unsafe { Library::open(Some(name), RTLD_LAZY | libc::RTLD_NOLOAD) }
         .map(Into::into)
-        .map_err(|error| format!("{name} is not loaded: {error}"))
+        .map_err(|error| format!("{name} is not loaded: {}", error_reason(&error)))
 }
 
 #[cfg(target_os = "windows")]
 unsafe fn open_loaded(name: &str) -> Result<Library, String> {
     libloading::os::windows::Library::open_already_loaded(name)
         .map(Into::into)
-        .map_err(|error| format!("{name} is not loaded: {error}"))
+        .map_err(|error| format!("{name} is not loaded: {}", error_reason(&error)))
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reports_the_requested_library_and_loader_reason() {
+        let name = "/nonexistent/koharu-loader-test.so";
+        let raw = unsafe {
+            libloading::os::unix::Library::open(
+                Some(name),
+                libloading::os::unix::RTLD_LAZY | libc::RTLD_NOLOAD,
+            )
+        }
+        .unwrap_err();
+        let reason = std::error::Error::source(&raw).unwrap_or(&raw);
+        let message = unsafe { open_loaded(name) }.unwrap_err();
+        assert!(message.contains(name));
+        assert!(message.contains(&reason.to_string()));
+        assert_eq!(
+            error_reason(&libloading::Error::DlOpenUnknown).to_string(),
+            libloading::Error::DlOpenUnknown.to_string()
+        );
+    }
+
+    #[test]
+    fn reports_the_missing_symbol_and_dlsym_reason() {
+        let library: Library = libloading::os::unix::Library::this().into();
+        let name = b"koharu_absent_symbol\0";
+        let raw = unsafe { library.get::<unsafe extern "C" fn()>(name) }.unwrap_err();
+        let reason = std::error::Error::source(&raw).unwrap().to_string();
+        let message = unsafe { symbol::<unsafe extern "C" fn()>(&library, name) }.unwrap_err();
+        assert_eq!(
+            message,
+            format!("missing symbol koharu_absent_symbol: {reason}")
+        );
+    }
 }

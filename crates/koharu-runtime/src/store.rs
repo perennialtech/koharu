@@ -2,7 +2,7 @@ use std::{
     fs::{File, OpenOptions},
     future::Future,
     path::{Path, PathBuf},
-    sync::OnceLock,
+    sync::{Arc, OnceLock},
 };
 
 use anyhow::{Context, Result, ensure};
@@ -63,7 +63,7 @@ impl Store {
     ) -> Result<PathBuf>
     where
         Valid: Fn(&Path) -> bool + Send + Sync,
-        Install: FnOnce(PathBuf) -> Pending + Send,
+        Install: FnOnce(Arc<tempfile::TempDir>) -> Pending + Send,
         Pending: Future<Output = Result<()>> + Send,
     {
         if valid(&target) {
@@ -89,7 +89,9 @@ impl Store {
             .prefix(".install-")
             .tempdir_in(parent)
             .with_context(|| format!("failed to stage {}", target.display()))?;
-        install(stage.path().to_owned()).await?;
+        // A blocking extractor may outlive its caller on cancellation.
+        let stage = Arc::new(stage);
+        install(Arc::clone(&stage)).await?;
         ensure!(
             valid(stage.path()),
             "installer produced an incomplete package"
@@ -201,7 +203,7 @@ mod tests {
                     move |stage| async move {
                         attempts.fetch_add(1, Ordering::Relaxed);
                         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-                        tokio::fs::write(stage.join("ready"), b"ok").await?;
+                        tokio::fs::write(stage.path().join("ready"), b"ok").await?;
                         Ok(())
                     },
                 )
@@ -225,7 +227,7 @@ mod tests {
             target.clone(),
             |path| path.join("ready").is_file(),
             move |stage| async move {
-                tokio::fs::write(stage.join("ready"), b"staged").await?;
+                tokio::fs::write(stage.path().join("ready"), b"staged").await?;
                 tokio::fs::create_dir_all(&winner).await?;
                 tokio::fs::write(winner.join("ready"), b"winner").await?;
                 Ok(())
@@ -264,7 +266,7 @@ mod tests {
                             .create_new(true)
                             .open(target.with_file_name("install-attempt"))?;
                         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                        tokio::fs::write(stage.join("ready"), b"ok").await?;
+                        tokio::fs::write(stage.path().join("ready"), b"ok").await?;
                         Ok(())
                     },
                 ))

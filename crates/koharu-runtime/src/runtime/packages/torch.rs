@@ -3,12 +3,12 @@ use std::path::{Path, PathBuf};
 use anyhow::Result;
 
 use crate::{
-    Hardware, Store, download,
+    Hardware, Store,
     runtime::{
         DiscoverablePackage, Package, RuntimePackage, graph::Component, loader, packages::Cuda,
         sealed,
     },
-    source::extract,
+    source::{SHARED_LIBRARIES, install_archive},
 };
 
 const RELEASE: &str = "v2.13.0.7";
@@ -47,9 +47,7 @@ impl Package for Torch {
                 let url = format!(
                     "https://github.com/koharu-rs/torch/releases/download/{RELEASE}/{ASSET}"
                 );
-                let archive = tempfile::Builder::new().suffix(".tar.gz").tempfile()?;
-                download::fetch(&url, archive.path()).await?;
-                extract(archive.path(), &stage, &["**/*.so", "**/*.so.*"])
+                install_archive(&url, stage, SHARED_LIBRARIES).await
             },
         )
         .await

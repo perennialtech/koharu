@@ -87,7 +87,7 @@ fn loader_tokens(library_names: &[String]) -> TokenStream {
     quote! {
         const __KOHARU_BINDGEN_LIBRARY_NAMES: &[&str] = &[#(#library_names),*];
 
-        static __KOHARU_BINDGEN_LIBRARIES: ::std::sync::OnceLock<::std::vec::Vec<::libloading::Library>> =
+        static __KOHARU_BINDGEN_LIBRARIES: ::std::sync::OnceLock<::std::vec::Vec<::std::result::Result<::libloading::Library, ::std::string::String>>> =
             ::std::sync::OnceLock::new();
 
         fn __koharu_bindgen_library_file_name(library_name: &str) -> ::std::string::String {
@@ -150,6 +150,10 @@ fn loader_tokens(library_names: &[String]) -> TokenStream {
             None
         }
 
+        fn __koharu_bindgen_error_reason(error: &::libloading::Error) -> &dyn ::std::error::Error {
+            ::std::error::Error::source(error).unwrap_or(error)
+        }
+
         unsafe fn __koharu_bindgen_open_library(
             library_file_name: &str,
         ) -> ::std::result::Result<::libloading::Library, ::std::string::String> {
@@ -158,52 +162,53 @@ fn loader_tokens(library_names: &[String]) -> TokenStream {
                 return Ok(library);
             }
 
-            for path in __koharu_bindgen_bundled_library_paths(library_file_name) {
-                if let Ok(library) = unsafe { ::libloading::Library::new(path) } {
-                    return Ok(library);
+            let mut paths = __koharu_bindgen_bundled_library_paths(library_file_name);
+            paths.push(::std::path::PathBuf::from(library_file_name));
+            let mut errors = ::std::vec::Vec::new();
+            for path in paths {
+                match unsafe { ::libloading::Library::new(&path) } {
+                    Ok(library) => return Ok(library),
+                    Err(error) => errors.push(::std::format!(
+                        "{}: {}", path.display(), __koharu_bindgen_error_reason(&error)
+                    )),
                 }
             }
-            unsafe { ::libloading::Library::new(library_file_name) }
-                .map_err(|error| error.to_string())
-        }
-
-        unsafe fn __koharu_bindgen_libraries() -> &'static [::libloading::Library] {
-            __KOHARU_BINDGEN_LIBRARIES.get_or_init(|| {
-                let mut libraries = ::std::vec::Vec::new();
-                let mut errors = ::std::vec::Vec::new();
-
-                for library_name in __KOHARU_BINDGEN_LIBRARY_NAMES {
-                    let library_file_name = __koharu_bindgen_library_file_name(library_name);
-                    match unsafe { __koharu_bindgen_open_library(&library_file_name) } {
-                        Ok(library) => libraries.push(library),
-                        Err(error) => errors.push(::std::format!("{library_file_name}: {error}")),
-                    }
-                }
-
-                if libraries.is_empty() {
-                    panic!(
-                        "failed to load any dynamic library from [{}]: {}",
-                        __KOHARU_BINDGEN_LIBRARY_NAMES.join(", "),
-                        errors.join("; ")
-                    );
-                }
-
-                libraries
-            }).as_slice()
+            Err(errors.join("; "))
         }
 
         unsafe fn __koharu_bindgen_load<F: Copy>(name: &[u8]) -> F {
-            for library in unsafe { __koharu_bindgen_libraries() } {
-                if let Ok(symbol) = unsafe { library.get::<F>(name) } {
-                    return *symbol;
+            let libraries = __KOHARU_BINDGEN_LIBRARIES.get_or_init(|| {
+                let libraries: ::std::vec::Vec<_> = __KOHARU_BINDGEN_LIBRARY_NAMES.iter().map(|name| {
+                    let filename = __koharu_bindgen_library_file_name(name);
+                    unsafe { __koharu_bindgen_open_library(&filename) }
+                }).collect();
+                if libraries.iter().all(::std::result::Result::is_err) {
+                    let errors: ::std::vec::Vec<_> = libraries.into_iter()
+                        .filter_map(::std::result::Result::err).collect();
+                    panic!("failed to load any dynamic library for symbol {}: {}",
+                        ::std::string::String::from_utf8_lossy(name).trim_end_matches('\0'),
+                        errors.join("; ")
+                    );
+                }
+                libraries
+            });
+
+            let mut errors = ::std::vec::Vec::new();
+            for (library, library_name) in libraries.iter().zip(__KOHARU_BINDGEN_LIBRARY_NAMES) {
+                match library {
+                    Ok(library) => match unsafe { library.get::<F>(name) } {
+                        Ok(symbol) => return *symbol,
+                        Err(error) => errors.push(::std::format!(
+                            "{library_name}: {}", __koharu_bindgen_error_reason(&error)
+                        )),
+                    },
+                    Err(error) => errors.push(error.clone()),
                 }
             }
-
             panic!(
-                "missing symbol {} in dynamic libraries [{}]",
-                ::std::string::String::from_utf8_lossy(name)
-                    .trim_end_matches('\0'),
-                __KOHARU_BINDGEN_LIBRARY_NAMES.join(", ")
+                "failed to resolve symbol {}: {}",
+                ::std::string::String::from_utf8_lossy(name).trim_end_matches('\0'),
+                errors.join("; ")
             )
         }
 
@@ -350,4 +355,23 @@ fn link_name(attr: &Attribute) -> Option<String> {
 
 fn is_link_attr(attr: &Attribute) -> bool {
     attr.path().is_ident("link_name") || attr.path().is_ident("link_ordinal")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn emits_loader_reasons_for_both_open_and_symbol_errors() {
+        let bindings =
+            rewrite_bindings("unsafe extern \"C\" { pub fn probe(); }", "probe").unwrap();
+        let bindings = bindings.split_whitespace().collect::<String>();
+        assert!(bindings.contains("::std::error::Error::source(error).unwrap_or(error)"));
+        assert_eq!(
+            bindings
+                .matches("__koharu_bindgen_error_reason(&error)")
+                .count(),
+            2
+        );
+    }
 }

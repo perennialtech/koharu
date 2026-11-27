@@ -3,15 +3,19 @@ use std::path::{Path, PathBuf};
 use anyhow::Result;
 
 use crate::{
-    Hardware, Store, download,
+    Hardware, Store,
     runtime::{
         DiscoverablePackage, Package, RuntimePackage, graph::Component, loader, packages::Cuda,
         sealed,
     },
-    source::{extract, wheel},
+    source::{Wheel, install_archive},
 };
 
-const PROJECT: &str = "tensorrt-rtx-cu13-libs/1.7.1.116";
+const WHEEL: Wheel = Wheel {
+    project: "tensorrt-rtx-cu13-libs",
+    version: "1.7.1.116",
+    platform: "manylinux_2_28_x86_64",
+};
 const ROOT: &str = "tensorrt_rtx_libs";
 // The ONNX parser opens the core library by soname, so the core loads first.
 const LIBRARIES: [&str; 2] = ["libtensorrt_rtx.so.1", "libtensorrt_onnxparser_rtx.so.1"];
@@ -37,19 +41,14 @@ impl sealed::Sealed for TensorRt {}
 
 impl Package for TensorRt {
     async fn install(self) -> Result<PathBuf> {
-        let target = Store::root()
-            .join("tensorrt")
-            .join(PROJECT.replace('/', "--"));
+        let target = Store::root().join("tensorrt").join(WHEEL.directory());
         Store::directory(
             target,
             move |path| self.complete(path),
             move |stage| async move {
-                let url = wheel(PROJECT).await?;
-                let archive = tempfile::Builder::new().suffix(".whl").tempfile()?;
-                download::fetch(&url, archive.path()).await?;
+                let url = WHEEL.url();
                 let patterns = LIBRARIES.map(|name| format!("{ROOT}/{name}"));
-                let patterns = patterns.iter().map(String::as_str).collect::<Vec<_>>();
-                extract(archive.path(), &stage, &patterns)
+                install_archive(&url, stage, patterns).await
             },
         )
         .await
@@ -75,5 +74,18 @@ impl RuntimePackage for TensorRt {
             loader::load(directory.join(library), false)?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pins_the_linux_wheel_url() {
+        assert_eq!(
+            WHEEL.url(),
+            "https://files.pythonhosted.org/packages/py3/t/tensorrt-rtx-cu13-libs/tensorrt_rtx_cu13_libs-1.7.1.116-py3-none-manylinux_2_28_x86_64.whl"
+        );
     }
 }

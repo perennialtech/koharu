@@ -3,12 +3,12 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 
 use crate::{
-    Hardware, Store, download,
+    Hardware, Store,
     runtime::{
         DiscoverablePackage, Package, RuntimePackage, graph::Component, loader, packages::Cuda,
         sealed,
     },
-    source::extract,
+    source::install_archive,
 };
 
 const RELEASE: &str = "1.31.1";
@@ -58,11 +58,8 @@ impl Package for OnnxRuntime {
                 let url = format!(
                     "https://api.nuget.org/v3-flatcontainer/{PACKAGE}/{RELEASE}/{PACKAGE}.{RELEASE}.nupkg"
                 );
-                let archive = tempfile::Builder::new().suffix(".zip").tempfile()?;
-                download::fetch(&url, archive.path()).await?;
                 let patterns = LIBRARIES.map(|name| format!("{ROOT}/{name}"));
-                let patterns = patterns.iter().map(String::as_str).collect::<Vec<_>>();
-                extract(archive.path(), &stage, &patterns)
+                install_archive(&url, stage, patterns).await
             },
         )
         .await
