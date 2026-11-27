@@ -12,7 +12,7 @@ use imageproc::{
 
 use super::{
     KoharuLayoutMask as Mask,
-    measure::{Outline, outline, scaled},
+    measure::{Outline, fill_holes, outline, scaled},
 };
 
 /// The least share of a tone, inside lettering, within an outline's width of
@@ -24,6 +24,8 @@ const AROUND: f32 = 0.6;
 /// the least share of it that must: art's specks lie too close together.
 const NEAR: u8 = 3;
 const SOLID: f32 = 0.7;
+const NEAR_THIN: u8 = 1;
+const SOLID_THIN: f32 = 0.70;
 
 /// Outlined lettering, by its glyphs.
 pub(super) struct Outlined {
@@ -76,7 +78,13 @@ pub(super) fn outlined(
         let width = found.map_or(2.0, |found| f64::from(found.width));
         let total = around.len();
         around.retain(|(distance, _)| *distance <= width + 1.5);
-        if around.is_empty() || (around.len() as f32) < AROUND * total as f32 {
+        // When `enclosed` is true, `AROUND` separates an outline around glyphs
+        // from plain lettering's ink around its counters. When `enclosed` is
+        // false, `glyphs` is already the ink and `outline()` has verified a
+        // sharp band around it, so textured art inside `block` must not veto it.
+        if around.is_empty()
+            || ((enclosed || found.is_none()) && (around.len() as f32) < AROUND * total as f32)
+        {
             return None;
         }
         let strokes: Vec<[u8; 3]> = glyphs
@@ -95,11 +103,146 @@ pub(super) fn outlined(
                 width,
             }
         });
+        let shell_ink = unlike(strokes, outline.color);
+        if enclosed
+            && let Some(peeled) =
+                peel_double_outline(page, &glyphs, corner, shell_ink, outline.color, &size)
+        {
+            return Some(peeled);
+        }
         Some(Outlined {
             glyphs,
-            ink: unlike(strokes, outline.color),
+            ink: shell_ink,
             outline,
         })
+    })
+}
+
+/// When `shell` is the inner outline of double-outlined lettering (for example
+/// black or red glyphs inside a white inner outline inside a black outer
+/// outline), every glyph sits as an enclosed hole inside `shell`. Peel one
+/// layer inward so the enclosed strokes become `glyphs` and `shell` becomes
+/// the inner outline.
+fn peel_double_outline(
+    page: &RgbImage,
+    shell: &GrayImage,
+    corner: [u32; 2],
+    shell_color: [u8; 3],
+    outer_color: [u8; 3],
+    size: &impl Fn(&GrayImage) -> f32,
+) -> Option<Outlined> {
+    let mut filled = shell.clone();
+    fill_holes(&mut filled);
+    let inner = GrayImage::from_fn(shell.width(), shell.height(), |x, y| {
+        Luma([
+            u8::from(filled.get_pixel(x, y).0[0] != 0 && shell.get_pixel(x, y).0[0] == 0) * u8::MAX,
+        ])
+    });
+    let shell_area = count(shell);
+    let inner_area = count(&inner);
+    if inner_area < 16 || inner_area * 5 < shell_area {
+        return None;
+    }
+    let shell_parts = connected_components(shell, Connectivity::Eight, Luma([0]));
+    let max_label = shell_parts.pixels().map(|p| p.0[0]).max().unwrap_or(0) as usize;
+    let mut part_area = vec![0usize; max_label + 1];
+    for p in shell_parts.pixels() {
+        let l = p.0[0] as usize;
+        if l != 0 {
+            part_area[l] += 1;
+        }
+    }
+    let mut has_hole = vec![0usize; max_label + 1];
+    let (w, h) = (shell.width(), shell.height());
+    for (x, y, p) in inner.enumerate_pixels() {
+        if p.0[0] == 0 {
+            continue;
+        }
+        for (nx, ny) in [
+            x.checked_sub(1).map(|nx| (nx, y)),
+            (x + 1 < w).then_some((x + 1, y)),
+            y.checked_sub(1).map(|ny| (x, ny)),
+            (y + 1 < h).then_some((x, y + 1)),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            let l = shell_parts.get_pixel(nx, ny).0[0] as usize;
+            if l != 0 {
+                has_hole[l] += 1;
+                break;
+            }
+        }
+    }
+    let enclosing_area: usize = (1..=max_label)
+        .filter(|&l| has_hole[l] >= 4)
+        .map(|l| part_area[l])
+        .sum();
+    if (enclosing_area as f32) < 0.65 * shell_area as f32 {
+        return None;
+    }
+    let inner_pixels: Vec<[u8; 3]> = inner
+        .enumerate_pixels()
+        .filter(|(_, _, p)| p.0[0] != 0)
+        .map(|(x, y, _)| page.get_pixel(corner[0] + x, corner[1] + y).0)
+        .collect();
+    let inner_ink = unlike(inner_pixels, shell_color);
+    let contrast = (0..3)
+        .map(|c| inner_ink[c].abs_diff(shell_color[c]))
+        .max()
+        .unwrap_or(0);
+    if contrast <= 60 {
+        return None;
+    }
+    // Single-outlined hollow glyphs (e.g. `口`, `〇`, `0`) have enclosed counters
+    // filled with the same colour as the outer outline. Those counters are solid
+    // convex blobs (high bounding-box fill ratio), whereas double-outlined glyphs
+    // inside an inner outline have stroke geometry with much lower fill ratio.
+    let same_as_outer = (0..3)
+        .map(|c| inner_ink[c].abs_diff(outer_color[c]))
+        .max()
+        .unwrap_or(0)
+        <= 40;
+    if same_as_outer {
+        let inner_parts = connected_components(&inner, Connectivity::Eight, Luma([0]));
+        let inner_max = inner_parts.pixels().map(|p| p.0[0]).max().unwrap_or(0) as usize;
+        let mut extents: Vec<Option<[u32; 4]>> = vec![None; inner_max + 1];
+        for (x, y, p) in inner_parts.enumerate_pixels() {
+            let l = p.0[0] as usize;
+            if l == 0 {
+                continue;
+            }
+            let e = extents[l].get_or_insert([x, y, x, y]);
+            *e = [e[0].min(x), e[1].min(y), e[2].max(x), e[3].max(y)];
+        }
+        let bbox_area: usize = extents
+            .into_iter()
+            .flatten()
+            .map(|[x0, y0, x1, y1]| (x1 - x0 + 1) as usize * (y1 - y0 + 1) as usize)
+            .sum();
+        if bbox_area > 0 && (inner_area as f32) > 0.72 * (bbox_area as f32) {
+            return None;
+        }
+    }
+    let inner_outline = outline(page, &inner, corner, size(&inner), Some(inner_ink))
+        .unwrap_or_else(|| {
+            let dist = euclidean_squared_distance_transform(&inner);
+            let mut d_shell: Vec<f64> = dist
+                .enumerate_pixels()
+                .filter(|&(x, y, _)| shell.get_pixel(x, y).0[0] != 0)
+                .map(|(_, _, sq)| sq.0[0].sqrt())
+                .collect();
+            d_shell.sort_unstable_by(f64::total_cmp);
+            let width = d_shell.get(d_shell.len() * 3 / 4).copied().unwrap_or(2.0) as f32;
+            Outline {
+                color: shell_color,
+                width,
+            }
+        });
+    Some(Outlined {
+        glyphs: inner,
+        ink: inner_ink,
+        outline: inner_outline,
     })
 }
 
@@ -189,10 +332,30 @@ impl Parts {
             .enumerate()
             .filter_map(|(label, part)| {
                 let (extent, area) = (*part)?;
-                self.surrounded(label, extent, &solid)
+                self.surrounded(label, extent, &solid, Norm::LInf, NEAR, SOLID)
                     .then_some((length(extent), area, label))
             })
             .collect();
+        if kept.iter().map(|(_, area, _)| *area).sum::<u32>() < 16 {
+            // Fall back to a tighter immediate-ring check for 2 px outlines
+            // that `open(..., 1)` erases, ignoring tiny screentone specks.
+            let thin: Vec<(u32, u32, usize)> = self
+                .parts
+                .iter()
+                .enumerate()
+                .filter_map(|(label, part)| {
+                    let (extent, area) = (*part)?;
+                    (length(extent) >= 6
+                        && self.surrounded(label, extent, &band, Norm::LInf, NEAR_THIN, SOLID_THIN))
+                    .then_some((length(extent), area, label))
+                })
+                .collect();
+            let all_area: u32 = self.parts.iter().filter_map(|p| p.map(|(_, a)| a)).sum();
+            let thin_area: u32 = thin.iter().map(|(_, a, _)| *a).sum();
+            if thin_area >= 16 && thin_area * 2 >= all_area {
+                kept = thin;
+            }
+        }
         kept.sort_unstable();
         let total: u32 = kept.iter().map(|(_, area, _)| area).sum();
         let mut seen = 0;
@@ -211,9 +374,17 @@ impl Parts {
         }
     }
 
-    /// Whether what's `NEAR` part `label` is mostly `solid`.
-    fn surrounded(&self, label: usize, [x0, y0, x1, y1]: [u32; 4], solid: &GrayImage) -> bool {
-        let pad = u32::from(NEAR);
+    /// Whether what's within `near` of part `label` is mostly `solid`.
+    fn surrounded(
+        &self,
+        label: usize,
+        [x0, y0, x1, y1]: [u32; 4],
+        solid: &GrayImage,
+        norm: Norm,
+        near: u8,
+        min_solid: f32,
+    ) -> bool {
+        let pad = u32::from(near);
         let (left, top) = (x0.saturating_sub(pad), y0.saturating_sub(pad));
         let right = (x1 + pad).min(solid.width() - 1);
         let bottom = (y1 + pad).min(solid.height() - 1);
@@ -222,13 +393,13 @@ impl Parts {
             Luma([u8::from(at == label) * u8::MAX])
         });
         let (mut around, mut held) = (0u32, 0u32);
-        for (x, y, pixel) in dilate(&part, Norm::LInf, NEAR).enumerate_pixels() {
+        for (x, y, pixel) in dilate(&part, norm, near).enumerate_pixels() {
             if pixel.0[0] != 0 && part.get_pixel(x, y).0[0] == 0 {
                 around += 1;
                 held += u32::from(solid.get_pixel(left + x, top + y).0[0] != 0);
             }
         }
-        held as f32 >= SOLID * around as f32
+        around > 0 && held as f32 >= min_solid * around as f32
     }
 }
 
@@ -424,5 +595,95 @@ mod tests {
             found.size
         );
         assert!(found.outline.is_some(), "expected white outline: {found:?}");
+    }
+
+    #[test]
+    fn thin_two_pixel_outline_is_detected_without_swapping_ink() {
+        let cross = |x: u32, y: u32| {
+            let (x, y) = (x.wrapping_sub(60), y.wrapping_sub(60));
+            x < 20
+                && y < 112
+                && y % 28 < 20
+                && ((8..12).contains(&x) || (8..12).contains(&(y % 28)))
+        };
+        let near = |x: u32, y: u32, reach: u32| {
+            (y.saturating_sub(reach)..=y + reach)
+                .any(|yy| (x.saturating_sub(reach)..=x + reach).any(|xx| cross(xx, yy)))
+        };
+        let page = RgbImage::from_fn(200, 240, |x, y| {
+            let bg = if (x / 8 + y / 8).is_multiple_of(2) {
+                [180, 180, 180]
+            } else {
+                [110, 110, 110]
+            };
+            Rgb(if cross(x, y) {
+                WHITE
+            } else if near(x, y, 2) {
+                BLACK
+            } else {
+                bg
+            })
+        });
+        let mask = Mask {
+            x: 40,
+            y: 40,
+            width: 120,
+            height: 160,
+            pixels: (40..200)
+                .flat_map(|y| (40..160).map(move |x| (x, y)))
+                .map(|(x, y)| u8::from(near(x, y, 2)) * u8::MAX)
+                .collect(),
+        };
+        let found = mask.typography(&page).expect("ink");
+        assert_eq!(found.ink, Some(WHITE), "{found:?}");
+        let band = found.outline.expect("a 2 px black outline");
+        assert_eq!(band.color, BLACK);
+        assert!((1.5..=3.5).contains(&band.width), "{band:?}");
+    }
+
+    #[test]
+    fn double_outlined_lettering_peels_to_inner_glyph_ink() {
+        let red = [220, 20, 30];
+        let cross = |x: u32, y: u32| {
+            let (x, y) = (x.wrapping_sub(60), y.wrapping_sub(60));
+            x < 20
+                && y < 112
+                && y % 28 < 20
+                && ((7..13).contains(&x) || (7..13).contains(&(y % 28)))
+        };
+        let near = |x: u32, y: u32, reach: u32| {
+            (y.saturating_sub(reach)..=y + reach)
+                .any(|yy| (x.saturating_sub(reach)..=x + reach).any(|xx| cross(xx, yy)))
+        };
+        let page = RgbImage::from_fn(200, 240, |x, y| {
+            let bg = if (x / 10 + y / 10).is_multiple_of(2) {
+                [30, 30, 30]
+            } else {
+                [140, 140, 140]
+            };
+            Rgb(if cross(x, y) {
+                red
+            } else if near(x, y, 4) {
+                WHITE
+            } else if near(x, y, 7) {
+                BLACK
+            } else {
+                bg
+            })
+        });
+        let mask = Mask {
+            x: 40,
+            y: 40,
+            width: 120,
+            height: 160,
+            pixels: (40..200)
+                .flat_map(|y| (40..160).map(move |x| (x, y)))
+                .map(|(x, y)| u8::from(near(x, y, 7)) * u8::MAX)
+                .collect(),
+        };
+        let found = mask.typography(&page).expect("ink");
+        assert_eq!(found.ink, Some(red), "{found:?}");
+        let band = found.outline.expect("a white inner outline");
+        assert_eq!(band.color, WHITE);
     }
 }
