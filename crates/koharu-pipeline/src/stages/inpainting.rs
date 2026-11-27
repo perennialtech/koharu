@@ -10,7 +10,11 @@ use image::{
     DynamicImage, GenericImageView as _, GrayImage, ImageBuffer, ImageFormat, Luma, Rgb, RgbImage,
     Rgba, RgbaImage,
 };
-use imageproc::region_labelling::{Connectivity, connected_components};
+use imageproc::{
+    distance_transform::{Norm, distance_transform_mut},
+    morphology::dilate,
+    region_labelling::{Connectivity, connected_components},
+};
 use koharu_ml::lama::{InpaintRequest, LaMa};
 use koharu_scene::{
     AssetInput, AssetMetadata, AssetRole, At, BubbleRegion, EntityOrigin, Geometry, Origin,
@@ -119,7 +123,10 @@ impl Model {
                         inpaint_tiled(
                             &prepared.image,
                             &prepared.mask,
-                            &prepared.text_mask,
+                            PaperMasks {
+                                text: &prepared.text_mask,
+                                covered: prepared.unscoped_mask.as_ref().unwrap_or(&prepared.mask),
+                            },
                             &prepared.flat_fill_regions,
                             LAMA_TILE_CONTEXT,
                             // A fixed-size LaMa engine gets its crop grown with
@@ -276,6 +283,7 @@ struct InpaintInput {
     cleanup: Option<RgbaImage>,
     mask: GrayImage,
     text_mask: GrayImage,
+    unscoped_mask: Option<GrayImage>,
     flat_fill_regions: Vec<FlatFillRegion>,
 }
 
@@ -340,6 +348,13 @@ async fn prepare(input: &StageInput) -> Result<InpaintInput> {
             }
         }
     }
+    let flat_fill_regions = flat_fill_regions(input, source.width(), source.height())?;
+    // A regional edit limits writes. Lettering outside it is still a hole
+    // when reading paper or tracing a line under a component across the cut.
+    let unscoped_mask = (input.region.is_some()
+        && input.inpainting_mask.is_none()
+        && !flat_fill_regions.is_empty())
+    .then(|| mask.clone());
     if let Some(bounds) = input.region {
         for (x, y, pixel) in mask.enumerate_pixels_mut() {
             if f64::from(x + 1) <= bounds.x
@@ -348,11 +363,9 @@ async fn prepare(input: &StageInput) -> Result<InpaintInput> {
                 || f64::from(y) >= bounds.y + bounds.height
             {
                 *pixel = Luma([0]);
-                text_mask.put_pixel(x, y, Luma([0]));
             }
         }
     }
-    let flat_fill_regions = flat_fill_regions(input, source.width(), source.height())?;
     Ok(InpaintInput {
         image: source,
         original,
@@ -360,6 +373,7 @@ async fn prepare(input: &StageInput) -> Result<InpaintInput> {
         cleanup,
         mask,
         text_mask,
+        unscoped_mask,
         flat_fill_regions,
     })
 }
@@ -368,8 +382,10 @@ const TILE_SIZE: u32 = 512;
 // Known pixels kept around each model crop. LaMa uses wide context to continue
 // texture into the mask.
 const LAMA_TILE_CONTEXT: u32 = 128;
-const UNIFORM_BACKGROUND_MIN_PIXELS: usize = 16;
-const FLAT_FILL_EDGE_MARGIN: f32 = 3.0;
+const PAPER_RING: u8 = 4;
+const PAPER_MIN_PIXELS: usize = 16;
+const PLAIN_CONTRAST: u8 = 16;
+const FLAT_FILL_EDGE_MARGIN: u32 = 3;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct InpaintTile {
@@ -384,32 +400,43 @@ struct MaskComponent {
     bounds: [u32; 4],
 }
 
-// BallonsTranslator avoids model inference for a text block when the non-text
-// pixels inside its balloon are nearly uniform, and otherwise sends an enlarged
-// block crop to the inpainter:
-// https://github.com/dmMaze/BallonsTranslator/blob/4bcc635c19f6c63a902872cf77b3d554e14ed1b7/ballontranslator/modules/inpaint/base.py#L168-L200
-// Koharu uses the detected bubble polygons as those blocks. Uniform bubbles are
-// filled first; only the remaining mask is split into bounded model crops.
+struct PaperMasks<'a> {
+    text: &'a GrayImage,
+    covered: &'a GrayImage,
+}
+
+// Fill lettering on flat balloon paper before growing the remaining model crops.
 fn inpaint_tiled(
     image: &DynamicImage,
     mask: &GrayImage,
-    text_mask: &GrayImage,
+    paper_masks: PaperMasks<'_>,
     flat_fill_regions: &[FlatFillRegion],
     context: u32,
     crop_size: impl Fn(u32, u32) -> Option<(u32, u32)>,
     mut inference: impl FnMut(&DynamicImage, &GrayImage) -> Result<DynamicImage>,
 ) -> Result<DynamicImage> {
     ensure!(
-        image.dimensions() == mask.dimensions() && mask.dimensions() == text_mask.dimensions(),
-        "image and mask dimensions differ: image={:?}, mask={:?}, text_mask={:?}",
+        [mask, paper_masks.text, paper_masks.covered]
+            .iter()
+            .all(|mask| mask.dimensions() == image.dimensions()),
+        "image and mask dimensions differ: image={:?}, mask={:?}, text_mask={:?}, covered={:?}",
         image.dimensions(),
         mask.dimensions(),
-        text_mask.dimensions()
+        paper_masks.text.dimensions(),
+        paper_masks.covered.dimensions()
     );
 
     let mut output = image.to_rgb8();
     let mut pending_mask = mask.clone();
-    fill_uniform_regions(&mut output, &mut pending_mask, text_mask, flat_fill_regions);
+    fill_uniform_regions(
+        &mut output,
+        &mut pending_mask,
+        paper_masks,
+        flat_fill_regions,
+    );
+    if pending_mask.iter().all(|&value| value < 127) {
+        return Ok(DynamicImage::ImageRgb8(output));
+    }
     let (component_labels, mut tiles) = inpaint_tiles(&pending_mask, context);
     for tile in &mut tiles {
         let [left, top, right, bottom] = tile.crop;
@@ -448,38 +475,247 @@ fn inpaint_tiled(
     Ok(DynamicImage::ImageRgb8(output))
 }
 
+/// The detected balloon and its readable paper, rasterized once for all components.
+struct BalloonCoverage {
+    bounds: [u32; 4],
+    pixels: GrayImage,
+}
+
+impl BalloonCoverage {
+    fn new(region: &FlatFillRegion) -> Self {
+        let [left, top, right, bottom] = region.bounds;
+        let mut pixels = GrayImage::new(right - left, bottom - top);
+        let mut crossings = Vec::new();
+        for (row, y) in pixels
+            .chunks_exact_mut((right - left) as usize)
+            .zip(top..bottom)
+        {
+            let y = y as f32 + 0.5;
+            crossings.clear();
+            let mut previous = *region.polygon.last().unwrap();
+            for &current in &region.polygon {
+                if (previous.1 > y) != (current.1 > y) {
+                    crossings.push(
+                        (previous.0 - current.0) * (y - current.1) / (previous.1 - current.1)
+                            + current.0,
+                    );
+                }
+                previous = current;
+            }
+            crossings.sort_unstable_by(f32::total_cmp);
+            // Even-odd spans contain pixel centers in [start, end).
+            let offset = |x: f32| (((x - 0.5).ceil() as u32).clamp(left, right) - left) as usize;
+            for &[start, end] in crossings.as_chunks::<2>().0 {
+                row[offset(start)..offset(end)].fill(255);
+            }
+        }
+        Self {
+            bounds: region.bounds,
+            pixels,
+        }
+    }
+
+    fn holds(&self, x: u32, y: u32) -> bool {
+        let [left, top, right, bottom] = self.bounds;
+        (left..right).contains(&x)
+            && (top..bottom).contains(&y)
+            && self.pixels.get_pixel(x - left, y - top)[0] != 0
+    }
+
+    fn reads_paper(&self, x: u32, y: u32) -> bool {
+        let edge = FLAT_FILL_EDGE_MARGIN;
+        x >= edge
+            && y >= edge
+            && self.holds(x, y)
+            && self.holds(x - edge, y)
+            && self.holds(x.saturating_add(edge), y)
+            && self.holds(x, y - edge)
+            && self.holds(x, y.saturating_add(edge))
+    }
+}
+
+/// Adapted from koharu-rs/koharu@43ea786d. Detection supplies the grown text
+/// mask. Only its pixels inside a balloon are eligible for paper fill, while
+/// every hole in the original combined mask is excluded from paper samples.
 fn fill_uniform_regions(
     output: &mut RgbImage,
     pending_mask: &mut GrayImage,
-    text_mask: &GrayImage,
+    paper_masks: PaperMasks<'_>,
     regions: &[FlatFillRegion],
 ) {
-    for region in regions {
-        let [left, top, right, bottom] = region.bounds;
-        let mut rows = PolygonRows::new(&region.polygon);
-        let mut targets = Vec::new();
-        for y in top..bottom {
-            rows.set_row(y);
-            for x in left..right {
-                if pending_mask.get_pixel(x, y)[0] >= 127
-                    && text_mask.get_pixel(x, y)[0] >= 127
-                    && rows.contains(x)
-                {
-                    targets.push((x, y));
-                }
-            }
-        }
-        if targets.is_empty() {
+    let PaperMasks {
+        text: text_mask,
+        covered,
+    } = paper_masks;
+    if regions.is_empty() || text_mask.iter().all(|&value| value < 127) {
+        return;
+    }
+    let (labels, components) = mask_components(text_mask);
+    let balloons: Vec<_> = regions.iter().map(BalloonCoverage::new).collect();
+    for component in components {
+        let [left, top, right, bottom] = component.bounds;
+        let mut candidates = balloons
+            .iter()
+            .filter(|balloon| {
+                let [x0, y0, x1, y1] = balloon.bounds;
+                left < x1 && x0 < right && top < y1 && y0 < bottom
+            })
+            .peekable();
+        if candidates.peek().is_none() {
             continue;
         }
-        let Some(color) = uniform_region_color(output, pending_mask, region) else {
+        let points: Vec<_> = (top..bottom)
+            .flat_map(|y| (left..right).map(move |x| (x, y)))
+            .filter(|&(x, y)| labels.get_pixel(x, y)[0] == component.label)
+            .collect();
+        if !points
+            .iter()
+            .any(|&(x, y)| pending_mask.get_pixel(x, y)[0] >= 127)
+        {
+            continue;
+        }
+        // A lettering straddling a balloon outline belongs to the model.
+        let Some((balloon, inside)) = candidates
+            .map(|balloon| {
+                let inside = points.iter().filter(|&&(x, y)| balloon.holds(x, y)).count();
+                (balloon, inside)
+            })
+            .max_by_key(|&(_, inside)| inside)
+        else {
             continue;
         };
-        for (x, y) in targets {
-            output.put_pixel(x, y, color);
+        if inside < points.len() - points.len() / 10 {
+            continue;
+        }
+        fill_paper_component(
+            output,
+            pending_mask,
+            covered,
+            balloon,
+            component.bounds,
+            &points,
+        );
+    }
+}
+
+fn fill_paper_component(
+    output: &mut RgbImage,
+    pending_mask: &mut GrayImage,
+    covered: &GrayImage,
+    balloon: &BalloonCoverage,
+    bounds: [u32; 4],
+    points: &[(u32, u32)],
+) {
+    let [left, top, right, bottom] = expand_bounds(
+        bounds,
+        u32::from(PAPER_RING),
+        output.width(),
+        output.height(),
+    );
+    let mut distance = GrayImage::new(right - left, bottom - top);
+    for &(x, y) in points {
+        distance.put_pixel(x - left, y - top, Luma([255]));
+    }
+    distance_transform_mut(&mut distance, Norm::LInf);
+    let ring: Vec<_> = distance
+        .enumerate_pixels()
+        .filter(|&(x, y, d)| {
+            (1..=PAPER_RING).contains(&d[0]) && covered.get_pixel(left + x, top + y)[0] < 127
+        })
+        .map(|(x, y, _)| (left + x, top + y))
+        .collect();
+    // A fully masked balloon can have a uniform exterior. Its paper must
+    // come from exposed pixels inside the outline.
+    let samples: Vec<_> = ring
+        .iter()
+        .copied()
+        .filter(|&(x, y)| balloon.reads_paper(x, y))
+        .collect();
+    let Some(paper) = paper_median(output, &samples) else {
+        return;
+    };
+    let plain = ring
+        .iter()
+        .all(|&(x, y)| contrast(*output.get_pixel(x, y), paper) <= PLAIN_CONTRAST);
+    let protected = if plain && points.iter().all(|&(x, y)| balloon.holds(x, y)) {
+        None
+    } else {
+        let mut deviations = [0u64; 3];
+        for &(x, y) in &samples {
+            let pixel = output.get_pixel(x, y);
+            for channel in 0..3 {
+                deviations[channel] += u64::from(pixel[channel].abs_diff(paper[channel]));
+            }
+        }
+        if deviations
+            .iter()
+            .any(|&sum| sum >= 10 * samples.len() as u64)
+        {
+            return;
+        }
+
+        // Only ink touching the mask can continue underneath it. Include
+        // softer edges while following the stroke through the lettering.
+        let ink = GrayImage::from_fn(distance.width(), distance.height(), |x, y| {
+            let d = distance.get_pixel(x, y)[0];
+            let (x, y) = (left + x, top + y);
+            let off_paper = contrast(*output.get_pixel(x, y), paper);
+            let ink = if d == 0 {
+                off_paper > PLAIN_CONTRAST / 2
+            } else {
+                d == 1 && covered.get_pixel(x, y)[0] < 127 && off_paper > PLAIN_CONTRAST
+            };
+            Luma([u8::from(ink)])
+        });
+        let labels = label_binary_mask(&ink);
+        let label = |x, y| labels.get_pixel(x - left, y - top)[0];
+        let mut contacts = ring.iter().map(|&(x, y)| label(x, y)).filter(|&id| id != 0);
+        let crossing = contacts.next();
+        // Separate traces can be two ends of a rule obscured by lettering.
+        // Leave the intervening paper available for the model to reconnect.
+        if let Some(id) = crossing
+            && (contacts.any(|other| other != id)
+                || !points.iter().any(|&(x, y)| label(x, y) == id))
+        {
+            return;
+        }
+        let mut keep = GrayImage::new(distance.width(), distance.height());
+        for &(x, y) in points {
+            if !balloon.holds(x, y) || crossing == Some(label(x, y)) {
+                keep.put_pixel(x - left, y - top, Luma([255]));
+            }
+        }
+        Some(dilate(&keep, Norm::LInf, 1))
+    };
+    for &(x, y) in points {
+        if pending_mask.get_pixel(x, y)[0] >= 127
+            && protected
+                .as_ref()
+                .is_none_or(|keep| keep.get_pixel(x - left, y - top)[0] == 0)
+        {
+            output.put_pixel(x, y, paper);
             pending_mask.put_pixel(x, y, Luma([0]));
         }
     }
+}
+
+fn paper_median(image: &RgbImage, samples: &[(u32, u32)]) -> Option<Rgb<u8>> {
+    (samples.len() >= PAPER_MIN_PIXELS).then(|| {
+        Rgb(std::array::from_fn(|channel| {
+            let mut values: Vec<_> = samples
+                .iter()
+                .map(|&(x, y)| image.get_pixel(x, y)[channel])
+                .collect();
+            *values.select_nth_unstable(samples.len() / 2).1
+        }))
+    })
+}
+
+fn contrast(pixel: Rgb<u8>, paper: Rgb<u8>) -> u8 {
+    (0..3)
+        .map(|channel| pixel[channel].abs_diff(paper[channel]))
+        .max()
+        .unwrap()
 }
 
 fn inpaint_tiles(
@@ -542,11 +778,19 @@ fn inpaint_tiles(
     (labels, bounded_tiles)
 }
 
+fn label_binary_mask(mask: &GrayImage) -> ImageBuffer<Luma<u32>, Vec<u32>> {
+    // imageproc#824: a single foreground pixel needs label 1 and background 0.
+    if mask.dimensions() == (1, 1) {
+        return ImageBuffer::from_pixel(1, 1, Luma([u32::from(mask.get_pixel(0, 0)[0] != 0)]));
+    }
+    connected_components(mask, Connectivity::Eight, Luma([0]))
+}
+
 fn mask_components(mask: &GrayImage) -> (ImageBuffer<Luma<u32>, Vec<u32>>, Vec<MaskComponent>) {
     let binary = GrayImage::from_fn(mask.width(), mask.height(), |x, y| {
         Luma([(mask.get_pixel(x, y)[0] >= 127) as u8 * u8::MAX])
     });
-    let labels = connected_components(&binary, Connectivity::Eight, Luma([0]));
+    let labels = label_binary_mask(&binary);
     let mut bounds = Vec::<Option<[u32; 4]>>::new();
     for (x, y, pixel) in labels.enumerate_pixels() {
         let label = pixel[0] as usize;
@@ -657,157 +901,6 @@ fn crop_tile_mask(mask: &GrayImage, tile: &InpaintTile) -> GrayImage {
         }
     }
     crop
-}
-
-fn uniform_region_color(
-    image: &RgbImage,
-    mask: &GrayImage,
-    region: &FlatFillRegion,
-) -> Option<Rgb<u8>> {
-    let [left, top, right, bottom] = region.bounds;
-    let mut rows = PolygonRows::new(&region.polygon);
-    let mut channels = [Vec::new(), Vec::new(), Vec::new()];
-    for y in top..bottom {
-        rows.set_row(y);
-        for x in left..right {
-            if mask.get_pixel(x, y)[0] >= 127 || !rows.contains(x) || rows.near_edge(x) {
-                continue;
-            }
-            let pixel = image.get_pixel(x, y);
-            for channel in 0..3 {
-                channels[channel].push(pixel[channel]);
-            }
-        }
-    }
-    if channels[0].len() < UNIFORM_BACKGROUND_MIN_PIXELS {
-        return None;
-    }
-
-    let medians = channels.each_mut().map(|values| median(values));
-    let deviations = std::array::from_fn::<_, 3, _>(|channel| {
-        standard_deviation(&channels[channel], f64::from(medians[channel]))
-    });
-    let mean_deviation = deviations.iter().sum::<f64>() / deviations.len() as f64;
-    let channel_spread = (deviations
-        .iter()
-        .map(|deviation| (deviation - mean_deviation).powi(2))
-        .sum::<f64>()
-        / deviations.len() as f64)
-        .sqrt();
-    let threshold = if channel_spread > 1.0 { 7.0 } else { 10.0 };
-    (deviations.iter().copied().fold(0.0, f64::max) < threshold).then_some(Rgb(medians))
-}
-
-/// Even-odd containment and edge-margin tests for the pixel centers of one
-/// polygon, evaluated a row at a time. Bubble polygons trace detector masks and
-/// can have hundreds of vertices, so testing every edge for every pixel of a
-/// bubble dominated inpainting on large pages. Each test keeps the per-edge
-/// arithmetic of a direct per-pixel test, so results are identical.
-struct PolygonRows<'a> {
-    polygon: &'a [(f32, f32)],
-    y: f32,
-    /// Sorted x coordinates where polygon edges cross the current row.
-    crossings: Vec<f32>,
-    /// Edges whose bounds lie within the edge margin of the current row.
-    nearby: Vec<((f32, f32), (f32, f32))>,
-}
-
-impl<'a> PolygonRows<'a> {
-    // Skipped edges are farther than this from the row, which keeps their
-    // squared distance well above the margin despite rounding.
-    const NEARBY: f32 = FLAT_FILL_EDGE_MARGIN + 1.0;
-
-    fn new(polygon: &'a [(f32, f32)]) -> Self {
-        Self {
-            polygon,
-            y: 0.0,
-            crossings: Vec::new(),
-            nearby: Vec::new(),
-        }
-    }
-
-    fn edges(&self) -> impl Iterator<Item = ((f32, f32), (f32, f32))> + '_ {
-        let last = self.polygon[self.polygon.len() - 1];
-        std::iter::once(last)
-            .chain(self.polygon.iter().copied())
-            .zip(self.polygon.iter().copied())
-    }
-
-    fn set_row(&mut self, y: u32) {
-        let y = y as f32 + 0.5;
-        let mut crossings = std::mem::take(&mut self.crossings);
-        let mut nearby = std::mem::take(&mut self.nearby);
-        crossings.clear();
-        nearby.clear();
-        for (previous, current) in self.edges() {
-            if (current.1 > y) != (previous.1 > y) {
-                crossings.push(
-                    (previous.0 - current.0) * (y - current.1) / (previous.1 - current.1)
-                        + current.0,
-                );
-            }
-            if previous.1.min(current.1) - Self::NEARBY <= y
-                && y <= previous.1.max(current.1) + Self::NEARBY
-            {
-                nearby.push((previous, current));
-            }
-        }
-        crossings.sort_unstable_by(f32::total_cmp);
-        self.y = y;
-        self.crossings = crossings;
-        self.nearby = nearby;
-    }
-
-    fn contains(&self, x: u32) -> bool {
-        let x = x as f32 + 0.5;
-        let right = self.crossings.len() - self.crossings.partition_point(|&edge| edge <= x);
-        right % 2 == 1
-    }
-
-    fn near_edge(&self, x: u32) -> bool {
-        let point = (x as f32 + 0.5, self.y);
-        self.nearby.iter().any(|&(start, end)| {
-            if point.0 < start.0.min(end.0) - Self::NEARBY
-                || point.0 > start.0.max(end.0) + Self::NEARBY
-            {
-                return false;
-            }
-            let segment = (end.0 - start.0, end.1 - start.1);
-            let length_squared = segment.0 * segment.0 + segment.1 * segment.1;
-            let projection = if length_squared > 0.0 {
-                ((point.0 - start.0) * segment.0 + (point.1 - start.1) * segment.1) / length_squared
-            } else {
-                0.0
-            }
-            .clamp(0.0, 1.0);
-            let closest = (
-                start.0 + segment.0 * projection,
-                start.1 + segment.1 * projection,
-            );
-            let dx = point.0 - closest.0;
-            let dy = point.1 - closest.1;
-            dx * dx + dy * dy < FLAT_FILL_EDGE_MARGIN * FLAT_FILL_EDGE_MARGIN
-        })
-    }
-}
-
-fn median(values: &mut [u8]) -> u8 {
-    values.sort_unstable();
-    let middle = values.len() / 2;
-    if values.len().is_multiple_of(2) {
-        ((u16::from(values[middle - 1]) + u16::from(values[middle])) / 2) as u8
-    } else {
-        values[middle]
-    }
-}
-
-fn standard_deviation(values: &[u8], center: f64) -> f64 {
-    (values
-        .iter()
-        .map(|value| (f64::from(*value) - center).powi(2))
-        .sum::<f64>()
-        / values.len() as f64)
-        .sqrt()
 }
 
 /// Writes a tile's fill for the mask it owns and unmasks those pixels, so the
@@ -990,7 +1083,10 @@ mod tests {
         let output = inpaint_tiled(
             &DynamicImage::ImageRgb8(image),
             &mask,
-            &mask,
+            PaperMasks {
+                text: &mask,
+                covered: &mask,
+            },
             &[rectangle_region([0, 0, 96, 96])],
             LAMA_TILE_CONTEXT,
             |_, _| None,
@@ -1003,7 +1099,320 @@ mod tests {
         .to_rgb8();
 
         assert_eq!(calls, 0);
-        assert_eq!(output.get_pixel(48, 48), &Rgb([240, 241, 242]));
+        assert!(output.pixels().all(|pixel| *pixel == Rgb([240, 241, 242])));
+    }
+
+    #[test]
+    fn crossing_rule_and_its_border_stay_pending_beside_a_flat_filled_glyph() {
+        assert_crossing_rule_stays_pending(Rgb([0; 3]));
+    }
+
+    #[test]
+    fn gray_rule_crossing_white_paper_stays_pending() {
+        assert_crossing_rule_stays_pending(Rgb([200; 3]));
+    }
+
+    fn assert_crossing_rule_stays_pending(ink: Rgb<u8>) {
+        let paper = Rgb([255; 3]);
+        let mut image = RgbImage::from_pixel(96, 96, paper);
+        let mask = GrayImage::from_fn(96, 96, |x, y| {
+            Luma([if (32..64).contains(&x) && (38..56).contains(&y) {
+                255
+            } else {
+                0
+            }])
+        });
+        // Only two pixels of the rule are exposed outside the grown mask.
+        for x in 31..65 {
+            image.put_pixel(x, 48, ink);
+        }
+        image.put_pixel(41, 41, Rgb([0; 3]));
+        // A soft diagonal joins the rule under the mask.
+        image.put_pixel(52, 49, Rgb([210; 3]));
+        image.put_pixel(53, 50, Rgb([210; 3]));
+        let mut calls = 0;
+        let output = inpaint_tiled(
+            &DynamicImage::ImageRgb8(image),
+            &mask,
+            PaperMasks {
+                text: &mask,
+                covered: &mask,
+            },
+            &[rectangle_region([0, 0, 96, 96])],
+            LAMA_TILE_CONTEXT,
+            |_, _| None,
+            |tile, pending| {
+                calls += 1;
+                for (x, y, pixel) in pending.enumerate_pixels() {
+                    let rule = (32..64).contains(&x) && (47..=49).contains(&y);
+                    let tip = (51..=53).contains(&x) && y == 50
+                        || (52..=54).contains(&x) && (50..=51).contains(&y);
+                    assert_eq!(pixel[0] != 0, rule || tip, "({x}, {y})");
+                }
+                assert_eq!(tile.get_pixel(41, 41), Rgba([255; 4]));
+                Ok(tile.clone())
+            },
+        )
+        .unwrap()
+        .to_rgb8();
+        assert_eq!(calls, 1);
+        assert!((31..65).all(|x| output.get_pixel(x, 48) == &ink));
+    }
+
+    #[test]
+    fn white_outlined_lettering_leaves_the_gap_in_a_crossing_rule_pending() {
+        let mask = GrayImage::from_fn(64, 48, |x, y| {
+            let crossed = (8..32).contains(&x) && (12..30).contains(&y);
+            let separate = (44..52).contains(&x) && (16..26).contains(&y);
+            Luma([if crossed || separate { 255 } else { 0 }])
+        });
+        let image = RgbImage::from_fn(64, 48, |x, y| {
+            let rule = y == 21 && x < 38 && !(17..23).contains(&x);
+            let glyph = (x == 20 || x == 47) && (17..26).contains(&y);
+            Rgb([if rule || glyph { 0 } else { 255 }; 3])
+        });
+        let mut calls = 0;
+        inpaint_tiled(
+            &DynamicImage::ImageRgb8(image),
+            &mask,
+            PaperMasks {
+                text: &mask,
+                covered: &mask,
+            },
+            &[rectangle_region([0, 0, 64, 48])],
+            LAMA_TILE_CONTEXT,
+            |_, _| None,
+            |tile, pending| {
+                calls += 1;
+                for x in 8..32 {
+                    assert_eq!(pending.get_pixel(x, 21)[0], 255, "rule at x={x}");
+                }
+                for y in 16..26 {
+                    for x in 44..52 {
+                        assert_eq!(pending.get_pixel(x, y)[0], 0);
+                        assert_eq!(tile.get_pixel(x, y), Rgba([255; 4]));
+                    }
+                }
+                Ok(tile.clone())
+            },
+        )
+        .unwrap();
+        assert_eq!(calls, 1);
+    }
+
+    #[test]
+    fn a_detached_outline_in_the_paper_ring_allows_local_fill() {
+        let mut image = RgbImage::from_pixel(32, 32, Rgb([255; 3]));
+        let mask = GrayImage::from_fn(32, 32, |x, y| {
+            if (10..22).contains(&x) && (12..20).contains(&y) {
+                image.put_pixel(x, y, Rgb([0; 3]));
+                Luma([255])
+            } else {
+                Luma([0])
+            }
+        });
+        image.put_pixel(7, 16, Rgb([0; 3]));
+        let output = inpaint_tiled(
+            &DynamicImage::ImageRgb8(image),
+            &mask,
+            PaperMasks {
+                text: &mask,
+                covered: &mask,
+            },
+            &[rectangle_region([0, 0, 32, 32])],
+            LAMA_TILE_CONTEXT,
+            |_, _| None,
+            |_, _| panic!("a detached outline does not require inference"),
+        )
+        .unwrap()
+        .to_rgb8();
+        for (x, y, pixel) in output.enumerate_pixels() {
+            let expected = if (x, y) == (7, 16) { 0 } else { 255 };
+            assert_eq!(*pixel, Rgb([expected; 3]));
+        }
+    }
+
+    #[test]
+    fn components_in_one_balloon_use_their_own_paper_or_go_to_the_model() {
+        let mut image = RgbImage::from_fn(96, 96, |x, y| {
+            if x >= 64 && y >= 64 {
+                Rgb([if (x + y).is_multiple_of(2) { 0 } else { 160 }; 3])
+            } else if x >= 64 {
+                Rgb([198, 210, 230])
+            } else {
+                Rgb([250; 3])
+            }
+        });
+        let mask = GrayImage::from_fn(96, 96, |x, y| {
+            let target = [(24, 24), (72, 24), (72, 72)]
+                .iter()
+                .any(|&(left, top)| (left..left + 8).contains(&x) && (top..top + 8).contains(&y));
+            if target {
+                image.put_pixel(x, y, Rgb([0; 3]));
+            }
+            Luma([if target { 255 } else { 0 }])
+        });
+        let mut calls = 0;
+        let output = inpaint_tiled(
+            &DynamicImage::ImageRgb8(image),
+            &mask,
+            PaperMasks {
+                text: &mask,
+                covered: &mask,
+            },
+            &[rectangle_region([0, 0, 96, 96])],
+            LAMA_TILE_CONTEXT,
+            |_, _| None,
+            |tile, pending| {
+                calls += 1;
+                for (x, y, pixel) in pending.enumerate_pixels() {
+                    assert_eq!(
+                        pixel[0] != 0,
+                        (72..80).contains(&x) && (72..80).contains(&y)
+                    );
+                }
+                Ok(DynamicImage::ImageRgb8(RgbImage::from_pixel(
+                    tile.width(),
+                    tile.height(),
+                    Rgb([1, 2, 3]),
+                )))
+            },
+        )
+        .unwrap()
+        .to_rgb8();
+        assert_eq!(calls, 1);
+        assert_eq!(output.get_pixel(26, 26), &Rgb([250; 3]));
+        assert_eq!(output.get_pixel(76, 26), &Rgb([198, 210, 230]));
+        assert_eq!(output.get_pixel(76, 76), &Rgb([1, 2, 3]));
+    }
+
+    #[test]
+    fn fully_masked_balloon_cannot_use_exterior_color_as_its_paper() {
+        let balloon = FlatFillRegion {
+            bounds: [4, 4, 28, 28],
+            polygon: vec![(16.0, 4.0), (28.0, 16.0), (16.0, 28.0), (4.0, 16.0)],
+        };
+        let mask = GrayImage::from_fn(32, 32, |x, y| {
+            let dx = (x as f32 + 0.5 - 16.0).abs();
+            let dy = (y as f32 + 0.5 - 16.0).abs();
+            Luma([if dx + dy <= 12.0 { 255 } else { 0 }])
+        });
+        let mut pending = mask.clone();
+        let mut image = RgbImage::from_pixel(32, 32, Rgb([20; 3]));
+        image.put_pixel(16, 16, Rgb([220; 3]));
+        fill_uniform_regions(
+            &mut image,
+            &mut pending,
+            PaperMasks {
+                text: &mask,
+                covered: &mask,
+            },
+            &[balloon],
+        );
+        assert_eq!(pending, mask);
+        assert_eq!(image.get_pixel(16, 16), &Rgb([220; 3]));
+    }
+
+    #[test]
+    fn paper_ring_excludes_neighboring_non_text_mask_pixels() {
+        let mut image = RgbImage::from_pixel(24, 24, Rgb([225; 3]));
+        let mut text = GrayImage::new(24, 24);
+        text.put_pixel(10, 10, Luma([255]));
+        image.put_pixel(10, 10, Rgb([0; 3]));
+        let mut combined = text.clone();
+        for y in 6..15 {
+            for x in 12..15 {
+                combined.put_pixel(x, y, Luma([255]));
+                image.put_pixel(x, y, Rgb([0; 3]));
+            }
+        }
+        let mut calls = 0;
+        let output = inpaint_tiled(
+            &DynamicImage::ImageRgb8(image),
+            &combined,
+            PaperMasks {
+                text: &text,
+                covered: &combined,
+            },
+            &[rectangle_region([0, 0, 24, 24])],
+            LAMA_TILE_CONTEXT,
+            |_, _| None,
+            |tile, pending| {
+                calls += 1;
+                assert_eq!(pending.get_pixel(10, 10)[0], 0);
+                assert_eq!(pending.iter().filter(|&&value| value != 0).count(), 27);
+                Ok(tile.clone())
+            },
+        )
+        .unwrap()
+        .to_rgb8();
+        assert_eq!(calls, 1);
+        assert_eq!(output.get_pixel(10, 10), &Rgb([225; 3]));
+    }
+
+    #[test]
+    fn regional_fill_reads_past_the_full_mask_and_writes_only_inside_the_scope() {
+        let paper = Rgb([248; 3]);
+        let ink = Rgb([10; 3]);
+        let mut image = RgbImage::from_pixel(32, 24, paper);
+        let covered = GrayImage::from_fn(32, 24, |x, y| {
+            if (8..24).contains(&x) && (8..16).contains(&y) {
+                image.put_pixel(x, y, ink);
+                Luma([255])
+            } else {
+                Luma([0])
+            }
+        });
+        let active = GrayImage::from_fn(32, 24, |x, y| {
+            if x < 16 {
+                *covered.get_pixel(x, y)
+            } else {
+                Luma([0])
+            }
+        });
+        let output = inpaint_tiled(
+            &DynamicImage::ImageRgb8(image),
+            &active,
+            PaperMasks {
+                text: &covered,
+                covered: &covered,
+            },
+            &[rectangle_region([0, 0, 32, 24])],
+            LAMA_TILE_CONTEXT,
+            |_, _| None,
+            |_, _| panic!("flat paper requires no inference"),
+        )
+        .unwrap()
+        .to_rgb8();
+        for (x, y, pixel) in output.enumerate_pixels() {
+            let outside = (16..24).contains(&x) && (8..16).contains(&y);
+            assert_eq!(*pixel, if outside { ink } else { paper });
+        }
+    }
+
+    #[test]
+    fn single_pixel_page_defers_to_the_model_without_paper_samples() {
+        let image = DynamicImage::new_rgb8(1, 1);
+        let mask = GrayImage::from_pixel(1, 1, Luma([255]));
+        let mut calls = 0;
+        inpaint_tiled(
+            &image,
+            &mask,
+            PaperMasks {
+                text: &mask,
+                covered: &mask,
+            },
+            &[rectangle_region([0, 0, 1, 1])],
+            LAMA_TILE_CONTEXT,
+            |_, _| None,
+            |tile, pending| {
+                calls += 1;
+                assert_eq!(pending, &mask);
+                Ok(tile.clone())
+            },
+        )
+        .unwrap();
+        assert_eq!(calls, 1);
     }
 
     #[test]
@@ -1040,7 +1449,10 @@ mod tests {
         let output = inpaint_tiled(
             &DynamicImage::ImageRgb8(image),
             &mask,
-            &mask,
+            PaperMasks {
+                text: &mask,
+                covered: &mask,
+            },
             &[
                 rectangle_region([10, 10, 90, 90]),
                 rectangle_region([110, 10, 190, 90]),
@@ -1074,7 +1486,10 @@ mod tests {
         let output = inpaint_tiled(
             &DynamicImage::ImageRgb8(image),
             &mask,
-            &mask,
+            PaperMasks {
+                text: &mask,
+                covered: &mask,
+            },
             &[],
             LAMA_TILE_CONTEXT,
             |_, _| None,
@@ -1147,7 +1562,10 @@ mod tests {
         inpaint_tiled(
             &DynamicImage::ImageRgb8(image),
             &mask,
-            &mask,
+            PaperMasks {
+                text: &mask,
+                covered: &mask,
+            },
             &[],
             LAMA_TILE_CONTEXT,
             |_, _| None,
@@ -1192,7 +1610,10 @@ mod tests {
         let output = inpaint_tiled(
             &DynamicImage::ImageRgb8(image),
             &mask,
-            &mask,
+            PaperMasks {
+                text: &mask,
+                covered: &mask,
+            },
             &[],
             LAMA_TILE_CONTEXT,
             |_, _| None,
