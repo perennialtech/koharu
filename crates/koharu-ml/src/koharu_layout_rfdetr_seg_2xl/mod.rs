@@ -6,7 +6,9 @@
 //! https://github.com/roboflow/rf-detr/tree/4ab7c18729de9d02ffd0495795d0831b5630f01b
 
 mod config;
+mod measure;
 mod model;
+mod outlined;
 mod processor;
 mod tensorrt;
 
@@ -16,6 +18,7 @@ use koharu_runtime::Backend;
 
 pub use self::{
     config::{KoharuLayoutRFDetrSeg2XLConfig, KoharuLayoutThresholds},
+    measure::{GlyphProposal, Outline, Typography, fit_glyph_masks},
     processor::{
         KoharuLayoutDetection, KoharuLayoutDetections, KoharuLayoutMask,
         KoharuLayoutRFDetrImageProcessor,
@@ -134,16 +137,15 @@ mod tests {
         let mut model = KoharuLayoutRFDetrSeg2XL::load(crate::Device::cpu()).await?;
         let result = model.inference(&image)?;
 
-        // rfdetr 1.7.0, CPU FP32, shape=(1920, 1920), the checkpoint loaded strictly.
-        // Both sides run FP32 on CPU. Kernels vary across runtimes and releases, so compare
-        // structured geometry and mask area with bounded confidence differences.
+        // ONNX Runtime CPU FP32 reference for the 770×1080 page placed at the
+        // top left of a white 1920×1920 letterboxed input.
         let best = &result.detections[0];
         assert_eq!(best.label, "bubble");
-        assert!((best.score - 0.981_6).abs() < 0.01);
-        for (actual, expected) in best.bbox.into_iter().zip([567.63, 546.78, 691.9, 720.57]) {
+        assert!((best.score - 0.977_7).abs() < 0.01);
+        for (actual, expected) in best.bbox.into_iter().zip([567.40, 547.30, 692.04, 720.84]) {
             assert!((actual - expected).abs() < 6.0);
         }
-        assert!(best.area.abs_diff(18_900) < 100);
+        assert!(best.area.abs_diff(18_968) < 150);
 
         let lower_panel = result
             .detections
@@ -160,19 +162,19 @@ mod tests {
         for (actual, expected) in lower_panel
             .bbox
             .into_iter()
-            .zip([68.45, 799.89, 701.19, 1008.47])
+            .zip([69.75, 800.27, 702.35, 1009.24])
         {
             assert!((actual - expected).abs() < 7.0);
         }
         for (actual, expected) in middle_panel
             .bbox
             .into_iter()
-            .zip([69.46, 555.17, 698.4, 787.68])
+            .zip([70.40, 554.60, 699.65, 788.71])
         {
             assert!((actual - expected).abs() < 3.0);
         }
-        assert!(lower_panel.area.abs_diff(137_424) < 1_000);
-        assert!(middle_panel.area.abs_diff(143_583) < 2_000);
+        assert!(lower_panel.area.abs_diff(134_662) < 2_000);
+        assert!(middle_panel.area.abs_diff(144_311) < 2_000);
         Ok(())
     }
 }
