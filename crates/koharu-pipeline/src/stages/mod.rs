@@ -10,7 +10,10 @@ use async_trait::async_trait;
 use image::DynamicImage;
 use koharu_scene::{Edit, EntityId, Generation, Patch, ProducerId, Snapshot};
 
-pub use detection::KoharuLayoutRFDetrSeg2XLConfig;
+pub use detection::{
+    DetectionFusionConfig, FusedDetectionLayout, KoharuLayoutRFDetrSeg2XLConfig, LayoutItem,
+    fuse_detections,
+};
 
 use crate::{Bounds, ImageCache, InpaintingMask, PipelineConfig, RequestTranslation, Stage};
 

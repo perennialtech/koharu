@@ -73,6 +73,96 @@ const COMIC_TEXT_AGREEMENT_CONTAINMENT: f32 = 0.5;
 const COMIC_TEXT_THRESHOLD: f32 = 0.5;
 const COMIC_TEXT_MAX_COVERAGE: f32 = 0.3;
 
+/// Configurable thresholds and strategy switches for fusing RF-DETR layout
+/// predictions with comic text/bubble detections.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DetectionFusionConfig {
+    pub duplicate_iou: f32,
+    pub dialogue_mask_containment_threshold: f32,
+    pub ellipse_text_containment_threshold: f32,
+    pub merge_container_containment_threshold: f32,
+    pub text_block_gap: f32,
+    pub neighbouring_line_min_shared: f32,
+    pub same_text_min_containment: f32,
+    pub split_bubble_min_share: f32,
+    pub bubble_mask_min_iou: f32,
+    pub comic_text_agreement_threshold: f32,
+    pub comic_text_agreement_containment: f32,
+    pub comic_text_threshold: f32,
+    pub comic_text_max_coverage: f32,
+    /// Minimum containment (in either direction) for a comic text box to
+    /// constrain `fit_to_mask`. `0.0` accepts any positive intersection.
+    pub fit_to_mask_min_overlap: f32,
+    /// Use mask containment instead of bbox containment when assigning bubble
+    /// containers in `merge_text_blocks`.
+    pub use_mask_containment_for_merge: bool,
+    /// Prevent `same_text` from merging two text boxes already assigned to
+    /// different bubbles.
+    pub prevent_cross_bubble_same_text: bool,
+    /// Compute exact union coverage area (instead of summing pairwise
+    /// intersections) when filtering comic-only text additions.
+    pub dedup_added_text_coverage: bool,
+    /// Prefer the bubble with higher mask containment (breaking ties by
+    /// smaller mask area) when assigning dialogue in `layout_order`.
+    pub prefer_higher_bubble_containment: bool,
+    /// Optional score threshold to keep unmatched RF-DETR bubble proposals
+    /// when the comic bubble detector misses a balloon.
+    pub fallback_rfdetr_bubble_threshold: Option<f32>,
+}
+
+impl Default for DetectionFusionConfig {
+    fn default() -> Self {
+        Self {
+            duplicate_iou: DUPLICATE_IOU,
+            dialogue_mask_containment_threshold: DIALOGUE_MASK_CONTAINMENT_THRESHOLD,
+            ellipse_text_containment_threshold: DIALOGUE_MASK_CONTAINMENT_THRESHOLD,
+            merge_container_containment_threshold: DIALOGUE_MASK_CONTAINMENT_THRESHOLD,
+            text_block_gap: TEXT_BLOCK_GAP,
+            neighbouring_line_min_shared: 0.5,
+            same_text_min_containment: 0.5,
+            split_bubble_min_share: SPLIT_BUBBLE_MIN_SHARE,
+            bubble_mask_min_iou: BUBBLE_MASK_MIN_IOU,
+            comic_text_agreement_threshold: COMIC_TEXT_AGREEMENT_THRESHOLD,
+            comic_text_agreement_containment: COMIC_TEXT_AGREEMENT_CONTAINMENT,
+            comic_text_threshold: COMIC_TEXT_THRESHOLD,
+            comic_text_max_coverage: COMIC_TEXT_MAX_COVERAGE,
+            fit_to_mask_min_overlap: 0.0,
+            use_mask_containment_for_merge: false,
+            prevent_cross_bubble_same_text: false,
+            dedup_added_text_coverage: false,
+            prefer_higher_bubble_containment: false,
+            fallback_rfdetr_bubble_threshold: None,
+        }
+    }
+}
+
+/// Result of running the proposal-level detection fusion and layout ordering
+/// pipeline without image-based glyph mask refitting.
+#[derive(Clone, Debug)]
+pub struct FusedDetectionLayout {
+    pub detections: Vec<KoharuLayoutDetection>,
+    pub order: Vec<LayoutItem>,
+}
+
+/// Runs the production detection fusion, NMS, text-block merging, split-bubble
+/// joining, and layout ordering pipeline with the given configuration.
+pub fn fuse_detections(
+    layout: KoharuLayoutDetections,
+    comic: &[ComicTextBubbleDetection],
+    bubble_threshold: f32,
+    config: &DetectionFusionConfig,
+) -> FusedDetectionLayout {
+    let mut candidates =
+        with_comic_detections_with_config(layout, comic, bubble_threshold, config);
+    non_maximum_suppression(&mut candidates, config.duplicate_iou);
+    let mut detections: Vec<_> = candidates.into_iter().map(|c| c.detection).collect();
+    merge_text_blocks_with_config(&mut detections, config);
+    join_split_bubbles_with_config(&mut detections, config);
+    let order = layout_order_with_config(&detections, config);
+    FusedDetectionLayout { detections, order }
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, Type)]
 #[serde(default)]
 pub struct KoharuLayoutRFDetrSeg2XLConfig {
@@ -239,6 +329,20 @@ fn with_comic_detections(
     comic: &[ComicTextBubbleDetection],
     bubble_threshold: f32,
 ) -> Vec<Candidate> {
+    with_comic_detections_with_config(
+        layout,
+        comic,
+        bubble_threshold,
+        &DetectionFusionConfig::default(),
+    )
+}
+
+fn with_comic_detections_with_config(
+    layout: KoharuLayoutDetections,
+    comic: &[ComicTextBubbleDetection],
+    bubble_threshold: f32,
+    config: &DetectionFusionConfig,
+) -> Vec<Candidate> {
     let KoharuLayoutDetections {
         image_width,
         image_height,
@@ -254,17 +358,17 @@ fn with_comic_detections(
         .iter()
         .filter(|detection| {
             detection.label != ComicTextBubbleLabel::Bubble
-                && detection.score > COMIC_TEXT_AGREEMENT_THRESHOLD
+                && detection.score > config.comic_text_agreement_threshold
         })
         .collect::<Vec<_>>();
     for detection in &mut detections {
         if detection.label != "text" && detection.label != "onomatopoeia" {
             continue;
         }
-        fit_to_mask(detection, &comic_text);
+        fit_to_mask_with_config(detection, &comic_text, config);
         if detection.label == "onomatopoeia"
             && comic_text.iter().any(|text| {
-                containment(text.bbox, detection.bbox) >= COMIC_TEXT_AGREEMENT_CONTAINMENT
+                containment(text.bbox, detection.bbox) >= config.comic_text_agreement_containment
             })
         {
             detection.label = "text".to_owned();
@@ -274,15 +378,24 @@ fn with_comic_detections(
     let mut added_text = Vec::new();
     for text in comic_text
         .iter()
-        .filter(|text| text.score > COMIC_TEXT_THRESHOLD)
+        .filter(|text| text.score > config.comic_text_threshold)
     {
         let bbox = clip_bounds(text.bbox, page);
-        let covered = detections
-            .iter()
-            .filter(|detection| detection.label == "text" || detection.label == "onomatopoeia")
-            .map(|detection| intersection_area(detection.bbox, bbox))
-            .sum::<f32>();
-        if area(bbox) < 1.0 || covered >= area(bbox) * COMIC_TEXT_MAX_COVERAGE {
+        let covered = if config.dedup_added_text_coverage {
+            let rects: Vec<[f32; 4]> = detections
+                .iter()
+                .filter(|detection| detection.label == "text" || detection.label == "onomatopoeia")
+                .filter_map(|detection| intersect_rect(detection.bbox, bbox))
+                .collect();
+            union_rect_area(&rects)
+        } else {
+            detections
+                .iter()
+                .filter(|detection| detection.label == "text" || detection.label == "onomatopoeia")
+                .map(|detection| intersection_area(detection.bbox, bbox))
+                .sum::<f32>()
+        };
+        if area(bbox) < 1.0 || covered >= area(bbox) * config.comic_text_max_coverage {
             continue;
         }
         let mask = box_mask(bbox);
@@ -297,6 +410,7 @@ fn with_comic_detections(
     }
     detections.extend(added_text);
     let mut bubble_detections = Vec::new();
+    let mut matched_proposals = vec![false; proposals.len()];
     for bubble in comic.iter().filter(|bubble| {
         bubble.label == ComicTextBubbleLabel::Bubble && bubble.score > bubble_threshold
     }) {
@@ -304,33 +418,43 @@ fn with_comic_detections(
         if area(bbox) < 1.0 {
             continue;
         }
-        let mask = proposals
+        let best_proposal = proposals
             .iter()
-            .filter(|proposal| proposal.area > 0 && valid_mask(&proposal.mask))
-            .map(|proposal| (intersection_over_union(proposal.bbox, bbox), proposal))
-            .filter(|(iou, _)| *iou >= BUBBLE_MASK_MIN_IOU)
-            .max_by(|left, right| left.0.total_cmp(&right.0))
-            .map_or_else(
-                || ellipse_mask(bbox, &detections),
-                |(_, proposal)| {
-                    // Over translucent balloons the proposal mask hugs the
-                    // text or loses bites to the artwork behind it, while the
-                    // detector's box follows the balloon. The inscribed
-                    // ellipse restores the body; the proposal keeps corners
-                    // of balloons that are not elliptical.
-                    let mut mask = ellipse_mask(bbox, &detections);
-                    let mut image = GrayImage::from_raw(mask.width, mask.height, mask.pixels)
-                        .expect("ellipse mask matches its size");
-                    stamp_mask(
-                        &mut image,
-                        &clip_mask(&proposal.mask, covering_pixels(bbox.map(f64::from))),
-                        mask.x,
-                        mask.y,
-                    );
-                    mask.pixels = image.into_raw();
-                    mask
-                },
-            );
+            .enumerate()
+            .filter(|(_, proposal)| proposal.area > 0 && valid_mask(&proposal.mask))
+            .map(|(idx, proposal)| (idx, intersection_over_union(proposal.bbox, bbox), proposal))
+            .filter(|(_, iou, _)| *iou >= config.bubble_mask_min_iou)
+            .max_by(|left, right| left.1.total_cmp(&right.1));
+        let mask = match best_proposal {
+            None => ellipse_mask_with_threshold(
+                bbox,
+                &detections,
+                config.ellipse_text_containment_threshold,
+            ),
+            Some((idx, _, proposal)) => {
+                matched_proposals[idx] = true;
+                // Over translucent balloons the proposal mask hugs the
+                // text or loses bites to the artwork behind it, while the
+                // detector's box follows the balloon. The inscribed
+                // ellipse restores the body; the proposal keeps corners
+                // of balloons that are not elliptical.
+                let mut mask = ellipse_mask_with_threshold(
+                    bbox,
+                    &detections,
+                    config.ellipse_text_containment_threshold,
+                );
+                let mut image = GrayImage::from_raw(mask.width, mask.height, mask.pixels)
+                    .expect("ellipse mask matches its size");
+                stamp_mask(
+                    &mut image,
+                    &clip_mask(&proposal.mask, covering_pixels(bbox.map(f64::from))),
+                    mask.x,
+                    mask.y,
+                );
+                mask.pixels = image.into_raw();
+                mask
+            }
+        };
         bubble_detections.push(KoharuLayoutDetection {
             label_id: RFDETR_BUBBLE_LABEL_ID,
             label: "bubble".to_owned(),
@@ -339,6 +463,24 @@ fn with_comic_detections(
             area: mask.pixels.iter().filter(|value| **value != 0).count() as u32,
             mask: mask.into(),
         });
+    }
+    if let Some(min_score) = config.fallback_rfdetr_bubble_threshold {
+        for (idx, proposal) in proposals.into_iter().enumerate() {
+            if matched_proposals[idx] || proposal.score < min_score || !valid_mask(&proposal.mask) {
+                continue;
+            }
+            let bbox = clip_bounds(proposal.bbox, page);
+            if area(bbox) < 1.0 {
+                continue;
+            }
+            let already_covered = bubble_detections.iter().any(|existing| {
+                intersection_over_union(existing.bbox, bbox) >= config.bubble_mask_min_iou
+                    || containment(existing.bbox, bbox) >= 0.7
+            });
+            if !already_covered {
+                bubble_detections.push(proposal);
+            }
+        }
     }
     detections.extend(bubble_detections);
     detections
@@ -360,10 +502,25 @@ fn with_comic_detections(
 /// must not take in. The comic detector boxes whole text blocks, so the box
 /// grows to its mask only within the comic text boxes it overlaps, and mask
 /// pixels outside them are dropped. Without such a box the box is kept.
-fn fit_to_mask(detection: &mut KoharuLayoutDetection, comic_text: &[&ComicTextBubbleDetection]) {
+fn fit_to_mask_with_config(
+    detection: &mut KoharuLayoutDetection,
+    comic_text: &[&ComicTextBubbleDetection],
+    config: &DetectionFusionConfig,
+) {
     let Some(window) = comic_text
         .iter()
-        .filter(|text| intersection_area(text.bbox, detection.bbox) > 0.0)
+        .filter(|text| {
+            let inter = intersection_area(text.bbox, detection.bbox);
+            if inter <= 0.0 {
+                return false;
+            }
+            if config.fit_to_mask_min_overlap <= 0.0 {
+                true
+            } else {
+                containment(text.bbox, detection.bbox) >= config.fit_to_mask_min_overlap
+                    || containment(detection.bbox, text.bbox) >= config.fit_to_mask_min_overlap
+            }
+        })
         .map(|text| text.bbox)
         .reduce(|left, right| {
             [
@@ -502,7 +659,11 @@ fn clip_mask(mask: &KoharuLayoutMask, bounds: [u32; 4]) -> KoharuLayoutMask {
     }
 }
 
-fn ellipse_mask(bbox: [f32; 4], detections: &[KoharuLayoutDetection]) -> KoharuLayoutMask {
+fn ellipse_mask_with_threshold(
+    bbox: [f32; 4],
+    detections: &[KoharuLayoutDetection],
+    text_containment_threshold: f32,
+) -> KoharuLayoutMask {
     let x = bbox[0].floor() as u32;
     let y = bbox[1].floor() as u32;
     let width = (bbox[2].ceil() as u32).saturating_sub(x).max(1);
@@ -516,7 +677,7 @@ fn ellipse_mask(bbox: [f32; 4], detections: &[KoharuLayoutDetection]) -> KoharuL
     });
     for text in detections.iter().filter(|detection| {
         detection.label == "text"
-            && containment(bbox, detection.bbox) >= DIALOGUE_MASK_CONTAINMENT_THRESHOLD
+            && containment(bbox, detection.bbox) >= text_containment_threshold
     }) {
         stamp_mask(&mut mask, &text.mask, x, y);
     }
@@ -2020,21 +2181,51 @@ fn non_maximum_suppression(detections: &mut Vec<Candidate>, threshold: f32) {
 /// less than a line's thickness and running mostly side by side), become one
 /// block. Neighbouring lines in different bubbles stay apart.
 fn merge_text_blocks(detections: &mut Vec<KoharuLayoutDetection>) {
+    merge_text_blocks_with_config(detections, &DetectionFusionConfig::default());
+}
+
+fn merge_text_blocks_with_config(
+    detections: &mut Vec<KoharuLayoutDetection>,
+    config: &DetectionFusionConfig,
+) {
     let texts = indices_with_label(detections, "text");
     let bubbles = indices_with_label(detections, "bubble");
     let container = texts
         .iter()
         .map(|&text| {
-            bubbles
-                .iter()
-                .copied()
-                .filter(|&bubble| {
-                    containment(detections[bubble].bbox, detections[text].bbox)
-                        >= DIALOGUE_MASK_CONTAINMENT_THRESHOLD
-                })
-                .min_by(|&left, &right| {
-                    area(detections[left].bbox).total_cmp(&area(detections[right].bbox))
-                })
+            if config.use_mask_containment_for_merge {
+                bubbles
+                    .iter()
+                    .copied()
+                    .map(|bubble| {
+                        (
+                            bubble,
+                            mask_containment(
+                                &detections[bubble].mask,
+                                &detections[text].mask,
+                                detections[text].bbox,
+                            ),
+                        )
+                    })
+                    .filter(|&(_, share)| share >= config.merge_container_containment_threshold)
+                    .max_by(|&(left, left_share), &(right, right_share)| {
+                        left_share
+                            .total_cmp(&right_share)
+                            .then_with(|| detections[right].area.cmp(&detections[left].area))
+                    })
+                    .map(|(bubble, _)| bubble)
+            } else {
+                bubbles
+                    .iter()
+                    .copied()
+                    .filter(|&bubble| {
+                        containment(detections[bubble].bbox, detections[text].bbox)
+                            >= config.merge_container_containment_threshold
+                    })
+                    .min_by(|&left, &right| {
+                        area(detections[left].bbox).total_cmp(&area(detections[right].bbox))
+                    })
+            }
         })
         .collect::<Vec<_>>();
     let mut parent = (0..texts.len()).collect::<Vec<_>>();
@@ -2051,9 +2242,19 @@ fn merge_text_blocks(detections: &mut Vec<KoharuLayoutDetection>) {
                 detections[texts[first]].bbox,
                 detections[texts[second]].bbox,
             );
-            if same_text(first_bounds, second_bounds)
+            let same_text_allowed = !config.prevent_cross_bubble_same_text
+                || match (container[first], container[second]) {
+                    (Some(a), Some(b)) => a == b,
+                    _ => true,
+                };
+            if (same_text_allowed
+                && same_text_with_threshold(
+                    first_bounds,
+                    second_bounds,
+                    config.same_text_min_containment,
+                ))
                 || (container[first] == container[second]
-                    && neighbouring_lines(first_bounds, second_bounds))
+                    && neighbouring_lines_with_config(first_bounds, second_bounds, config))
             {
                 let (first, second) = (root(&mut parent, first), root(&mut parent, second));
                 parent[second] = first;
@@ -2079,6 +2280,13 @@ fn merge_text_blocks(detections: &mut Vec<KoharuLayoutDetection>) {
 /// would be set as free text over the balloon's edge. Bubbles that each hold
 /// part of such a block, and together hold all of it, become one bubble.
 fn join_split_bubbles(detections: &mut Vec<KoharuLayoutDetection>) {
+    join_split_bubbles_with_config(detections, &DetectionFusionConfig::default());
+}
+
+fn join_split_bubbles_with_config(
+    detections: &mut Vec<KoharuLayoutDetection>,
+    config: &DetectionFusionConfig,
+) {
     let bubbles = indices_with_label(detections, "bubble");
     let mut used = vec![false; detections.len()];
     let mut groups = Vec::new();
@@ -2086,7 +2294,7 @@ fn join_split_bubbles(detections: &mut Vec<KoharuLayoutDetection>) {
         let text = &detections[text];
         let contains = |bubble: &KoharuLayoutDetection| {
             mask_containment(&bubble.mask, &text.mask, text.bbox)
-                >= DIALOGUE_MASK_CONTAINMENT_THRESHOLD
+                >= config.dialogue_mask_containment_threshold
         };
         if bubbles.iter().any(|&bubble| contains(&detections[bubble])) {
             continue;
@@ -2096,7 +2304,8 @@ fn join_split_bubbles(detections: &mut Vec<KoharuLayoutDetection>) {
             .copied()
             .filter(|&bubble| {
                 !used[bubble]
-                    && containment(detections[bubble].bbox, text.bbox) >= SPLIT_BUBBLE_MIN_SHARE
+                    && containment(detections[bubble].bbox, text.bbox)
+                        >= config.split_bubble_min_share
             })
             .collect::<Vec<_>>();
         if parts.len() < 2 || !contains(&union_detection(detections, &parts)) {
@@ -2177,11 +2386,15 @@ fn union_detection(detections: &[KoharuLayoutDetection], group: &[usize]) -> Koh
 
 /// Mostly overlapping boxes cover the same text, even when the bubble
 /// detector splits their balloon in two.
-fn same_text(first: [f32; 4], second: [f32; 4]) -> bool {
-    intersection_area(first, second) >= area(first).min(area(second)) * 0.5
+fn same_text_with_threshold(first: [f32; 4], second: [f32; 4], threshold: f32) -> bool {
+    intersection_area(first, second) >= area(first).min(area(second)) * threshold
 }
 
-fn neighbouring_lines(first: [f32; 4], second: [f32; 4]) -> bool {
+fn neighbouring_lines_with_config(
+    first: [f32; 4],
+    second: [f32; 4],
+    config: &DetectionFusionConfig,
+) -> bool {
     let width = |bounds: [f32; 4]| bounds[2] - bounds[0];
     let height = |bounds: [f32; 4]| bounds[3] - bounds[1];
     let vertical = |bounds: [f32; 4]| height(bounds) > width(bounds);
@@ -2197,18 +2410,26 @@ fn neighbouring_lines(first: [f32; 4], second: [f32; 4]) -> bool {
     let gap = first[across].max(second[across]) - first[across + 2].min(second[across + 2]);
     let shared = first[along + 2].min(second[along + 2]) - first[along].max(second[along]);
     let shorter = (first[along + 2] - first[along]).min(second[along + 2] - second[along]);
-    gap <= line * TEXT_BLOCK_GAP && shared >= shorter * 0.5
+    gap <= line * config.text_block_gap && shared >= shorter * config.neighbouring_line_min_shared
 }
 
-struct LayoutItem {
-    index: usize,
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LayoutItem {
+    pub index: usize,
     /// The glyph-mask parent, visited before this text so its scene ID is available.
-    bubble: Option<usize>,
+    pub bubble: Option<usize>,
 }
 
 /// Panel hierarchy and gutter cuts follow koharu_layout_highres/order.rs
 /// (1235d5c8, f72997e4). A fused balloon groups its dialogue into one subtree.
 fn layout_order(detections: &[KoharuLayoutDetection]) -> Vec<LayoutItem> {
+    layout_order_with_config(detections, &DetectionFusionConfig::default())
+}
+
+fn layout_order_with_config(
+    detections: &[KoharuLayoutDetection],
+    config: &DetectionFusionConfig,
+) -> Vec<LayoutItem> {
     let panels = indices_with_label(detections, "panel");
     let bubbles = indices_with_label(detections, "bubble");
     let mut children = vec![Vec::new(); detections.len()];
@@ -2225,15 +2446,36 @@ fn layout_order(detections: &[KoharuLayoutDetection]) -> Vec<LayoutItem> {
                     area(outer) > area(bbox) && containment(outer, bbox) >= 0.9
                 })
                 .min_by(|&a, &b| area(detections[a].bbox).total_cmp(&area(detections[b].bbox))),
-            "text" => bubbles
-                .iter()
-                .copied()
-                .filter(|&bubble| {
-                    mask_containment(&detections[bubble].mask, &detection.mask, bbox)
-                        >= DIALOGUE_MASK_CONTAINMENT_THRESHOLD
-                })
-                .min_by_key(|&bubble| detections[bubble].area)
-                .or_else(|| holding_panel(detections, bbox, &panels)),
+            "text" => {
+                let bubble_match = if config.prefer_higher_bubble_containment {
+                    bubbles
+                        .iter()
+                        .copied()
+                        .map(|bubble| {
+                            (
+                                bubble,
+                                mask_containment(&detections[bubble].mask, &detection.mask, bbox),
+                            )
+                        })
+                        .filter(|&(_, share)| share >= config.dialogue_mask_containment_threshold)
+                        .max_by(|&(a, a_share), &(b, b_share)| {
+                            a_share
+                                .total_cmp(&b_share)
+                                .then_with(|| detections[b].area.cmp(&detections[a].area))
+                        })
+                        .map(|(bubble, _)| bubble)
+                } else {
+                    bubbles
+                        .iter()
+                        .copied()
+                        .filter(|&bubble| {
+                            mask_containment(&detections[bubble].mask, &detection.mask, bbox)
+                                >= config.dialogue_mask_containment_threshold
+                        })
+                        .min_by_key(|&bubble| detections[bubble].area)
+                };
+                bubble_match.or_else(|| holding_panel(detections, bbox, &panels))
+            }
             "bubble" => holding_panel(detections, bbox, &panels),
             // Untranslated sound effects and other analysis-only regions
             // have scene geometry but do not participate in dialogue order.
@@ -2487,6 +2729,63 @@ fn intersection_over_union(left: [f32; 4], right: [f32; 4]) -> f32 {
 fn intersection_area(left: [f32; 4], right: [f32; 4]) -> f32 {
     (left[2].min(right[2]) - left[0].max(right[0])).max(0.0)
         * (left[3].min(right[3]) - left[1].max(right[1])).max(0.0)
+}
+
+fn intersect_rect(left: [f32; 4], right: [f32; 4]) -> Option<[f32; 4]> {
+    let x1 = left[0].max(right[0]);
+    let y1 = left[1].max(right[1]);
+    let x2 = left[2].min(right[2]);
+    let y2 = left[3].min(right[3]);
+    (x2 > x1 && y2 > y1).then_some([x1, y1, x2, y2])
+}
+
+fn union_rect_area(rects: &[[f32; 4]]) -> f32 {
+    if rects.is_empty() {
+        return 0.0;
+    }
+    if rects.len() == 1 {
+        return area(rects[0]);
+    }
+    let mut xs: Vec<f32> = Vec::with_capacity(rects.len() * 2);
+    for rect in rects {
+        xs.push(rect[0]);
+        xs.push(rect[2]);
+    }
+    xs.sort_by(f32::total_cmp);
+    xs.dedup();
+    let mut total = 0.0_f32;
+    let mut ys: Vec<(f32, f32)> = Vec::with_capacity(rects.len());
+    for pair in xs.windows(2) {
+        let (x1, x2) = (pair[0], pair[1]);
+        if x2 <= x1 {
+            continue;
+        }
+        ys.clear();
+        for rect in rects {
+            if rect[0] <= x1 && rect[2] >= x2 {
+                ys.push((rect[1], rect[3]));
+            }
+        }
+        if ys.is_empty() {
+            continue;
+        }
+        ys.sort_by(|a, b| a.0.total_cmp(&b.0).then_with(|| a.1.total_cmp(&b.1)));
+        let mut covered_y = 0.0_f32;
+        let mut cur_start = ys[0].0;
+        let mut cur_end = ys[0].1;
+        for &(start, end) in &ys[1..] {
+            if start <= cur_end {
+                cur_end = cur_end.max(end);
+            } else {
+                covered_y += cur_end - cur_start;
+                cur_start = start;
+                cur_end = end;
+            }
+        }
+        covered_y += cur_end - cur_start;
+        total += (x2 - x1) * covered_y;
+    }
+    total
 }
 
 fn area(bounds: [f32; 4]) -> f32 {
