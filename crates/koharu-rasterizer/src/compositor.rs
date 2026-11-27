@@ -327,8 +327,17 @@ impl GpuCompositor {
         self.images.contains_key(&id)
     }
 
+    fn touch_tile(&mut self, id: ResourceId) -> bool {
+        self.image_clock = self.image_clock.wrapping_add(1);
+        let Some(cached) = self.images.get_mut(&id) else {
+            return false;
+        };
+        cached.last_used = self.image_clock;
+        true
+    }
+
     #[cfg(target_arch = "wasm32")]
-    pub fn cache_external_raster(
+    pub async fn cache_external_raster(
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
@@ -347,61 +356,57 @@ impl GpuCompositor {
             )));
         }
         let limit = device.limits().max_texture_dimension_2d;
-        for tile in tiles {
-            let id = tile.id(source);
-            let (width, height) = tile.resource_size();
-            let (x, y) = tile.source_origin();
-            if width > limit || height > limit {
-                return Err(Error::invalid(format!(
-                    "raster tile {width}x{height} exceeds the device limit {limit}"
-                )));
-            }
-            if x.saturating_add(width) > source_size.0 || y.saturating_add(height) > source_size.1 {
-                return Err(Error::invalid(
-                    "raster tile crop exceeds its encoded source",
-                ));
-            }
-            self.image_clock = self.image_clock.wrapping_add(1);
-            if let Some(cached) = self.images.get_mut(&id) {
-                cached.last_used = self.image_clock;
-                continue;
-            }
-            let mut texture = create_texture(
-                device,
-                "koharu decoded browser raster tile",
-                width,
-                height,
-                Some(source),
-            );
-            queue.copy_external_image_to_texture(
-                &wgpu::CopyExternalImageSourceInfo {
-                    source: image.clone(),
-                    origin: wgpu::Origin2d { x, y },
-                    flip_y: false,
-                },
-                wgpu::CopyExternalImageDestInfo {
-                    texture: &texture.texture,
-                    mip_level: 0,
-                    origin: wgpu::Origin3d::ZERO,
-                    aspect: wgpu::TextureAspect::All,
-                    color_space: wgpu::PredefinedColorSpace::Srgb,
-                    premultiplied_alpha: true,
-                },
-                wgpu::Extent3d {
+        self.cache_uploads(
+            device,
+            queue,
+            tiles,
+            |tile| tile.id(source),
+            |tile| {
+                let (width, height) = tile.resource_size();
+                let (x, y) = tile.source_origin();
+                if width > limit || height > limit {
+                    return Err(Error::invalid(format!(
+                        "raster tile {width}x{height} exceeds the device limit {limit}"
+                    )));
+                }
+                if x.saturating_add(width) > source_size.0
+                    || y.saturating_add(height) > source_size.1
+                {
+                    return Err(Error::invalid(
+                        "raster tile crop exceeds its encoded source",
+                    ));
+                }
+                let texture = create_texture(
+                    device,
+                    "koharu decoded browser raster tile",
                     width,
                     height,
-                    depth_or_array_layers: 1,
-                },
-            );
-            texture.last_used = self.image_clock;
-            if let Some(previous) = self.images.insert(id, texture) {
-                self.image_bytes = self.image_bytes.saturating_sub(previous.byte_len);
-            }
-            self.image_bytes = self
-                .image_bytes
-                .saturating_add(u64::from(width) * u64::from(height) * 4);
-        }
-        Ok(())
+                    Some(source),
+                );
+                queue.copy_external_image_to_texture(
+                    &wgpu::CopyExternalImageSourceInfo {
+                        source: image.clone(),
+                        origin: wgpu::Origin2d { x, y },
+                        flip_y: false,
+                    },
+                    wgpu::CopyExternalImageDestInfo {
+                        texture: &texture.texture,
+                        mip_level: 0,
+                        origin: wgpu::Origin3d::ZERO,
+                        aspect: wgpu::TextureAspect::All,
+                        color_space: wgpu::PredefinedColorSpace::Srgb,
+                        premultiplied_alpha: true,
+                    },
+                    wgpu::Extent3d {
+                        width,
+                        height,
+                        depth_or_array_layers: 1,
+                    },
+                );
+                Ok(texture)
+            },
+        )
+        .await
     }
 
     fn evict_tile(&mut self, id: ResourceId) -> bool {
@@ -449,6 +454,35 @@ impl GpuCompositor {
         }
     }
 
+    /// Upload CPU-backed tiles asynchronously before drawing in a browser.
+    #[cfg(target_arch = "wasm32")]
+    #[allow(clippy::too_many_arguments)]
+    pub async fn render_async(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        vello: &mut vello::Renderer,
+        target: &wgpu::TextureView,
+        size: (u32, u32),
+        commands: &[CompositionCommand],
+        erase_mask: Option<&Scene>,
+        background: [u8; 4],
+        clip: [u32; 4],
+    ) -> Result<()> {
+        if size.0 != 0 && size.1 != 0 {
+            for command in commands {
+                if let CompositionCommand::Raster(draw) = command {
+                    self.upload(device, queue, &draw.image).await?;
+                }
+            }
+        }
+        self.render(
+            device, queue, vello, target, size, commands, erase_mask, background, clip,
+        )
+    }
+
+    /// Browser rendering uses resident tiles. Await `cache_external_raster` for
+    /// decoded browser images or use `render_async` for CPU-backed images.
     #[allow(clippy::too_many_arguments)]
     pub fn render(
         &mut self,
@@ -464,6 +498,21 @@ impl GpuCompositor {
     ) -> Result<()> {
         if size.0 == 0 || size.1 == 0 {
             return Ok(());
+        }
+        for command in commands {
+            if let CompositionCommand::Raster(draw) = command {
+                #[cfg(not(target_arch = "wasm32"))]
+                vello::util::block_on_wgpu(device, self.upload(device, queue, &draw.image))?;
+                #[cfg(target_arch = "wasm32")]
+                for tile in draw.image.tiles() {
+                    if !self.touch_tile(tile.id()) {
+                        return Err(Error::invalid(format!(
+                            "raster tile {} is not resident; await its upload before drawing",
+                            tile.id()
+                        )));
+                    }
+                }
+            }
         }
         if commands
             .iter()
@@ -490,11 +539,6 @@ impl GpuCompositor {
                 CompositionCommand::Vector(_) => Vec::new(),
             })
             .collect::<HashSet<_>>();
-        for command in commands {
-            if let CompositionCommand::Raster(draw) = command {
-                self.upload(device, queue, &draw.image)?;
-            }
-        }
         if let Some(mask) = erase_mask {
             render_vello(
                 vello,
@@ -692,37 +736,78 @@ impl GpuCompositor {
         self.draws.clear();
     }
 
-    fn upload(
+    async fn upload(
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         image: &RasterImage,
     ) -> Result<()> {
-        for tile in image.tiles() {
-            self.image_clock = self.image_clock.wrapping_add(1);
-            if let Some(cached) = self.images.get_mut(&tile.id()) {
-                cached.last_used = self.image_clock;
-                continue;
+        self.cache_uploads(
+            device,
+            queue,
+            image.tiles(),
+            crate::RasterTile::id,
+            |tile| {
+                let pixels = image.pixels().ok_or_else(|| {
+                    Error::invalid(format!(
+                        "raster tile {} is not resident on the GPU",
+                        tile.id()
+                    ))
+                })?;
+                Self::upload_native_tile(device, queue, image, tile, pixels)
+            },
+        )
+        .await
+    }
+
+    async fn cache_uploads<T>(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        tiles: &[T],
+        id: impl Fn(&T) -> ResourceId,
+        upload: impl Fn(&T) -> Result<CachedTexture>,
+    ) -> Result<()> {
+        let mut missing = tiles
+            .iter()
+            .filter_map(|tile| {
+                let id = id(tile);
+                (!self.touch_tile(id)).then_some((id, tile, self.image_clock))
+            })
+            .peekable();
+        if missing.peek().is_none() {
+            return Ok(());
+        }
+        let pending = checked_gpu(device, || {
+            let mut pending = Vec::new();
+            for (id, tile, last_used) in missing {
+                let mut texture = upload(tile)?;
+                texture.last_used = last_used;
+                pending.push((id, texture));
             }
-            let pixels = image.pixels().ok_or_else(|| {
-                Error::invalid(format!(
-                    "raster tile {} is not resident on the GPU",
-                    tile.id()
-                ))
-            })?;
-            self.upload_native_tile(device, queue, image, tile, pixels)?;
+            // write_texture defers the transfer until the next submit. Keep both
+            // allocation and submission inside the batch's error scopes.
+            queue.submit([]);
+            Result::Ok(pending)
+        })
+        .await
+        .map_err(Error::backend)??;
+        for (id, texture) in pending {
+            self.image_bytes += texture.byte_len;
+            if let Some(previous) = self.images.insert(id, texture) {
+                self.image_bytes -= previous.byte_len;
+            }
         }
         Ok(())
     }
 
     fn upload_native_tile(
-        &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         image: &RasterImage,
         tile: &crate::RasterTile,
         pixels: &[u8],
-    ) -> Result<()> {
+    ) -> Result<CachedTexture> {
         let (image_width, image_height) = image.size();
         let expected = usize::try_from(u64::from(image_width) * u64::from(image_height) * 4)
             .map_err(|_| Error::invalid("raster image byte length exceeds usize"))?;
@@ -732,7 +817,6 @@ impl GpuCompositor {
                 image.source()
             )));
         }
-        let id = tile.id();
         let (width, height) = tile.resource_size();
         let limit = device.limits().max_texture_dimension_2d;
         if width > limit || height > limit {
@@ -740,7 +824,7 @@ impl GpuCompositor {
                 "raster image {width}x{height} exceeds the device limit {limit}"
             )));
         }
-        let mut texture = create_texture(
+        let texture = create_texture(
             device,
             "koharu decoded native raster tile",
             width,
@@ -776,15 +860,35 @@ impl GpuCompositor {
                 depth_or_array_layers: 1,
             },
         );
-        texture.byte_len = u64::try_from(expected).unwrap_or(u64::MAX);
-        texture.last_used = self.image_clock;
-        if let Some(previous) = self.images.insert(id, texture) {
-            self.image_bytes = self.image_bytes.saturating_sub(previous.byte_len);
-        }
-        self.image_bytes = self
-            .image_bytes
-            .saturating_add(u64::try_from(expected).unwrap_or(u64::MAX));
-        Ok(())
+        Ok(texture)
+    }
+}
+
+/// wgpu scopes are thread-local. Pop all three before yielding to an executor.
+pub(crate) fn checked_gpu<T>(
+    device: &wgpu::Device,
+    work: impl FnOnce() -> T,
+) -> impl Future<Output = std::result::Result<T, wgpu::Error>> {
+    let memory = device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
+    let internal = device.push_error_scope(wgpu::ErrorFilter::Internal);
+    let validation = device.push_error_scope(wgpu::ErrorFilter::Validation);
+    let result = work();
+    let validation = validation.pop();
+    let internal = internal.pop();
+    let memory = memory.pop();
+    async move { scope_result(result, memory.await, internal.await, validation.await) }
+}
+
+fn scope_result<T>(
+    result: T,
+    memory: Option<wgpu::Error>,
+    internal: Option<wgpu::Error>,
+    validation: Option<wgpu::Error>,
+) -> std::result::Result<T, wgpu::Error> {
+    // An invalid resource can be the consequence of a failed allocation.
+    match memory.or(internal).or(validation) {
+        Some(error) => Err(error),
+        None => Ok(result),
     }
 }
 
@@ -991,4 +1095,152 @@ fn clipped_rect([x, y, width, height]: [u32; 4], size: (u32, u32)) -> [u32; 4] {
         width.min(size.0.saturating_sub(x)),
         height.min(size.1.saturating_sub(y)),
     ]
+}
+
+#[cfg(all(test, feature = "native"))]
+mod tests {
+    use super::*;
+    use crate::{
+        Bounds, LayerId, LayerKind, Point, PreparedContent, PreparedFrame, PreparedFrameBundle,
+        PreparedLayer, PreparedRaster, PreparedRasterTile, PreparedResource, Presentation,
+        Revision, native::tests::with_device,
+    };
+    use std::sync::Arc;
+
+    #[test]
+    fn native_uploads_charge_and_evict_each_tile_with_its_gutters() {
+        let (width, height) = (1025, 2);
+        let resource =
+            PreparedResource::encoded_raster(width, height, "image/png", Arc::from(&b"tiled"[..]))
+                .unwrap();
+        let source = resource.id();
+        let tiles = vec![
+            PreparedRasterTile {
+                x: 0,
+                y: 0,
+                width: 1024,
+                height,
+                gutter: [0, 0, 1, 0],
+            },
+            PreparedRasterTile {
+                x: 1024,
+                y: 0,
+                width: 1,
+                height,
+                gutter: [1, 0, 0, 0],
+            },
+        ];
+        let last = tiles[1].id(source);
+        let bounds = Bounds {
+            x: 0.0,
+            y: 0.0,
+            width: width as f32,
+            height: height as f32,
+        };
+        let frame = PreparedFrameBundle {
+            frame: PreparedFrame {
+                revision: Revision::ZERO,
+                page: LayerId::from_bytes([1; 16]),
+                width,
+                height,
+                origin: (0, 0),
+                normalization: Affine::IDENTITY.as_coeffs(),
+                layers: vec![PreparedLayer {
+                    id: LayerId::from_bytes([2; 16]),
+                    geometry: vec![
+                        Point { x: 0.0, y: 0.0 },
+                        Point { x: 1025.0, y: 0.0 },
+                        Point { x: 0.0, y: 2.0 },
+                    ],
+                    bounds,
+                    local_bounds: bounds,
+                    presentation: Presentation {
+                        visible: true,
+                        opacity: 1.0,
+                    },
+                    kind: LayerKind::Raster,
+                    placement: Affine::IDENTITY.as_coeffs(),
+                    content: PreparedContent::Raster(PreparedRaster {
+                        source,
+                        width,
+                        height,
+                        tiles,
+                    }),
+                    element_frame: None,
+                }],
+            },
+            resources: vec![resource],
+        }
+        .into_frame_with_raster_sources(&HashMap::from([(
+            source,
+            Arc::from(vec![255; (width * height * 4) as usize]),
+        )]))
+        .unwrap();
+        let image = frame.layers()[0].raster_image().unwrap();
+        with_device(|device, queue| {
+            let full = 1025 * 2 * 4;
+            let edge = 2 * 2 * 4;
+            let mut compositor = GpuCompositor::with_cache_budget(device, full + edge);
+            for _ in 0..2 {
+                pollster::block_on(compositor.upload(device, queue, image)).unwrap();
+                compositor.trim_cache();
+                assert_eq!(compositor.cached_resource_bytes(), full + edge);
+                assert_eq!(compositor.cached_resource_count(), 2);
+            }
+            compositor.set_cache_budget(edge);
+            assert!(compositor.is_tile_cached(last));
+            assert_eq!(compositor.cached_resource_bytes(), edge);
+            assert!(compositor.evict_source(source));
+            assert_eq!(compositor.cached_resource_bytes(), 0);
+        });
+    }
+
+    #[test]
+    fn allocation_failure_takes_precedence_over_consequential_errors() {
+        let memory = wgpu::Error::OutOfMemory {
+            source: "allocation failed".into(),
+        };
+        let validation = wgpu::Error::Validation {
+            source: "invalid texture".into(),
+            description: "invalid texture view".into(),
+        };
+        let internal = wgpu::Error::Internal {
+            source: "invalid texture".into(),
+            description: "upload failed".into(),
+        };
+        let result = scope_result((), Some(memory), Some(internal), Some(validation));
+        assert!(matches!(result, Err(wgpu::Error::OutOfMemory { .. })));
+    }
+
+    #[test]
+    fn rejected_upload_batch_can_be_retried_without_invalid_cached_tiles() {
+        with_device(|device, queue| {
+            let mut compositor = GpuCompositor::new(device);
+            let tiles = [
+                ResourceId::from_bytes([1; 32]),
+                ResourceId::from_bytes([2; 32]),
+            ];
+            let upload = |width| create_texture(device, "validation test tile", width, 1, None);
+            let failed = pollster::block_on(compositor.cache_uploads(
+                device,
+                queue,
+                &tiles,
+                |id| *id,
+                |id| Ok(upload(u32::from(*id == tiles[0]))),
+            ));
+            assert!(matches!(failed, Err(Error::Backend(_))));
+            assert_eq!(compositor.cached_resource_count(), 0);
+            assert_eq!(compositor.cached_resource_bytes(), 0);
+            pollster::block_on(compositor.cache_uploads(
+                device,
+                queue,
+                &tiles,
+                |id| *id,
+                |_| Ok(upload(1)),
+            ))
+            .unwrap();
+            assert_eq!(compositor.cached_resource_count(), 2);
+            assert_eq!(compositor.cached_resource_bytes(), 8);
+        });
+    }
 }

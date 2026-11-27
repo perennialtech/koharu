@@ -3,16 +3,16 @@
 use std::{collections::HashMap, sync::Arc};
 
 use vello::{
-    FontEmbolden, Glyph, Scene,
-    kurbo::{Affine, BezPath, Diagonal2, Join, Rect},
+    DrawGlyphs, Glyph, Scene,
+    kurbo::{Affine, BezPath, Join, Rect, Stroke},
     peniko::{Blob, Color, Fill, FontData, Mix},
 };
 
 use crate::{
     Bounds, CompositionCommand, Error, FillRule, LayerId, LayerKind, PathElement, PreparedContent,
-    PreparedElementFrame, PreparedFrame, PreparedFrameBundle, PreparedFrameManifest, PreparedPath,
-    PreparedResource, PreparedResourceStore, PreparedScene, PreparedSceneCommand, Presentation,
-    RasterDraw, ResourceId, Result, Revision,
+    PreparedElementFrame, PreparedFrame, PreparedFrameBundle, PreparedFrameManifest, PreparedGlyph,
+    PreparedGlyphRun, PreparedPath, PreparedResource, PreparedResourceStore, PreparedScene,
+    PreparedSceneCommand, Presentation, RasterDraw, ResourceId, Result, Revision,
 };
 
 #[derive(Clone)]
@@ -350,7 +350,13 @@ fn compile_frame(
     let mut font_blobs = HashMap::new();
     let mut layers = Vec::with_capacity(frame.layers.len());
     let mut layer_index = HashMap::with_capacity(frame.layers.len());
+    let normalization = Affine::new(frame.normalization);
+    let viewport = Rect::from_origin_size(
+        (0.0, 0.0),
+        (f64::from(frame.width), f64::from(frame.height)),
+    );
     for prepared in frame.layers {
+        let placement = Affine::new(prepared.placement);
         let (scene, image) = match &prepared.content {
             PreparedContent::Raster(raster) => {
                 let Some(PreparedResource::EncodedRaster { width, height, .. }) =
@@ -409,10 +415,25 @@ fn compile_frame(
                     }),
                 )
             }
-            PreparedContent::Vector(prepared_scene) => (
-                compile_scene(prepared_scene, resources, &mut font_blobs)?,
-                None,
-            ),
+            PreparedContent::Vector(prepared_scene) => {
+                // Vello requires a clip for an opacity layer. Include the entire
+                // visible frame so layout bounds cannot cut off overhanging ink.
+                let bounds = prepared.local_bounds;
+                let mut clip = Rect::from_origin_size(
+                    (f64::from(bounds.x), f64::from(bounds.y)),
+                    (f64::from(bounds.width), f64::from(bounds.height)),
+                );
+                let visible = (normalization * placement)
+                    .inverse()
+                    .transform_rect_bbox(viewport.inflate(1.0, 1.0));
+                if visible.is_finite() {
+                    clip = clip.union(visible);
+                }
+                (
+                    compile_scene(prepared_scene, clip, resources, &mut font_blobs)?,
+                    None,
+                )
+            }
         };
         let layer = Layer(Arc::new(LayerData {
             id: prepared.id,
@@ -421,7 +442,7 @@ fn compile_frame(
             local_bounds: prepared.local_bounds,
             presentation: prepared.presentation,
             kind: prepared.kind,
-            placement: Affine::new(prepared.placement),
+            placement,
             scene: Arc::new(scene),
             image,
             element_frame: prepared.element_frame,
@@ -435,7 +456,7 @@ fn compile_frame(
         width: frame.width,
         height: frame.height,
         origin: frame.origin,
-        normalization: Affine::new(frame.normalization),
+        normalization,
         layers: layers.into(),
         layer_index,
     })))
@@ -443,6 +464,7 @@ fn compile_frame(
 
 fn compile_scene(
     prepared: &PreparedScene,
+    clip: Rect,
     resources: &HashMap<ResourceId, &PreparedResource>,
     font_blobs: &mut HashMap<ResourceId, Blob<u8>>,
 ) -> Result<Scene> {
@@ -462,34 +484,7 @@ fn compile_scene(
                     .or_insert_with(|| Blob::new(Arc::new(Arc::clone(bytes))))
                     .clone();
                 let font = FontData::new(blob, prepared.font_index);
-                let mut run = scene
-                    .draw_glyphs(&font)
-                    .font_size(prepared.font_size)
-                    .transform(Affine::new(prepared.transform))
-                    .hint(prepared.hint);
-                if !prepared.normalized_coords.is_empty() {
-                    run = run.normalized_coords(&prepared.normalized_coords);
-                }
-                if let Some(transform) = prepared.glyph_transform {
-                    run = run.glyph_transform(Some(Affine::new(transform)));
-                }
-                if prepared.embolden != [0.0, 0.0] {
-                    // Round joins avoid the long miter spikes a dilated outline can otherwise
-                    // produce at sharp glyph corners once the border width is large.
-                    run = run.font_embolden(
-                        FontEmbolden::new(Diagonal2::new(
-                            f64::from(prepared.embolden[0]),
-                            f64::from(prepared.embolden[1]),
-                        ))
-                        .with_join(Join::Round),
-                    );
-                }
-                let glyphs = prepared.glyphs.iter().map(|glyph| Glyph {
-                    id: glyph.id,
-                    x: glyph.x,
-                    y: glyph.y,
-                });
-                run.brush(rgba(prepared.color)).draw(Fill::NonZero, glyphs);
+                prepared.paint(&mut scene, &font, clip);
             }
             PreparedSceneCommand::FillPath(prepared) => {
                 let path = compile_path(prepared);
@@ -507,6 +502,83 @@ fn compile_scene(
         }
     }
     Ok(scene)
+}
+
+impl PreparedGlyphRun {
+    fn paint(&self, scene: &mut Scene, font: &FontData, clip: Rect) {
+        let color = rgba(self.color);
+        let fill = |scene: &mut Scene, glyphs: &[PreparedGlyph]| {
+            if !glyphs.is_empty() {
+                self.draw_glyphs(scene, font, color).draw(
+                    Fill::NonZero,
+                    glyphs.iter().map(|glyph| Glyph {
+                        id: glyph.id,
+                        x: glyph.x,
+                        y: glyph.y,
+                    }),
+                );
+            }
+        };
+        // A round stroke has one radius, so use the larger extent for an anisotropic packet.
+        let radius = self.embolden[0].max(self.embolden[1]);
+        if radius == 0.0 {
+            fill(scene, &self.glyphs);
+            return;
+        }
+        let stroke = Stroke::new(2.0 * f64::from(radius)).with_join(Join::Round);
+        let alpha = color.components[3];
+        let opaque = color.with_alpha(1.0);
+
+        // Vello retains contiguous outlines as glyph runs and expands COLR and
+        // bitmap glyphs into paths and images for this font and strike size.
+        let mut filled = Scene::new();
+        fill(&mut filled, &self.glyphs);
+        let resources = &filled.encoding().resources;
+        if resources.glyphs.is_empty() {
+            scene.append(&filled, None);
+            return;
+        }
+        let mut remaining = self.glyphs.as_slice();
+        for run in &resources.glyph_runs {
+            let outlines = &resources.glyphs[run.glyphs.clone()];
+            let color_count = remaining
+                .iter()
+                .take_while(|g| g.id != outlines[0].id)
+                .count();
+            let (colors, rest) = remaining.split_at(color_count);
+            fill(scene, colors);
+            remaining = &rest[outlines.len()..];
+
+            // Paint alpha applies once to the union of the outline fill and stroke.
+            if alpha < 1.0 {
+                scene.push_layer(Fill::NonZero, Mix::Normal, alpha, Affine::IDENTITY, &clip);
+            }
+            self.draw_glyphs(scene, font, opaque)
+                .draw(Fill::NonZero, outlines.iter().copied());
+            self.draw_glyphs(scene, font, opaque)
+                .draw(&stroke, outlines.iter().copied());
+            if alpha < 1.0 {
+                scene.pop_layer();
+            }
+        }
+        fill(scene, remaining);
+    }
+
+    fn draw_glyphs<'a>(
+        &self,
+        scene: &'a mut Scene,
+        font: &FontData,
+        color: Color,
+    ) -> DrawGlyphs<'a> {
+        scene
+            .draw_glyphs(font)
+            .font_size(self.font_size)
+            .transform(Affine::new(self.transform))
+            .glyph_transform(self.glyph_transform.map(Affine::new))
+            .hint(self.hint)
+            .normalized_coords(&self.normalized_coords)
+            .brush(color)
+    }
 }
 
 fn compile_path(prepared: &PreparedPath) -> BezPath {

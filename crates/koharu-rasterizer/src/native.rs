@@ -1,6 +1,14 @@
 //! Reusable native WGPU readback and export supersampling.
 
-use std::sync::mpsc;
+use std::{
+    num::NonZeroUsize,
+    panic::{AssertUnwindSafe, catch_unwind, resume_unwind},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    },
+};
 
 use anyhow::{Context, Result as AnyResult, anyhow, bail};
 use fast_image_resize::{
@@ -117,8 +125,50 @@ impl Raster {
     }
 }
 
+#[derive(Clone)]
+struct GpuDevice {
+    raw: wgpu::Device,
+    retired: Arc<AtomicBool>,
+}
+
+impl GpuDevice {
+    fn check_live(&self) -> AnyResult<()> {
+        if self.retired.load(Ordering::Acquire) {
+            bail!("WGPU device lost or retired");
+        }
+        Ok(())
+    }
+
+    fn checked<T>(&self, work: impl FnOnce() -> AnyResult<T>) -> AnyResult<T> {
+        self.check_live()?;
+        // wgpu can panic in poll on a driver reset after firing the loss callback.
+        let result = pollster::block_on(crate::compositor::checked_gpu(&self.raw, || {
+            catch_unwind(AssertUnwindSafe(work))
+        }));
+        let result = match result {
+            Err(error) => Err(error.into()),
+            Ok(Ok(result)) => result,
+            Ok(Err(panic)) => {
+                self.check_live()?;
+                resume_unwind(panic)
+            }
+        };
+        if let Err(error) = &result {
+            // Vello and the compositor retain buffers and bind groups. A failed
+            // GPU operation can leave those resources invalid on a live device.
+            if !matches!(error.downcast_ref::<Error>(), Some(Error::Invalid(_))) {
+                self.retired.store(true, Ordering::Release);
+            }
+        } else {
+            self.check_live()?;
+        }
+        result
+    }
+}
+
 struct GpuState {
-    device: wgpu::Device,
+    device: GpuDevice,
+    limits: wgpu::Limits,
     queue: wgpu::Queue,
     renderer: vello::Renderer,
     compositor: GpuCompositor,
@@ -134,34 +184,120 @@ struct RenderTarget {
     readback: Buffer,
 }
 
+impl GpuState {
+    fn new() -> AnyResult<Self> {
+        let (raw, queue) = pollster::block_on(request_device())?;
+        let retired = Arc::new(AtomicBool::new(false));
+        raw.set_device_lost_callback({
+            let retired = Arc::clone(&retired);
+            move |_, _| retired.store(true, Ordering::Release)
+        });
+        let device = GpuDevice { raw, retired };
+        let (renderer, compositor) = device.checked(|| {
+            let renderer = vello::Renderer::new(
+                &device.raw,
+                RendererOptions {
+                    antialiasing_support: AaSupport::area_only(),
+                    // Shader creation must use the thread that owns the error scopes.
+                    num_init_threads: Some(NonZeroUsize::MIN),
+                    ..Default::default()
+                },
+            )
+            .context("failed to create Vello renderer")?;
+            Ok((renderer, GpuCompositor::new(&device.raw)))
+        })?;
+        Ok(Self {
+            limits: device.raw.limits(),
+            device,
+            queue,
+            renderer,
+            compositor,
+            targets: Vec::new(),
+        })
+    }
+
+    fn take_target(&mut self, width: u32, height: u32) -> AnyResult<RenderTarget> {
+        if let Some(index) = self
+            .targets
+            .iter()
+            .position(|target| target.width == width && target.height == height)
+        {
+            return Ok(self.targets.swap_remove(index));
+        }
+        let limit = self.limits.max_texture_dimension_2d;
+        if width > limit || height > limit {
+            bail!("render surface {width}x{height} exceeds the device limit {limit}");
+        }
+        let padded_width = width
+            .checked_mul(4)
+            .and_then(|bytes| bytes.checked_next_multiple_of(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT))
+            .context("render target row size overflow")?;
+        let buffer_size = u64::from(padded_width)
+            .checked_mul(u64::from(height))
+            .context("render target buffer size overflow")?;
+        let limit = self.limits.max_buffer_size;
+        if buffer_size > limit {
+            bail!(
+                "readback buffer requires {buffer_size} bytes, exceeding the device limit {limit}"
+            );
+        }
+        self.device.checked(|| {
+            Ok(RenderTarget::new(
+                &self.device.raw,
+                width,
+                height,
+                padded_width,
+                buffer_size,
+            ))
+        })
+    }
+}
+
+struct Worker {
+    generation: u64,
+    state: Option<GpuState>,
+}
+
+impl Worker {
+    fn current(&mut self) -> AnyResult<(u64, &mut GpuState)> {
+        if self
+            .state
+            .as_ref()
+            .is_none_or(|gpu| gpu.device.retired.load(Ordering::Acquire))
+        {
+            // Release the old renderer, tile cache, and pool before allocating replacements.
+            self.state = None;
+            self.state = Some(GpuState::new()?);
+            self.generation += 1;
+        }
+        Ok((
+            self.generation,
+            self.state.as_mut().expect("device initialized"),
+        ))
+    }
+
+    fn return_target(&mut self, generation: u64, target: RenderTarget) {
+        if self.generation == generation
+            && let Some(gpu) = &mut self.state
+            && !gpu.device.retired.load(Ordering::Acquire)
+            && gpu.targets.len() < 4
+        {
+            gpu.targets.push(target);
+        }
+    }
+}
+
 /// Reusable headless Vello renderer with a bounded readback-target pool.
 pub struct Rasterizer {
-    gpu: Mutex<GpuState>,
+    gpu: Mutex<Worker>,
 }
 
 impl Rasterizer {
     pub fn new() -> Result<Self> {
-        Self::try_new().map_err(Error::backend)
-    }
-
-    fn try_new() -> AnyResult<Self> {
-        let (device, queue) = pollster::block_on(request_device())?;
-        let renderer = vello::Renderer::new(
-            &device,
-            RendererOptions {
-                antialiasing_support: AaSupport::area_only(),
-                ..Default::default()
-            },
-        )
-        .map_err(|error| anyhow!("failed to create Vello renderer: {error:?}"))?;
-        let compositor = GpuCompositor::new(&device);
         Ok(Self {
-            gpu: Mutex::new(GpuState {
-                device,
-                queue,
-                renderer,
-                compositor,
-                targets: Vec::new(),
+            gpu: Mutex::new(Worker {
+                generation: 1,
+                state: Some(GpuState::new().map_err(Error::backend)?),
             }),
         })
     }
@@ -286,56 +422,20 @@ impl Rasterizer {
         width: u32,
         height: u32,
     ) -> AnyResult<Vec<u8>> {
-        let size = Extent3d {
-            width,
-            height,
-            depth_or_array_layers: 1,
-        };
-        let (device, submission, target) = {
-            let mut gpu = self.gpu.lock();
-            let GpuState {
-                device,
-                queue,
-                renderer,
-                compositor,
-                targets,
-            } = &mut *gpu;
-            let device = device.clone();
-            check_device_limit(&device, width, height)?;
-            let target = take_target(targets, &device, width, height)?;
-            compositor
-                .render(
-                    &device,
-                    queue,
-                    renderer,
-                    &target.view,
-                    (width, height),
-                    commands,
-                    None,
-                    [0, 0, 0, 0],
-                    [0, 0, width, height],
-                )
-                .map_err(|error| anyhow!(error.to_string()))?;
-            let mut encoder = device.create_command_encoder(&CommandEncoderDescriptor {
-                label: Some("koharu frame readback encoder"),
-            });
-            encoder.copy_texture_to_buffer(
-                target.texture.as_image_copy(),
-                TexelCopyBufferInfo {
-                    buffer: &target.readback,
-                    layout: wgpu::TexelCopyBufferLayout {
-                        offset: 0,
-                        bytes_per_row: Some(target.padded_width),
-                        rows_per_image: None,
-                    },
-                },
-                size,
-            );
-            let submission = queue.submit([encoder.finish()]);
-            (device, submission, target)
-        };
         // Compositor targets are premultiplied; native images expose straight RGBA.
-        self.finish_readback(device, submission, target, true)
+        self.readback(width, height, true, |gpu, view| {
+            Ok(gpu.compositor.render(
+                &gpu.device.raw,
+                &gpu.queue,
+                &mut gpu.renderer,
+                view,
+                (width, height),
+                commands,
+                None,
+                [0; 4],
+                [0, 0, width, height],
+            )?)
+        })
     }
 
     fn readback_scene(
@@ -345,29 +445,13 @@ impl Rasterizer {
         height: u32,
         background: [u8; 4],
     ) -> AnyResult<Vec<u8>> {
-        let size = Extent3d {
-            width,
-            height,
-            depth_or_array_layers: 1,
-        };
-        let (device, submission, target) = {
-            let mut gpu = self.gpu.lock();
-            let GpuState {
-                device,
-                queue,
-                renderer,
-                compositor: _,
-                targets,
-            } = &mut *gpu;
-            let device = device.clone();
-            check_device_limit(&device, width, height)?;
-            let target = take_target(targets, &device, width, height)?;
-            renderer
+        self.readback(width, height, false, |gpu, view| {
+            gpu.renderer
                 .render_to_texture(
-                    &device,
-                    queue,
+                    &gpu.device.raw,
+                    &gpu.queue,
                     scene,
-                    &target.view,
+                    view,
                     &RenderParams {
                         base_color: rgba(background),
                         width,
@@ -375,48 +459,73 @@ impl Rasterizer {
                         antialiasing_method: AaConfig::Area,
                     },
                 )
-                .map_err(|error| anyhow!("Vello rendering failed: {error:?}"))?;
-            let mut encoder = device.create_command_encoder(&CommandEncoderDescriptor {
-                label: Some("koharu scene readback encoder"),
-            });
-            encoder.copy_texture_to_buffer(
-                target.texture.as_image_copy(),
-                TexelCopyBufferInfo {
-                    buffer: &target.readback,
-                    layout: wgpu::TexelCopyBufferLayout {
-                        offset: 0,
-                        bytes_per_row: Some(target.padded_width),
-                        rows_per_image: None,
-                    },
-                },
-                size,
-            );
-            let submission = queue.submit([encoder.finish()]);
-            (device, submission, target)
-        };
-        self.finish_readback(device, submission, target, false)
+                .context("Vello rendering failed")
+        })
     }
 
-    fn finish_readback(
+    fn readback(
         &self,
-        device: wgpu::Device,
+        width: u32,
+        height: u32,
+        premultiplied: bool,
+        render: impl FnOnce(&mut GpuState, &TextureView) -> AnyResult<()>,
+    ) -> AnyResult<Vec<u8>> {
+        let (generation, device, target, submission) = {
+            let mut worker = self.gpu.lock();
+            let (generation, gpu) = worker.current()?;
+            let device = gpu.device.clone();
+            let target = gpu.take_target(width, height)?;
+            device.checked(|| render(gpu, &target.view))?;
+            let submission = device.checked(|| {
+                let mut encoder = device
+                    .raw
+                    .create_command_encoder(&CommandEncoderDescriptor {
+                        label: Some("koharu readback encoder"),
+                    });
+                encoder.copy_texture_to_buffer(
+                    target.texture.as_image_copy(),
+                    TexelCopyBufferInfo {
+                        buffer: &target.readback,
+                        layout: wgpu::TexelCopyBufferLayout {
+                            offset: 0,
+                            bytes_per_row: Some(target.padded_width),
+                            rows_per_image: None,
+                        },
+                    },
+                    target.texture.size(),
+                );
+                Ok(gpu.queue.submit([encoder.finish()]))
+            })?;
+            (generation, device, target, submission)
+        };
+        let pixels = device.checked(|| target.read_pixels(&device, submission, premultiplied))?;
+        self.gpu.lock().return_target(generation, target);
+        Ok(pixels)
+    }
+}
+
+impl RenderTarget {
+    fn read_pixels(
+        &self,
+        device: &GpuDevice,
         submission: wgpu::SubmissionIndex,
-        target: RenderTarget,
         premultiplied: bool,
     ) -> AnyResult<Vec<u8>> {
-        let width = target.width;
-        let height = target.height;
-        let slice = target.readback.slice(..);
+        let width = self.width;
+        let height = self.height;
+        let slice = self.readback.slice(..);
         let (sender, receiver) = mpsc::sync_channel(1);
         slice.map_async(wgpu::MapMode::Read, move |result| {
             let _ = sender.send(result);
         });
         device
+            .raw
             .poll(wgpu::PollType::Wait {
                 submission_index: Some(submission),
                 timeout: None,
             })
             .map_err(|error| anyhow!("WGPU device polling failed: {error:?}"))?;
+        device.check_live()?;
         receiver
             .recv()
             .context("WGPU closed the readback channel")?
@@ -427,7 +536,7 @@ impl Rasterizer {
         let row_len = (width * 4) as usize;
         let mut pixels = Vec::with_capacity(row_len * height as usize);
         for row in mapped
-            .chunks_exact(target.padded_width as usize)
+            .chunks_exact(self.padded_width as usize)
             .take(height as usize)
         {
             let start = pixels.len();
@@ -449,11 +558,7 @@ impl Rasterizer {
             }
         }
         drop(mapped);
-        target.readback.unmap();
-        let mut gpu = self.gpu.lock();
-        if gpu.targets.len() < 4 {
-            gpu.targets.push(target);
-        }
+        self.readback.unmap();
         Ok(pixels)
     }
 }
@@ -498,29 +603,14 @@ fn checked_surface(width: u32, height: u32) -> AnyResult<()> {
     Ok(())
 }
 
-fn check_device_limit(device: &wgpu::Device, width: u32, height: u32) -> AnyResult<()> {
-    let limit = device.limits().max_texture_dimension_2d;
-    if width > limit || height > limit {
-        bail!("render surface {width}x{height} exceeds the device limit {limit}");
-    }
-    Ok(())
-}
-
-fn take_target(
-    targets: &mut Vec<RenderTarget>,
-    device: &wgpu::Device,
-    width: u32,
-    height: u32,
-) -> AnyResult<RenderTarget> {
-    targets
-        .iter()
-        .position(|target| target.width == width && target.height == height)
-        .map(|position| targets.swap_remove(position))
-        .map_or_else(|| RenderTarget::new(device, width, height), Ok)
-}
-
 impl RenderTarget {
-    fn new(device: &wgpu::Device, width: u32, height: u32) -> AnyResult<Self> {
+    fn new(
+        device: &wgpu::Device,
+        width: u32,
+        height: u32,
+        padded_width: u32,
+        buffer_size: u64,
+    ) -> Self {
         let size = Extent3d {
             width,
             height,
@@ -540,27 +630,20 @@ impl RenderTarget {
             view_formats: &[],
         });
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-        let row_bytes = width
-            .checked_mul(4)
-            .context("render target row size overflow")?;
-        let padded_width = row_bytes.next_multiple_of(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT);
-        let buffer_size = u64::from(padded_width)
-            .checked_mul(u64::from(height))
-            .context("render target buffer size overflow")?;
         let readback = device.create_buffer(&BufferDescriptor {
             label: Some("koharu rasterizer readback"),
             size: buffer_size,
             usage: BufferUsages::MAP_READ | BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        Ok(Self {
+        Self {
             width,
             height,
             padded_width,
             texture,
             view,
             readback,
-        })
+        }
     }
 }
 
@@ -596,4 +679,81 @@ fn finish_raster(
 
 fn rgba([r, g, b, a]: [u8; 4]) -> Color {
     Color::from_rgba8(r, g, b, a)
+}
+
+#[cfg(test)]
+pub(super) mod tests {
+    use super::*;
+    use std::sync::LazyLock;
+
+    static RASTERIZER: LazyLock<Rasterizer> = LazyLock::new(|| Rasterizer::new().unwrap());
+
+    pub(crate) fn with_device(work: impl FnOnce(&wgpu::Device, &wgpu::Queue)) {
+        let mut worker = RASTERIZER.gpu.lock();
+        let (_, gpu) = worker.current().unwrap();
+        work(&gpu.device.raw, &gpu.queue);
+    }
+
+    #[test]
+    fn an_oversized_padded_readback_preserves_the_device_generation() {
+        static LIMITED: LazyLock<Rasterizer> = LazyLock::new(|| Rasterizer::new().unwrap());
+        let (generation, device) = {
+            let mut worker = LIMITED.gpu.lock();
+            let (generation, gpu) = worker.current().unwrap();
+            gpu.limits.max_buffer_size = 512;
+            (generation, gpu.device.clone())
+        };
+
+        let render = |height| {
+            LIMITED.rasterize_scene(
+                &Scene::new(),
+                1,
+                height,
+                [12, 34, 56, 255],
+                RasterOptions::default(),
+            )
+        };
+        let error = render(3).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("readback buffer requires 768 bytes")
+        );
+        device.check_live().unwrap();
+        assert_eq!(render(2).unwrap().get_pixel(0, 1).0, [12, 34, 56, 255]);
+        assert_eq!(LIMITED.gpu.lock().generation, generation);
+    }
+
+    #[test]
+    fn a_lost_device_is_replaced_before_render_and_rejects_old_targets() {
+        let (generation, old_target) = {
+            let mut worker = RASTERIZER.gpu.lock();
+            let (generation, gpu) = worker.current().unwrap();
+            let target = gpu.take_target(5, 3).unwrap();
+            gpu.device.raw.destroy();
+            gpu.device
+                .raw
+                .poll(wgpu::PollType::wait_indefinitely())
+                .unwrap();
+            assert!(gpu.device.retired.load(Ordering::Acquire));
+            (generation, target)
+        };
+
+        let image = RASTERIZER
+            .rasterize_scene(
+                &Scene::new(),
+                2,
+                2,
+                [12, 34, 56, 255],
+                RasterOptions::default(),
+            )
+            .unwrap();
+        assert_eq!(image.get_pixel(1, 1).0, [12, 34, 56, 255]);
+        let mut worker = RASTERIZER.gpu.lock();
+        assert_eq!(worker.generation, generation + 1);
+        worker.return_target(generation, old_target);
+        let targets = &worker.state.as_ref().unwrap().targets;
+        assert_eq!(targets.len(), 1);
+        assert_eq!((targets[0].width, targets[0].height), (2, 2));
+    }
 }
