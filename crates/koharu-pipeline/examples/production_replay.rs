@@ -23,7 +23,9 @@ use image::{
     ExtendedColorType, GrayImage, ImageFormat, RgbImage, codecs::jpeg::JpegEncoder, imageops,
 };
 use koharu_ml::koharu_layout_rfdetr_seg_2xl::KoharuLayoutMask;
-use koharu_pipeline::{DetectionFusionConfig, InferredTypography, replay_detection_page};
+use koharu_pipeline::{
+    DetectionFusionConfig, InferredTypography, ReplayedDetectionPage, replay_detection_page,
+};
 use koharu_scene::WritingMode;
 use rayon::prelude::*;
 use serde::Serialize;
@@ -194,10 +196,10 @@ struct Typography {
 
 #[tokio::main(worker_threads = 2)]
 async fn main() -> Result<()> {
-    run(Args::parse())
+    run(Args::parse()).await
 }
 
-fn run(args: Args) -> Result<()> {
+async fn run(args: Args) -> Result<()> {
     ensure!(
         (0.0..=1.0).contains(&args.bubble_threshold),
         "bubble threshold must be between 0 and 1"
@@ -245,12 +247,6 @@ fn run(args: Args) -> Result<()> {
     } else {
         None
     };
-    // Rendering submits work to the global Rayon pool from Tokio. Audit pages
-    // run in a separate pool so blocking for the render cannot starve it.
-    let audit_pool = auditor
-        .as_ref()
-        .map(|_| rayon::ThreadPoolBuilder::new().build())
-        .transpose()?;
     let out = BufWriter::new(
         File::create(&args.out)
             .with_context(|| format!("failed to create {}", args.out.display()))?,
@@ -268,7 +264,11 @@ fn run(args: Args) -> Result<()> {
     let mut batch = Vec::new();
     let (mut seen, mut written, mut missing) = (0, 0, 0);
     let limit = args.max_pages.unwrap_or(usize::MAX);
-    let batch_size = args.batch_size as usize;
+    let batch_size = if auditor.is_some() {
+        (args.batch_size as usize).min(8)
+    } else {
+        args.batch_size as usize
+    };
     for dump in dumps {
         let mut lines = dump_reader(&dump)?.lines().enumerate();
         while seen < limit {
@@ -287,22 +287,23 @@ fn run(args: Args) -> Result<()> {
             if batch.is_empty() {
                 break;
             }
-            let replay_batch = || {
-                batch
-                    .par_iter()
-                    .map(|(number, line)| {
-                        replay_line(line, &images, &args, &config, auditor.as_ref())
-                            .with_context(|| format!("{}:{number}", dump.display()))
-                    })
-                    .collect::<Vec<_>>()
-            };
-            let records = match &audit_pool {
-                Some(pool) => pool.install(replay_batch),
-                None => replay_batch(),
-            };
+            let records: Vec<_> = batch
+                .par_iter()
+                .map(|(_, line)| replay_line(line, &images, &args, &config))
+                .collect();
             let out = writer.stream();
-            for record in records {
-                if let Some(record) = record? {
+            for ((number, _), record) in batch.iter().zip(records) {
+                let context = || format!("{}:{number}", dump.display());
+                if let Some((mut record, render_input)) = record.with_context(context)? {
+                    if let (Some(auditor), Some((image, page))) = (&auditor, render_input) {
+                        let started = Instant::now();
+                        record.render_audit = Some(
+                            render::measure_page(auditor, &image, &page)
+                                .await
+                                .with_context(context)?,
+                        );
+                        record.elapsed_ms += started.elapsed().as_secs_f64() * 1000.0;
+                    }
                     serde_json::to_writer(&mut *out, &record)?;
                     out.write_all(b"\n")?;
                     written += 1;
@@ -339,13 +340,14 @@ impl Output {
     }
 }
 
+type ReplayedRecord<'a> = (PageRecord<'a>, Option<(RgbImage, ReplayedDetectionPage)>);
+
 fn replay_line<'a>(
     line: &str,
     images: &ImageDirectory<'_>,
     args: &'a Args,
     config: &DetectionFusionConfig,
-    auditor: Option<&RenderAuditor>,
-) -> Result<Option<PageRecord<'a>>> {
+) -> Result<Option<ReplayedRecord<'a>>> {
     let started = Instant::now();
     let raw: RawDumpLine = serde_json::from_str(line).context("invalid raw detection record")?;
     let file_name = raw.file_name.clone();
@@ -474,10 +476,7 @@ fn replay_line<'a>(
             })
         })
         .collect::<Result<_>>()?;
-    let render_audit = auditor
-        .map(|auditor| auditor.measure(&image, &page))
-        .transpose()?;
-    Ok(Some(PageRecord {
+    let record = PageRecord {
         schema_version: 1,
         build_sha: &args.build_sha,
         perturb: args.perturb,
@@ -499,8 +498,9 @@ fn replay_line<'a>(
             .count() as u32,
         counts,
         regions,
-        render_audit,
-    }))
+        render_audit: None,
+    };
+    Ok(Some((record, args.render_audit.then_some((image, page)))))
 }
 
 struct ImageDirectory<'a> {
@@ -701,7 +701,8 @@ mod tests {
             emit_mask_rle: false,
             perturb: Perturb::None,
             render_audit: false,
-        })?;
+        })
+        .await?;
         let records: Vec<Value> = dump_reader(&output)?
             .lines()
             .map(|line| Ok(serde_json::from_str(&line?)?))
@@ -712,6 +713,75 @@ mod tests {
         assert_eq!(records[0]["sha256"], records[1]["sha256"]);
         assert_eq!(records[0]["is_color"], true);
         assert!(records[0].get("render_audit").is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn render_audit_renders_every_page_in_a_batch() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let root = dir.path();
+        let image = RgbImage::from_fn(160, 96, |x, y| {
+            let ink = (24..68).contains(&y) && (30..132).contains(&x) && x % 24 < 12;
+            image::Rgb([if ink { 16 } else { 248 }; 3])
+        });
+        image.save(root.join("page.png"))?;
+        let dump = root.join("pages.raw.jsonl");
+        let mut input = File::create(&dump)?;
+        for id in 1..=5 {
+            writeln!(
+                input,
+                "{}",
+                json!({
+                    "image_id": id, "file_name": "page.png", "image_width": 160, "image_height": 96,
+                    "rfdetr": [{
+                        "label_id": 0, "label": "text", "score": 0.95,
+                        "bbox": [26, 20, 136, 72], "area": 5720,
+                        "mask": {"x": 26, "y": 20, "width": 110, "height": 52, "counts": [0, 5720]},
+                    }],
+                    "ogkalu": [],
+                })
+            )?;
+        }
+        let output = root.join("replay.jsonl");
+        let args = Args::try_parse_from::<_, &std::ffi::OsStr>([
+            "production_replay".as_ref(),
+            "--raw-dumps".as_ref(),
+            dump.as_os_str(),
+            "--images-dir".as_ref(),
+            root.as_os_str(),
+            "--out".as_ref(),
+            output.as_os_str(),
+            "--batch-size".as_ref(),
+            "4".as_ref(),
+            "--render-audit".as_ref(),
+        ])?;
+        // A timeout on another thread can catch a stall during synchronous replay.
+        let (finished, result) = std::sync::mpsc::sync_channel(1);
+        std::thread::spawn(move || {
+            let outcome = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+                .context("starting the render audit runtime")
+                .and_then(|runtime| runtime.block_on(run(args)));
+            let _ = finished.send(outcome);
+        });
+        result
+            .recv_timeout(std::time::Duration::from_secs(60))
+            .context("render audit did not finish")??;
+        let records: Vec<Value> = dump_reader(&output)?
+            .lines()
+            .map(|line| Ok(serde_json::from_str(&line?)?))
+            .collect::<Result<_>>()?;
+        assert_eq!(records.len(), 5);
+        for (i, record) in records.iter().enumerate() {
+            assert_eq!(record["image_id"], i + 1);
+            for profile in ["short", "typical", "long"] {
+                let metrics = &record["render_audit"]["profiles"][profile];
+                assert_eq!(metrics["missing_glyph_regions"], 0, "{profile}: {metrics}");
+                assert!(metrics["min_font_px"].as_f64().is_some_and(|px| px > 0.0));
+            }
+        }
         Ok(())
     }
 
@@ -759,14 +829,8 @@ mod tests {
             };
             let roots = vec![dir.path().to_owned()];
             let images = ImageDirectory::new(&roots);
-            let page = replay_line(
-                &line,
-                &images,
-                &args,
-                &DetectionFusionConfig::default(),
-                None,
-            )?
-            .unwrap();
+            let (page, _) =
+                replay_line(&line, &images, &args, &DetectionFusionConfig::default())?.unwrap();
             assert_eq!(page.scale, scale);
             assert_eq!((page.page_w, page.page_h), dims);
             let panel = page.regions.iter().find(|r| r.label == "panel").unwrap();

@@ -1,6 +1,4 @@
-use std::sync::Mutex;
-
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result};
 use image::{GrayImage, RgbImage};
 use koharu_pipeline::ReplayedDetectionPage;
 use koharu_rasterizer::{PreparedContent, PreparedSceneCommand, RasterOptions, Rasterizer};
@@ -9,11 +7,10 @@ use koharu_scene::{
     At, Authored, EntityId, Geometry, LanguageTag, PageDraft, Session, SourceText, Translation,
 };
 use serde::Serialize;
-use tokio::runtime::Handle;
 
 pub struct RenderAuditor {
-    runtime: Handle,
-    engine: Mutex<(Renderer, Rasterizer)>,
+    renderer: Renderer,
+    rasterizer: Rasterizer,
 }
 
 #[derive(Serialize)]
@@ -59,30 +56,25 @@ struct Ink {
 impl RenderAuditor {
     pub fn new() -> Result<Self> {
         Ok(Self {
-            runtime: Handle::current(),
-            engine: Mutex::new((
-                // Use production font fallback with the locally installed fonts.
-                Renderer::from_config(koharu_config::Config::memory(TypesettingConfig {
-                    font_families: Vec::new(),
-                }))?,
-                Rasterizer::new().context("render audit requires a WGPU graphics adapter")?,
-            )),
+            // Use production font fallback with the locally installed fonts.
+            renderer: Renderer::from_config(koharu_config::Config::memory(TypesettingConfig {
+                font_families: Vec::new(),
+            }))?,
+            rasterizer: Rasterizer::new()
+                .context("render audit requires a WGPU graphics adapter")?,
         })
-    }
-
-    pub fn measure(&self, image: &RgbImage, page: &ReplayedDetectionPage) -> Result<RenderAudit> {
-        let engine = self.engine.lock().map_err(|error| anyhow!("{error}"))?;
-        self.runtime
-            .block_on(measure_page(&engine.0, &engine.1, image, page))
     }
 }
 
-async fn measure_page(
-    renderer: &Renderer,
-    rasterizer: &Rasterizer,
+pub async fn measure_page(
+    auditor: &RenderAuditor,
     image: &RgbImage,
     replay: &ReplayedDetectionPage,
 ) -> Result<RenderAudit> {
+    let RenderAuditor {
+        renderer,
+        rasterizer,
+    } = auditor;
     const LONG: &str = "I thought we could take the long way home and talk about what happened today, but then the rain started, the lights went out across the whole neighborhood, and all I could think about was whether anyone would find the note we left under the door before morning.";
 
     let mut metrics = [

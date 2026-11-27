@@ -4,10 +4,10 @@
 
 use std::{collections::HashMap, sync::Arc};
 
-use image::{GrayImage, ImageBuffer, Luma, RgbImage, imageops};
+use image::{GrayImage, ImageBuffer, Luma, Pixel, RgbImage, imageops};
 use imageproc::{
     distance_transform::{Norm, euclidean_squared_distance_transform},
-    morphology::{close, dilate},
+    morphology::{close, dilate, dilate_mut},
     region_labelling::{Connectivity, connected_components},
 };
 use rayon::prelude::*;
@@ -15,7 +15,7 @@ use serde::Serialize;
 
 use super::{
     KoharuLayoutDetection, KoharuLayoutMask as Mask,
-    outlined::{median as color_median, outlined},
+    outlined::{color_distance, median as color_median, outlined},
 };
 
 /// What a detection's lettering shows.
@@ -856,63 +856,57 @@ fn fit_glyph_masks_inner<'a>(
                 GlyphProposal::Segmented(original) => original,
                 GlyphProposal::Box => detection.bbox,
             };
-            (original, proposal, Mask::default(), detection, index)
+            (original, proposal, None, Mask::default(), detection, index)
         })
         .collect();
     letters
         .par_iter_mut()
-        .for_each(|(_, proposal, core, detection, _)| {
-            let input_mask = Arc::clone(&detection.mask);
-            let (mask, core_mask, grown) = glyph_mask(&input_mask, detection.bbox, page, *proposal);
-            // For segmented proposals, anchor ownership tie-breaking to core
-            // ink supported by the detector's own mask so plain-paper box
-            // expansion cannot pull a tilted neighbour's glyphs into our core.
-            let anchored = if matches!(proposal, GlyphProposal::Segmented(_))
-                && core_mask.width > 0
-                && core_mask.height > 0
-            {
-                let mut anchored = core_mask.clone();
-                let mut any = false;
-                for y in 0..anchored.height {
-                    for x in 0..anchored.width {
-                        let idx = (y * anchored.width + x) as usize;
-                        if anchored.pixels[idx] != 0 {
-                            if input_mask.contains(anchored.x + x, anchored.y + y) {
-                                any = true;
-                            } else {
-                                anchored.pixels[idx] = 0;
-                            }
+        .for_each(|(_, proposal, support, core, detection, _)| {
+            let (mask, ink, grown, detector) =
+                glyph_mask(&detection.mask, detection.bbox, page, *proposal);
+            if claims.is_some() {
+                *core = if matches!(proposal, GlyphProposal::Segmented(_)) {
+                    let mut anchored = ink.clone();
+                    for (i, pixel) in anchored.pixels.iter_mut().enumerate() {
+                        let x = anchored.x + i as u32 % anchored.width;
+                        let y = anchored.y + i as u32 / anchored.width;
+                        if !detection.mask.contains(x, y) {
+                            *pixel = 0;
                         }
                     }
-                }
-                if any { anchored } else { core_mask }
-            } else {
-                core_mask
-            };
-            *core = anchored;
+                    if anchored.trim_to_owned_pixels() > 0 {
+                        anchored
+                    } else {
+                        ink
+                    }
+                } else {
+                    ink
+                };
+            }
+            *support = detector;
             detection.mask = Arc::new(mask);
             detection.bbox = grown;
         });
     if let Some(claims) = claims {
         claims.extend(
             letters
-                .iter()
-                .map(|(_, _, core, detection, index)| GlyphClaim {
+                .iter_mut()
+                .map(|(_, _, _, core, detection, index)| GlyphClaim {
                     index: *index,
                     mask: Arc::clone(&detection.mask),
-                    core: core.clone(),
+                    core: std::mem::take(core),
                 }),
         );
     }
     let area = |[left, top, right, bottom]: [f32; 4]| (right - left) * (bottom - top);
     letters.sort_by(|(a, ..), (b, ..)| area(*a).total_cmp(&area(*b)));
-    // Resolve shared pixels by Euclidean distance to each region's uncontested
-    // pre-dilation core ink before falling back to original-box distance and
-    // smaller-box tie-breaking.
+    // Fitting can change with the page's encoding. Shared pixels are assigned
+    // from the detectors' geometry, so a change in fitted ink cannot move
+    // the ownership boundary through both proposals.
     for i in 0..letters.len() {
         let (earlier, later) = letters.split_at_mut(i + 1);
-        let (bbox, _, core_a, first, _) = &mut earlier[i];
-        for (other, _, core_b, second, _) in later {
+        let (bbox, _, support_a, _, first, _) = &mut earlier[i];
+        for (other, _, support_b, _, second, _) in later {
             let (a, b) = (&first.mask, &second.mask);
             let (x0, y0) = (a.x.max(b.x), a.y.max(b.y));
             let (x1, y1) = (
@@ -932,42 +926,21 @@ fn fit_glyph_masks_inner<'a>(
             if !has_overlap {
                 continue;
             }
-            let ux0 = x0.min(core_a.x).min(core_b.x);
-            let uy0 = y0.min(core_a.y).min(core_b.y);
-            let ux1 = x1.max(core_a.x + core_a.width).max(core_b.x + core_b.width);
-            let uy1 = y1
-                .max(core_a.y + core_a.height)
-                .max(core_b.y + core_b.height);
-            let (uw, uh) = (ux1 - ux0, uy1 - uy0);
-            let mut only_a = GrayImage::new(uw, uh);
-            let mut only_b = GrayImage::new(uw, uh);
-            let (mut any_a, mut any_b) = (false, false);
-            for (index, &value) in core_a.pixels.iter().enumerate() {
-                if value != 0 {
-                    let px = core_a.x + index as u32 % core_a.width;
-                    let py = core_a.y + index as u32 / core_a.width;
-                    if !core_b.contains(px, py) {
-                        only_a.put_pixel(px - ux0, py - uy0, Luma([255]));
-                        any_a = true;
-                    }
+            let distance_field = |support: &Mask| {
+                let left = x0.min(support.x);
+                let top = y0.min(support.y);
+                let right = x1.max(support.x + support.width);
+                let bottom = y1.max(support.y + support.height);
+                let mut shape = GrayImage::new(right - left, bottom - top);
+                for (i, _) in support.pixels.iter().enumerate().filter(|&(_, &p)| p != 0) {
+                    let x = support.x + i as u32 % support.width;
+                    let y = support.y + i as u32 / support.width;
+                    shape[(x - left, y - top)] = Luma([255]);
                 }
-            }
-            for (index, &value) in core_b.pixels.iter().enumerate() {
-                if value != 0 {
-                    let px = core_b.x + index as u32 % core_b.width;
-                    let py = core_b.y + index as u32 / core_b.width;
-                    if !core_a.contains(px, py) {
-                        only_b.put_pixel(px - ux0, py - uy0, Luma([255]));
-                        any_b = true;
-                    }
-                }
-            }
-            let core_distances = (any_a && any_b).then(|| {
-                (
-                    euclidean_squared_distance_transform(&only_a),
-                    euclidean_squared_distance_transform(&only_b),
-                )
-            });
+                ([left, top], euclidean_squared_distance_transform(&shape))
+            };
+            let prior_a = support_a.as_ref().map(distance_field);
+            let prior_b = support_b.as_ref().map(distance_field);
             let a = Arc::make_mut(&mut first.mask);
             let b = Arc::make_mut(&mut second.mask);
             for y in y0..y1 {
@@ -975,17 +948,20 @@ fn fit_glyph_masks_inner<'a>(
                     let ai = ((y - a.y) * a.width + x - a.x) as usize;
                     let bi = ((y - b.y) * b.width + x - b.x) as usize;
                     if a.pixels[ai] != 0 && b.pixels[bi] != 0 {
-                        let second_wins = match &core_distances {
-                            Some((dist_a, dist_b)) => {
-                                let da = dist_a.get_pixel(x - ux0, y - uy0).0[0];
-                                let db = dist_b.get_pixel(x - ux0, y - uy0).0[0];
-                                if db != da {
-                                    db < da
-                                } else {
-                                    box_distance(*other, x, y) < box_distance(*bbox, x, y)
-                                }
+                        let box_a = box_distance(*bbox, x, y);
+                        let box_b = box_distance(*other, x, y);
+                        let second_wins = match (&prior_a, &prior_b) {
+                            (Some(([la, ta], da)), Some(([lb, tb], db))) => db[(x - lb, y - tb)][0]
+                                .total_cmp(&da[(x - la, y - ta)][0])
+                                .then_with(|| box_b.total_cmp(&box_a))
+                                .is_lt(),
+                            (Some(([la, ta], da)), None) => {
+                                da[(x - la, y - ta)][0] > 0.0 && box_b < box_a
                             }
-                            None => box_distance(*other, x, y) < box_distance(*bbox, x, y),
+                            (None, Some(([lb, tb], db))) => {
+                                db[(x - lb, y - tb)][0] == 0.0 || box_b < box_a
+                            }
+                            (None, None) => box_b < box_a,
                         };
                         if second_wins {
                             a.pixels[ai] = 0;
@@ -1007,25 +983,21 @@ fn box_distance([left, top, right, bottom]: [f32; 4], x: u32, y: u32) -> f32 {
     across * across + down * down
 }
 
-/// A text or onomatopoeia mask fitted to its glyphs: RF-DETR's mask within
-/// its box, which hugs each stroke and its outline but misses counters and
-/// parts of strokes, with its block's ink, widened by 2 pixels per 1024 of the
-/// page's longer side for anti-aliased edges. The paper or art between glyphs
-/// stays out, so inpainting redraws only the lettering. And the box, grown
-/// over the glyphs it cuts that the block holds, so that what's cut to the
-/// box after keeps them whole.
+/// Fit the source glyphs and recover their counters and any verified outline.
+/// Keep the clipped detector support for ownership. Grow the final mask over
+/// antialiased edges and the box over cut glyphs that the block holds.
 fn glyph_mask(
     mask: &Mask,
     bbox: [f32; 4],
     page: &RgbImage,
     proposal: GlyphProposal,
-) -> (Mask, Mask, [f32; 4]) {
+) -> (Mask, Mask, [f32; 4], Option<Mask>) {
     let (page_width, page_height) = page.dimensions();
     // imageproc 0.27.0 labels the first foreground pixel 1 even when its
     // union-find table has just one slot (image-rs/imageproc#824).
     if mask.pixels.len() <= 1 || page_width == 0 || page_height == 0 {
         let fallback = proposal.without_ink(mask.clone());
-        return (fallback.clone(), fallback, bbox);
+        return (fallback.clone(), fallback, bbox, None);
     }
     // RF-DETR's mask can stop a few pixels short of a glyph's ends, and LaMa
     // grows even a sliver of ink left outside into a stroke, so the ink may
@@ -1122,6 +1094,7 @@ fn glyph_mask(
         page_width,
         page_height,
     );
+    let segmented = matches!(proposal, GlyphProposal::Segmented(_)) && mask.pixels.contains(&0);
     let block = block(&mask, page_width, page_height);
     let Some(Ink {
         glyphs: ink,
@@ -1132,8 +1105,8 @@ fn glyph_mask(
         ..
     }) = ink(&block, page, reach, Some(bbox))
     else {
-        let fallback = proposal.without_ink(mask);
-        return (fallback.clone(), fallback, bbox);
+        let fallback = proposal.without_ink(mask.clone());
+        return (fallback.clone(), fallback, bbox, segmented.then_some(mask));
     };
     let bbox = held.map_or(bbox, |held| {
         let [x0, y0, x1, y1] = held.map(|edge| edge as f32);
@@ -1148,16 +1121,8 @@ fn glyph_mask(
     let ink_corner = [left, top];
     let left = i64::from(left) - i64::from(margin);
     let top = i64::from(top) - i64::from(margin);
-    let segmented = matches!(proposal, GlyphProposal::Segmented(_)) && mask.pixels.contains(&0);
     let [bx0, by0, bx1, by1] = bbox;
     let approx_size = (bx1 - bx0).min(by1 - by0).max(1.0);
-    let difference = |a: [u8; 3], b: [u8; 3]| {
-        a.into_iter()
-            .zip(b)
-            .map(|(a, b)| a.abs_diff(b))
-            .max()
-            .unwrap()
-    };
     let offset = [block.x - ink_corner[0], block.y - ink_corner[1]];
     let block_ink =
         imageops::crop_imm(&ink, offset[0], offset[1], block.width, block.height).to_image();
@@ -1166,7 +1131,9 @@ fn glyph_mask(
     })
     // Without a segmentation, patches of known paper inside closed glyphs
     // or contours cannot serve as evidence of a different fill.
-    .filter(|found| segmented || paper.is_none_or(|paper| difference(found.ink, paper) > 4));
+    .filter(|found| {
+        segmented || paper.is_none_or(|paper| color_distance(found.ink, paper) > PAPER_TOLERANCE)
+    });
     let fits_blend = |from_ink: u8, from_outline: u8, contrast: u16| {
         u16::from(from_ink) + u16::from(from_outline) <= contrast + 6
     };
@@ -1180,33 +1147,7 @@ fn glyph_mask(
         );
         let distance = euclidean_squared_distance_transform(&aligned);
         let reach_sq = f64::from(found.outline.width + 1.0).powi(2);
-        let contrast = u16::from(difference(found.ink, found.outline.color));
-        let mut histogram = [0; 256];
-        let mut exterior = 0;
-        let x0 = mask.x.saturating_sub(reach);
-        let y0 = mask.y.saturating_sub(reach);
-        let x1 = (mask.x + mask.width + reach).min(page_width);
-        let y1 = (mask.y + mask.height + reach).min(page_height);
-        for py in y0..y1 {
-            for px in x0..x1 {
-                if !mask.contains(px, py) {
-                    exterior += 1;
-                    let color = page[(px, py)].0;
-                    let from_ink = difference(color, found.ink);
-                    if fits_blend(from_ink, difference(color, found.outline.color), contrast) {
-                        histogram[usize::from(from_ink)] += 1;
-                    }
-                }
-            }
-        }
-        // The stroke's antialiased colors mix its fill and outline. Keep
-        // them beyond the recovered strokes only when distinct from the art.
-        let distinct: [bool; 256] = std::array::from_fn(|shade| {
-            let nearby: u32 = histogram[shade.saturating_sub(3)..=(shade + 3).min(255)]
-                .iter()
-                .sum();
-            exterior >= 16 && nearby * 100 < exterior
-        });
+        let contrast = u16::from(color_distance(found.ink, found.outline.color));
         // A clipped band can end outside the mask. Its color must stop
         // within the measured contour instead of continuing into the art.
         let outside_band = segmented.then(|| {
@@ -1214,7 +1155,7 @@ fn glyph_mask(
                 let (px, py) = (x + ink_corner[0], y + ink_corner[1]);
                 let color = page[(px, py)].0;
                 Luma([u8::from(
-                    !mask.contains(px, py) && difference(color, found.outline.color) <= 16,
+                    !mask.contains(px, py) && color_distance(color, found.outline.color) <= 16,
                 ) * 255])
             });
             let parts = connected_components(&color_band, Connectivity::Eight, Luma([0]));
@@ -1226,75 +1167,120 @@ fn glyph_mask(
             }
             (parts, runs_on)
         });
-        (found, distance, reach_sq, contrast, distinct, outside_band)
+        (found, distance, reach_sq, contrast, outside_band)
     });
 
-    let mut foreground = GrayImage::new(ink.width() + 2 * margin, ink.height() + 2 * margin);
+    // Compare the detector's tones with the same tones just outside its
+    // support. A second ink tone can qualify only when it is concentrated
+    // inside the detector footprint and lies on the ink side of the exterior
+    // mean, preventing caption or bubble paper from being promoted to ink.
+    let supported_tones = segmented.then(|| {
+        let x0 = mask.x.saturating_sub(reach);
+        let y0 = mask.y.saturating_sub(reach);
+        let x1 = (mask.x + mask.width + reach).min(page_width);
+        let y1 = (mask.y + mask.height + reach).min(page_height);
+        let shape = GrayImage::from_fn(x1 - x0, y1 - y0, |x, y| {
+            Luma([u8::from(mask.contains(x + x0, y + y0)) * 255])
+        });
+        let ring = dilate(&shape, Norm::LInf, reach as u8);
+        let mut tones = [[0u32; 256]; 2];
+        for (x, y, value) in ring.enumerate_pixels() {
+            if value[0] != 0 {
+                let tone = usize::from(page[(x + x0, y + y0)].to_luma()[0]);
+                tones[usize::from(shape[(x, y)][0] != 0)][tone] += 1;
+            }
+        }
+        let [exterior_area, detector_area] = tones
+            .each_ref()
+            .map(|hist| f64::from(hist.iter().sum::<u32>()));
+        let exterior_mean = if exterior_area > 0.0 {
+            tones[0]
+                .iter()
+                .enumerate()
+                .map(|(t, &n)| t as f64 * f64::from(n))
+                .sum::<f64>()
+                / exterior_area
+        } else {
+            0.0
+        };
+        let (mut ink_sum, mut ink_count) = (0.0f64, 0u32);
+        for (x, y, pixel) in ink.enumerate_pixels() {
+            if pixel[0] != 0 {
+                ink_sum += f64::from(page[(x + ink_corner[0], y + ink_corner[1])].to_luma()[0]);
+                ink_count += 1;
+            }
+        }
+        let ink_mean = if ink_count > 0 {
+            ink_sum / f64::from(ink_count)
+        } else {
+            exterior_mean
+        };
+        let contrast = exterior_mean - ink_mean;
+        std::array::from_fn::<_, 256, _>(|tone| {
+            let on_ink_side = if contrast > 16.0 {
+                exterior_mean - tone as f64 >= 0.35 * contrast
+            } else if contrast < -16.0 {
+                tone as f64 - exterior_mean >= 0.35 * (-contrast)
+            } else {
+                false
+            };
+            if !on_ink_side {
+                return false;
+            }
+            let range = tone.saturating_sub(16)..=(tone + 16).min(255);
+            let [exterior_count, detector_count] = tones
+                .each_ref()
+                .map(|hist| f64::from(hist[range.clone()].iter().sum::<u32>()));
+            // Group nearby tones so rare compression artifacts cannot
+            // qualify as a distinct material.
+            detector_count * exterior_area
+                > (4.0 * exterior_count + 0.02 * exterior_area) * detector_area
+        })
+    });
+    let mut canvas = GrayImage::new(ink.width() + 2 * margin, ink.height() + 2 * margin);
+    let mut detector_only = Vec::new();
     for (x, y, pixel) in ink.enumerate_pixels() {
+        let (px, py) = (x + ink_corner[0], y + ink_corner[1]);
+        let supported = segmented && mask.contains(px, py);
+        let color = page[(px, py)].0;
         let on_border = borders.as_ref().is_some_and(|mask| mask[(x, y)][0] != 0);
-        let raw = pixel[0] != 0;
-        let keep = recovered_support.as_ref().map_or(
-            raw && !on_border,
-            |(found, distance, reach_sq, contrast, distinct, outside_band)| {
-                let (px, py) = (x + ink_corner[0], y + ink_corner[1]);
-                let color = page[(px, py)].0;
-                let supported = mask.contains(px, py);
-                let sq = distance[(x, y)][0];
-                let near = sq <= *reach_sq;
-                let from_ink = difference(color, found.ink);
-                let from_outline = difference(color, found.outline.color);
-                sq == 0.0
-                    || (supported || raw)
-                        && from_outline > OUTLINE_TOLERANCE
-                        && fits_blend(from_ink, from_outline, *contrast)
-                        && (near && !on_border || distinct[usize::from(from_ink)])
-                    || !on_border
-                        && (sq <= 4.0 && from_ink <= OUTLINE_TOLERANCE
-                            || near
-                                && from_outline <= OUTLINE_TOLERANCE
-                                && (!segmented
-                                    || supported
-                                    || outside_band.as_ref().is_some_and(|(parts, runs_on)| {
-                                        !runs_on[parts[(x, y)][0] as usize]
-                                    })))
+        let from_split = pixel[0] != 0;
+        let from_detector = supported
+            && !on_border
+            && paper.is_none_or(|paper| color_distance(color, paper) > PAPER_TOLERANCE)
+            && supported_tones
+                .as_ref()
+                .is_some_and(|tones| tones[usize::from(page[(px, py)].to_luma()[0])]);
+        let from_stroke = recovered_support.as_ref().map_or(
+            from_split,
+            |(found, distance, reach_sq, contrast, outside_band)| {
+                let squared = distance[(x, y)][0];
+                let from_ink = color_distance(color, found.ink);
+                if squared == 0.0 || from_split && (!segmented || from_ink <= PAPER_TOLERANCE) {
+                    return true;
+                }
+                if squared > *reach_sq || on_border {
+                    return false;
+                }
+                let from_outline = color_distance(color, found.outline.color);
+                if squared <= 4.0 && from_ink <= OUTLINE_TOLERANCE {
+                    return true;
+                }
+                if from_outline <= OUTLINE_TOLERANCE {
+                    return outside_band.as_ref().is_none_or(|(parts, runs_on)| {
+                        supported || !runs_on[parts[(x, y)][0] as usize]
+                    });
+                }
+                supported && fits_blend(from_ink, from_outline, *contrast)
             },
         );
-        if keep {
-            foreground[(x + margin, y + margin)] = Luma([255]);
+        if from_stroke || from_detector {
+            canvas[(x + margin, y + margin)] = Luma([255]);
+            if !from_stroke {
+                detector_only.push((x + margin, y + margin));
+            }
         }
     }
-    let mut canvas = foreground.clone();
-    if segmented && recovered.is_none() {
-        let palette = sample_background_palette(page, &mask, &ink, ink_corner, bbox, reach);
-        for (index, _) in mask
-            .pixels
-            .iter()
-            .enumerate()
-            .filter(|(_, pixel)| **pixel != 0)
-        {
-            let (px, py) = (
-                mask.x + index as u32 % mask.width,
-                mask.y + index as u32 / mask.width,
-            );
-            let (ix, iy) = (px - ink_corner[0], py - ink_corner[1]);
-            if borders
-                .as_ref()
-                .is_some_and(|borders| borders[(ix, iy)][0] != 0)
-            {
-                continue;
-            }
-            let pixel = page[(px, py)].0;
-            if paper
-                .iter()
-                .chain(&palette)
-                .any(|bg| (0..3).all(|c| pixel[c].abs_diff(bg[c]) <= PAPER_TOLERANCE))
-            {
-                continue;
-            }
-            canvas[(ix + margin, iy + margin)] = Luma([255]);
-        }
-    }
-
     // Inside the box, what the glyphs enclose is a counter or, in lettering
     // outlined in a lighter colour, the glyph's own fill; the ink split takes
     // only the outline there.
@@ -1309,7 +1295,7 @@ fn glyph_mask(
     let hole_parts = connected_components(&holes, Connectivity::Four, Luma([0]));
     let hole_labels = hole_parts.pixels().map(|p| p.0[0]).max().unwrap_or(0) as usize;
     let mut hole_extents: Vec<Option<[u32; 4]>> = vec![None; hole_labels + 1];
-    let mut boundary = vec![(0u32, 0u32, false); hole_labels + 1];
+    let mut crosses_border = vec![false; hole_labels + 1];
     for (x, y, p) in hole_parts.enumerate_pixels() {
         let l = p.0[0] as usize;
         if l == 0 {
@@ -1317,18 +1303,11 @@ fn glyph_mask(
         }
         let e = hole_extents[l].get_or_insert([x, y, x, y]);
         *e = [e[0].min(x), e[1].min(y), e[2].max(x), e[3].max(y)];
-        let (support, around, crosses_border) = &mut boundary[l];
-        for (nx, ny) in [(x - 1, y), (x + 1, y), (x, y - 1), (x, y + 1)] {
-            if canvas[(nx, ny)][0] != 0 {
-                *around += 1;
-                *support += u32::from(foreground[(nx, ny)][0] != 0);
-            }
-        }
         if let Some(border) = &borders
             && let (Some(ix), Some(iy)) = (x.checked_sub(margin), y.checked_sub(margin))
             && border.get_pixel_checked(ix, iy).is_some_and(|p| p[0] != 0)
         {
-            *crosses_border = true;
+            crosses_border[l] = true;
         }
     }
     let vertical = by1 - by0 > bx1 - bx0;
@@ -1341,10 +1320,9 @@ fn glyph_mask(
         .min(approx_size);
     let keep_hole: Vec<bool> = hole_extents
         .into_iter()
-        .zip(boundary)
-        .map(|(ext, (support, around, crosses_border))| {
+        .zip(crosses_border)
+        .map(|(ext, crosses_border)| {
             !crosses_border
-                && support * 4 >= around * 3
                 && ext.is_some_and(|[x0, y0, x1, y1]| {
                     let (w, h) = ((x1 - x0 + 1) as f32, (y1 - y0 + 1) as f32);
                     w.max(h) <= glyph_size && w * h <= 0.6 * glyph_size * glyph_size
@@ -1361,11 +1339,27 @@ fn glyph_mask(
         }
     }
     let core = crop(&canvas, left, top, page_width, page_height);
-    let fitted = dilate(&canvas, Norm::L2, margin as u8);
+    // The detector footprint already extends past the stroke core, so a
+    // weaker detector-only pixel gets a smaller antialias margin.
+    for &point in &detector_only {
+        canvas[point] = Luma([0]);
+    }
+    let mut fitted = dilate(&canvas, Norm::L2, margin as u8);
+    if !detector_only.is_empty() {
+        canvas.fill(0);
+        for point in detector_only {
+            canvas[point] = Luma([255]);
+        }
+        dilate_mut(&mut canvas, Norm::L2, (margin / 2) as u8);
+        for (fit, detector) in fitted.iter_mut().zip(canvas.as_raw()) {
+            *fit |= detector;
+        }
+    }
     (
         crop(&fitted, left, top, page_width, page_height),
         core,
         bbox,
+        segmented.then_some(mask),
     )
 }
 
@@ -1574,14 +1568,7 @@ fn ink(block: &Mask, page: &RgbImage, reach: u32, bbox: Option<[f32; 4]>) -> Opt
     for pixel in sample.pixels() {
         histogram[usize::from(pixel[0])] += 1.0;
     }
-    let level = split_distribution(&histogram, 0.1);
-    let mut threshold = sample
-        .as_raw()
-        .iter()
-        .copied()
-        .filter(|value| *value < level)
-        .max()
-        .map_or(0, |value| u16::from(value) + 1);
+    let mut threshold = u16::from(split_distribution(&histogram));
     let (mut block_tones, mut ring_tones) = ([0u32; 256], [0u32; 256]);
     for y in offset_y.saturating_sub(surround)..(offset_y + block.height + surround).min(height) {
         for x in offset_x.saturating_sub(surround)..(offset_x + block.width + surround).min(width) {
@@ -2234,8 +2221,7 @@ fn refine_bimodal_ink_threshold(
     let threshold = usize::from(threshold);
     let mut sub_hist = *histogram;
     sub_hist[threshold..].fill(0.0);
-    let sub_level = usize::from(split_distribution(&sub_hist, 0.1));
-    let split = sub_hist[..sub_level].iter().rposition(|&n| n > 0.0)? + 1;
+    let split = usize::from(split_distribution(&sub_hist));
     let tone = |from: usize, to: usize| {
         let total: f32 = sub_hist[from..to].iter().sum();
         let sum: f32 = (from..to).map(|v| v as f32 * sub_hist[v]).sum();
@@ -2272,152 +2258,37 @@ fn refine_bimodal_ink_threshold(
     (far_middle as f32 >= 0.18 * middle && 10 * far_middle >= far_total).then_some(split as u16)
 }
 
-/// Samples dominant non-ink background RGB colors around `bbox` (both outside
-/// `mask` and inside `bbox` away from ink strokes), used to filter coarse
-/// segmented blobs over translucent textured or gradient bubbles without
-/// removing strokes or outlines.
-fn sample_background_palette(
-    page: &RgbImage,
-    mask: &Mask,
-    ink: &GrayImage,
-    ink_corner: [u32; 2],
-    bbox: [f32; 4],
-    reach: u32,
-) -> Vec<[u8; 3]> {
-    let pad = reach.max(8);
-    let bx0 = bbox[0].floor().max(0.0) as u32;
-    let by0 = bbox[1].floor().max(0.0) as u32;
-    let bx1 = (bbox[2].ceil().max(0.0) as u32).min(page.width());
-    let by1 = (bbox[3].ceil().max(0.0) as u32).min(page.height());
-    let x0 = bx0.saturating_sub(pad);
-    let y0 = by0.saturating_sub(pad);
-    let x1 = (bx1 + pad).min(page.width());
-    let y1 = (by1 + pad).min(page.height());
-    let ink_edges = dilate(ink, Norm::LInf, 2);
-    let mut bins = HashMap::<[u8; 3], (u32, [u64; 3])>::new();
-    let mut total = 0u32;
-    for py in y0..y1 {
-        for px in x0..x1 {
-            if mask.contains(px, py) {
-                continue;
-            }
-            if px >= ink_corner[0]
-                && py >= ink_corner[1]
-                && px - ink_corner[0] < ink_edges.width()
-                && py - ink_corner[1] < ink_edges.height()
-                && ink_edges
-                    .get_pixel(px - ink_corner[0], py - ink_corner[1])
-                    .0[0]
-                    != 0
-            {
-                continue;
-            }
-            let rgb = page.get_pixel(px, py).0;
-            let key = rgb.map(|c| c / 24);
-            let (cnt, sum) = bins.entry(key).or_default();
-            *cnt += 1;
-            for (s, c) in sum.iter_mut().zip(rgb) {
-                *s += u64::from(c);
-            }
-            total += 1;
+/// Otsu separates the two tone populations. Their midpoint keeps the decision
+/// between the populations even when compression fills in the histogram valley.
+fn split_distribution(histogram: &[f32; 256]) -> u8 {
+    let total: f64 = histogram.iter().map(|&count| f64::from(count)).sum();
+    let moment: f64 = histogram
+        .iter()
+        .enumerate()
+        .map(|(tone, &count)| tone as f64 * f64::from(count))
+        .sum();
+    let (mut below, mut low_moment) = (0.0, 0.0);
+    let (mut best, mut midpoint) = (0.0, 128.0);
+    for (tone, &count) in histogram
+        .iter()
+        .enumerate()
+        .filter(|&(_, &count)| count > 0.0)
+    {
+        below += f64::from(count);
+        low_moment += tone as f64 * f64::from(count);
+        let above = total - below;
+        if above == 0.0 {
+            break;
+        }
+        let dark = low_moment / below;
+        let light = (moment - low_moment) / above;
+        let score = below * above * (light - dark).powi(2);
+        if score > best {
+            best = score;
+            midpoint = (dark + light) / 2.0;
         }
     }
-    if total < 32 {
-        return Vec::new();
-    }
-    // Never include the dominant ink colour in the background palette so we
-    // never strip genuine glyph strokes even when art shares the ink tone.
-    let mut ink_bins = HashMap::<[u8; 3], (u32, [u64; 3])>::new();
-    for (x, y, p) in ink.enumerate_pixels() {
-        if p.0[0] != 0 {
-            let px = ink_corner[0] + x;
-            let py = ink_corner[1] + y;
-            if px < page.width() && py < page.height() {
-                let rgb = page.get_pixel(px, py).0;
-                let (cnt, sum) = ink_bins.entry(rgb.map(|c| c / 16)).or_default();
-                *cnt += 1;
-                for (s, c) in sum.iter_mut().zip(rgb) {
-                    *s += u64::from(c);
-                }
-            }
-        }
-    }
-    let dominant_ink = ink_bins
-        .into_values()
-        .max_by_key(|(cnt, _)| *cnt)
-        .map(|(cnt, sum)| sum.map(|s| (s / u64::from(cnt)) as u8));
-
-    let min_bin = (total / 40).max(8);
-    bins.into_values()
-        .filter(|(cnt, _)| *cnt >= min_bin)
-        .map(|(cnt, sum)| sum.map(|s| (s / u64::from(cnt)) as u8))
-        .filter(|bg| {
-            let not_pure_dark = bg.iter().copied().max().unwrap_or(0) >= 70;
-            not_pure_dark
-                && dominant_ink.is_none_or(|ink_c| (0..3).any(|c| bg[c].abs_diff(ink_c[c]) > 48))
-        })
-        .collect()
-}
-
-/// `numaSplitDistribution`, plus one: the split with the best Otsu score,
-/// moved to the histogram's minimum among the neighbouring splits scoring
-/// within `score_fraction` of it.
-fn split_distribution(histogram: &[f32; 256], score_fraction: f32) -> u8 {
-    let n = histogram.len();
-    let sum: f32 = histogram.iter().fold(0.0, |sum, &count| sum + count);
-    let norm = 4.0f32 / ((n - 1) as f32 * (n - 1) as f32);
-    let (mut moment, mut total) = (0.0f32, 0.0f32);
-    for (index, &count) in histogram.iter().enumerate() {
-        total += count;
-        moment += index as f32 * count;
-    }
-    let (mut mean_below, mut mean_above) = (0.0f32, moment / total);
-    let (mut below, mut above) = (0.0f32, sum);
-    let mut scores = [0.0f32; 256];
-    let (mut max_score, mut max_index) = (0.0f32, n / 2);
-    for (index, &count) in histogram.iter().enumerate() {
-        let next_below = below + count;
-        let next_mean_below = if next_below == 0.0 {
-            mean_below
-        } else {
-            (below * mean_below + index as f32 * count) / next_below
-        };
-        let next_above = above - count;
-        let next_mean_above = if next_above == 0.0 {
-            mean_above
-        } else {
-            (above * mean_above - index as f32 * count) / next_above
-        };
-        let fraction = next_below / sum;
-        let score = norm
-            * (fraction * (1.0 - fraction))
-            * (next_mean_above - next_mean_below)
-            * (next_mean_above - next_mean_below);
-        scores[index] = score;
-        if score > max_score {
-            max_score = score;
-            max_index = index;
-        }
-        (below, above, mean_below, mean_above) =
-            (next_below, next_above, next_mean_below, next_mean_above);
-    }
-
-    let min_score = (1.0 - score_fraction) * max_score;
-    let mut first = max_index;
-    while first > 0 && scores[first - 1] >= min_score {
-        first -= 1;
-    }
-    let mut last = max_index;
-    while last + 1 < n && scores[last + 1] >= min_score {
-        last += 1;
-    }
-    let mut split = first;
-    for index in first + 1..=last {
-        if histogram[index] < histogram[split] {
-            split = index;
-        }
-    }
-    (split + 1).min(255) as u8
+    midpoint.ceil() as u8
 }
 
 /// Single-tile Leptonica stroke width. Padding puts the page beyond the
@@ -2512,6 +2383,234 @@ mod tests {
     use image::Rgb;
 
     use super::*;
+
+    fn jpeg75(page: &RgbImage) -> RgbImage {
+        let mut bytes = Vec::new();
+        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut bytes, 75)
+            .encode_image(page)
+            .unwrap();
+        image::load_from_memory_with_format(&bytes, image::ImageFormat::Jpeg)
+            .unwrap()
+            .into_rgb8()
+    }
+
+    fn mask_disagreement(a: &Mask, b: &Mask) -> f32 {
+        let (mut union, mut difference) = (0, 0);
+        let right = (a.x + a.width).max(b.x + b.width);
+        let bottom = (a.y + a.height).max(b.y + b.height);
+        for y in a.y.min(b.y)..bottom {
+            for x in a.x.min(b.x)..right {
+                let (a, b) = (a.contains(x, y), b.contains(x, y));
+                union += u32::from(a || b);
+                difference += u32::from(a != b);
+            }
+        }
+        assert!(union > 0, "expected lettering in the union of fitted masks");
+        difference as f32 / union as f32
+    }
+
+    #[test]
+    fn jpeg75_keeps_free_text_masks_and_outline() {
+        let fills = GrayImage::from_fn(236, 124, |x, y| {
+            let stroke = [45, 81, 118, 157].into_iter().any(|left| {
+                ((left..left + 8).contains(&x) && (41..78).contains(&y))
+                    || ((left..left + 22).contains(&x) && (56..64).contains(&y))
+            });
+            Luma([u8::from(stroke) * 255])
+        });
+        let band = dilate(&fills, Norm::L2, 4);
+        let bbox = [34., 33., 191., 86.];
+        let mask = Mask {
+            x: 34,
+            y: 33,
+            width: 157,
+            height: 53,
+            pixels: vec![255; 157 * 53],
+        };
+        for (ink, paper, outline_rgb) in [
+            ([20; 3], [222; 3], None),
+            ([68, 32, 103], [221, 205, 147], None),
+            ([239, 227, 149], [171, 182, 202], Some([29, 35, 48])),
+        ] {
+            let page = RgbImage::from_fn(236, 124, |x, y| {
+                let color: [u8; 3] = if fills[(x, y)][0] != 0 {
+                    ink
+                } else if let Some(outline) = outline_rgb
+                    && band[(x, y)][0] != 0
+                {
+                    outline
+                } else {
+                    paper
+                };
+                // Low-amplitude color variation makes the band and paper
+                // distributions representative of decoded artwork.
+                let noise = ((3 * x + 7 * y) % 11) as i16 - 5;
+                Rgb(color.map(|v| (i16::from(v) + noise) as u8))
+            });
+            let round_trip = jpeg75(&page);
+            let fit = |page: &RgbImage| glyph_mask(&mask, bbox, page, GlyphProposal::Box).0;
+            let original = fit(&page);
+            let compressed = fit(&round_trip);
+            let disagreement = mask_disagreement(&original, &compressed);
+            assert!(disagreement < 0.08, "{ink:?}: {disagreement}");
+            for (fitted, source) in [(&original, &page), (&compressed, &round_trip)] {
+                let typo = fitted.typography(source).expect("lettering has typography");
+                assert_eq!(typo.outline.is_some(), outline_rgb.is_some(), "{typo:?}");
+                assert!(fitted.contains(48, 62) && fitted.contains(123, 49));
+                assert!(!fitted.contains(147, 47));
+            }
+        }
+    }
+
+    #[test]
+    fn detector_support_preserves_a_second_ink_tone_after_compression() {
+        let bbox = [16., 20., 176., 80.];
+        let tone = |x: u32, y: u32| {
+            if !(25..75).contains(&y) {
+                245
+            } else if (22..42).contains(&x) {
+                20
+            } else if [58, 88, 118]
+                .into_iter()
+                .any(|left| (left..left + 12).contains(&x))
+            {
+                135
+            } else {
+                245
+            }
+        };
+        let page = RgbImage::from_fn(192, 112, |x, y| Rgb([tone(x, y); 3]));
+        let shape = GrayImage::from_fn(page.width(), page.height(), |x, y| {
+            Luma([u8::from(tone(x, y) != 245) * 255])
+        });
+        let mask = crop(&shape, 0, 0, page.width(), page.height());
+        let fit = |source| glyph_mask(&mask, bbox, source, GlyphProposal::Segmented(bbox)).0;
+        let original = fit(&page);
+        let compressed = fit(&jpeg75(&page));
+        for fitted in [&original, &compressed] {
+            for x in [30, 64, 94, 124] {
+                assert!(fitted.contains(x, 52), "stroke at x={x}");
+            }
+            for x in [49, 79, 109] {
+                assert!(!fitted.contains(x, 52), "paper at x={x}");
+            }
+        }
+        assert!(mask_disagreement(&original, &compressed) < 0.08);
+    }
+
+    #[test]
+    fn jpeg75_keeps_ownership_in_nested_free_text() {
+        let mut page = RgbImage::from_pixel(288, 132, Rgb([218; 3]));
+        for (i, left) in [47, 84, 113, 155, 188, 221].into_iter().enumerate() {
+            for y in 42..81 {
+                for x in left..left + 19 {
+                    if x < left + 6 || (52..60).contains(&y) || (71..75).contains(&y) {
+                        page[(x, y)] = Rgb([if i == 2 { 61 } else { 22 }; 3]);
+                    }
+                }
+            }
+        }
+        for y in 50..74 {
+            for x in 143..149 {
+                page[(x, y)] = Rgb([123; 3]);
+            }
+        }
+        let outer = [36., 34., 249., 90.];
+        let inner = [75., 38., 151., 86.];
+        let fit = |page: &RgbImage| {
+            let detection = |label: &str, bbox: [f32; 4], include: &dyn Fn(u32, u32) -> bool| {
+                let mask = crop(
+                    &GrayImage::from_fn(page.width(), page.height(), |x, y| {
+                        Luma([u8::from(include(x, y)) * 255])
+                    }),
+                    0,
+                    0,
+                    page.width(),
+                    page.height(),
+                );
+                KoharuLayoutDetection {
+                    label_id: 0,
+                    label: label.to_owned(),
+                    score: 0.9,
+                    bbox,
+                    area: mask.pixels.iter().filter(|&&p| p != 0).count() as u32,
+                    mask: Arc::new(mask),
+                }
+            };
+            let mut detections = [
+                detection("onomatopoeia", outer, &|x, y| {
+                    (36..249).contains(&x)
+                        && (34..90).contains(&y)
+                        && !((142..151).contains(&x) && (46..85).contains(&y))
+                }),
+                detection("text", inner, &|x, y| {
+                    (75..151).contains(&x)
+                        && (38..86).contains(&y)
+                        && !((75..80).contains(&x) && y < 41)
+                }),
+            ];
+            fit_glyph_masks(
+                detections
+                    .iter_mut()
+                    .map(|detection| (GlyphProposal::Segmented(detection.bbox), detection)),
+                page,
+            );
+            detections.map(|detection| detection.mask)
+        };
+        let [outer, inner] = fit(&page);
+        let [jpeg_outer, jpeg_inner] = fit(&jpeg75(&page));
+        for (original, compressed) in [(&outer, &jpeg_outer), (&inner, &jpeg_inner)] {
+            let disagreement = mask_disagreement(original, compressed);
+            assert!(disagreement < 0.08, "mask disagreement {disagreement}");
+        }
+        for (outer, inner) in [(outer, inner), (jpeg_outer, jpeg_inner)] {
+            assert!(outer.contains(49, 55) && !inner.contains(49, 55));
+            assert!(inner.contains(86, 55) && !outer.contains(86, 55));
+        }
+    }
+
+    #[test]
+    fn a_large_pastel_enclosure_is_not_recovered_as_glyph_fill() {
+        let bbox = [104., 282., 1080., 735.];
+        let mask = Mask {
+            x: 104,
+            y: 282,
+            width: 976,
+            height: 453,
+            pixels: (0..976 * 453)
+                .map(|i| u8::from(i / 976 >= 6 || i % 976 >= 6) * 255)
+                .collect(),
+        };
+        let page = RgbImage::from_fn(1200, 1024, |x, y| {
+            let ellipse = |rx: f64, ry: f64| {
+                ((f64::from(x) - 628.0) / rx).powi(2) + ((f64::from(y) - 503.0) / ry).powi(2) < 1.0
+            };
+            let frame = ellipse(347.0, 149.0) && !ellipse(339.0, 141.0);
+            let text = [152, 198, 1012].into_iter().any(|left| {
+                ((left..left + 9).contains(&x) && (469..522).contains(&y))
+                    || ((left..left + 29).contains(&x) && (493..503).contains(&y))
+            });
+            Rgb(if text || frame {
+                [24, 32, 38]
+            } else {
+                [119, 218, 198]
+            })
+        });
+        let round_trip = jpeg75(&page);
+        let fit = |page: &RgbImage| {
+            let proposal = GlyphProposal::Segmented(bbox);
+            glyph_mask(&mask, bbox, page, proposal).0
+        };
+        let original = fit(&page);
+        let compressed = fit(&round_trip);
+        for fitted in [&original, &compressed] {
+            let area = fitted.pixels.iter().filter(|&&p| p != 0).count();
+            assert!(area < 35_000, "pastel fill flooded to {area} pixels");
+            assert!(!fitted.contains(628, 503));
+            assert!(fitted.contains(156, 510));
+        }
+        assert!(mask_disagreement(&original, &compressed) < 0.08);
+    }
 
     #[test]
     fn ring_tail_distinguishes_frames_from_a_second_outline() {
@@ -2669,7 +2768,7 @@ mod tests {
                 245
             }; 3])
         });
-        let (fitted, _, grown) = glyph_mask(&mask, bbox, &page, GlyphProposal::Box);
+        let (fitted, _, grown, _) = glyph_mask(&mask, bbox, &page, GlyphProposal::Box);
         assert!(fitted.contains(65, 75));
         assert!(grown[3] >= 78.0);
         assert!(!fitted.contains(101, 75));
@@ -2694,10 +2793,9 @@ mod tests {
             block_tones[usize::from(pixel[0])] += 1;
         }
         let histogram = block_tones.map(|n| n as f32);
-        assert_eq!(
-            refine_bimodal_ink_threshold(&sample, &histogram, &block_tones, 190),
-            Some(26)
-        );
+        let threshold = refine_bimodal_ink_threshold(&sample, &histogram, &block_tones, 190)
+            .expect("the split separates the ink from the hatching");
+        assert!((26..=155).contains(&threshold));
     }
 
     #[test]
@@ -2779,7 +2877,7 @@ mod tests {
                     .map(|i| if i % 46 < 2 && i / 46 < 2 { 0 } else { 255 })
                     .collect(),
             };
-            let (fitted, _, _) = glyph_mask(&mask, bbox, &page, GlyphProposal::Segmented(bbox));
+            let (fitted, _, _, _) = glyph_mask(&mask, bbox, &page, GlyphProposal::Segmented(bbox));
             assert!(fitted.contains(34, 38) && fitted.contains(69, 40));
             assert!(fitted.contains(70, 40)); // scale-dependent antialias margin
             assert!(!fitted.contains(51, 36) && !fitted.contains(22, 48));
@@ -2798,7 +2896,8 @@ mod tests {
                 pixels,
             };
             let bbox = [0., 0., w as f32, h as f32];
-            let (fitted, _, grown) = glyph_mask(&mask, bbox, &page, GlyphProposal::Segmented(bbox));
+            let (fitted, _, grown, _) =
+                glyph_mask(&mask, bbox, &page, GlyphProposal::Segmented(bbox));
             assert_eq!(fitted.pixels, mask.pixels);
             assert_eq!(grown, bbox);
             assert!(fitted.typography(&page).is_none());
@@ -2873,7 +2972,7 @@ mod tests {
             pixels,
         };
         let bbox = [80.0, 36.0, 120.0, 180.0];
-        let (fitted, _, _) = glyph_mask(&detected, bbox, &page, GlyphProposal::Segmented(bbox));
+        let (fitted, _, _, _) = glyph_mask(&detected, bbox, &page, GlyphProposal::Segmented(bbox));
         assert!(fitted.contains(100, 192));
         assert!(!fitted.contains(100, 213));
     }
@@ -2912,7 +3011,7 @@ mod tests {
             pixels,
         };
         let bbox = [80.0, 36.0, 120.0, 180.0];
-        let (fitted, _, _) = glyph_mask(&detected, bbox, &page, GlyphProposal::Segmented(bbox));
+        let (fitted, _, _, _) = glyph_mask(&detected, bbox, &page, GlyphProposal::Segmented(bbox));
         assert!(fitted.contains(100, 48));
         assert!(!fitted.contains(100, 16));
     }
@@ -2946,7 +3045,8 @@ mod tests {
                 })
                 .collect(),
         };
-        let (fitted, _, grown) = glyph_mask(&detected, bbox, &page, GlyphProposal::Segmented(bbox));
+        let (fitted, _, grown, _) =
+            glyph_mask(&detected, bbox, &page, GlyphProposal::Segmented(bbox));
         assert!(fitted.contains(45, 113));
         assert!(grown[3] >= 114.0);
         assert!(!fitted.contains(45, 131) && grown[3] < 130.0);
@@ -3357,7 +3457,7 @@ mod tests {
         };
         // Mark a non-solid segmented blob by clearing the 4 corners.
         mask.pixels[0] = 0;
-        let (fitted, _, _) = glyph_mask(&mask, bbox, &page, GlyphProposal::Segmented(bbox));
+        let (fitted, _, _, _) = glyph_mask(&mask, bbox, &page, GlyphProposal::Segmented(bbox));
         let mut glyph_total = 0u32;
         let mut glyph_hit = 0u32;
         let mut bg_bleed = 0u32;
@@ -3405,7 +3505,7 @@ mod tests {
             height: 60,
             pixels: vec![255; 70 * 60],
         };
-        let (fitted, _, _) = glyph_mask(&mask, bbox, &page, GlyphProposal::Box);
+        let (fitted, _, _, _) = glyph_mask(&mask, bbox, &page, GlyphProposal::Box);
         // Every glyph pixel must remain covered.
         for y in 55..95 {
             for x in (70..76).chain(92..98) {
@@ -3446,7 +3546,7 @@ mod tests {
             height: 110,
             pixels: vec![255; 100 * 110],
         };
-        let (fitted, _, _) = glyph_mask(&mask, bbox, &page, GlyphProposal::Box);
+        let (fitted, _, _, _) = glyph_mask(&mask, bbox, &page, GlyphProposal::Box);
         assert!(fitted.contains(88, 68) && fitted.contains(88, 94));
         // Far screentone dot inside the loose bbox must be dropped.
         assert!(
@@ -3468,9 +3568,215 @@ mod tests {
             height: 50,
             pixels: vec![255; 20 * 50],
         };
-        let (e_fitted, _, _) = glyph_mask(&e_mask, e_bbox, &ellipsis_page, GlyphProposal::Box);
+        let (e_fitted, _, _, _) = glyph_mask(&e_mask, e_bbox, &ellipsis_page, GlyphProposal::Box);
         assert!(
             e_fitted.contains(60, 38) && e_fitted.contains(60, 54) && e_fitted.contains(60, 70)
         );
+    }
+
+    #[test]
+    fn detector_tone_recovery_keeps_white_and_tinted_caption_paper_out_of_mask() {
+        for (tinted, oval) in [(false, false), (true, false), (false, true), (true, true)] {
+            let page = RgbImage::from_fn(200, 160, |x, y| {
+                let in_caption = if oval {
+                    let dx = (x as f32 - 100.0) / 60.0;
+                    let dy = (y as f32 - 80.0) / 50.0;
+                    dx * dx + dy * dy <= 1.0
+                } else {
+                    (40..160).contains(&x) && (30..130).contains(&y)
+                };
+                let border = !oval && in_caption && (x == 40 || x == 159 || y == 30 || y == 129);
+                let stroke = ((60..68).contains(&x) && (50..105).contains(&y))
+                    || ((88..96).contains(&x) && (50..105).contains(&y));
+                Rgb(if stroke {
+                    [15, 15, 15]
+                } else if tinted && border {
+                    [160, 160, 160]
+                } else if in_caption && tinted && (75..125).contains(&y) {
+                    [205, 240, 248]
+                } else if in_caption {
+                    [250, 250, 250]
+                } else {
+                    [180, 180, 180]
+                })
+            });
+            let bbox = [40.0, 30.0, 160.0, 130.0];
+            let pixels: Vec<u8> = if oval {
+                (30..130)
+                    .flat_map(|y| (40..160).map(move |x| (x, y)))
+                    .map(|(x, y)| {
+                        let dx = (x as f32 - 100.0) / 60.0;
+                        let dy = (y as f32 - 80.0) / 50.0;
+                        u8::from(dx * dx + dy * dy <= 1.0) * 255
+                    })
+                    .collect()
+            } else {
+                let mut pixels = vec![255u8; 120 * 100];
+                pixels[0] = 0;
+                pixels
+            };
+            let mask = Mask {
+                x: 40,
+                y: 30,
+                width: 120,
+                height: 100,
+                pixels,
+            };
+            let (fitted, _, _, _) = glyph_mask(&mask, bbox, &page, GlyphProposal::Segmented(bbox));
+            assert!(fitted.contains(64, 75) && fitted.contains(92, 75));
+            assert!(
+                !fitted.contains(130, 60) && !fitted.contains(130, 100),
+                "caption paper (tinted={tinted}, oval={oval}) must not be promoted to foreground"
+            );
+        }
+    }
+
+    #[test]
+    fn dense_two_tone_segmented_lettering_preserves_second_ink_tone() {
+        let bbox = [20.0, 20.0, 100.0, 80.0];
+        let tone = |x: u32, y: u32| {
+            if !(24..76).contains(&y) {
+                245
+            } else if (24..40).contains(&x) {
+                20
+            } else if (42..58).contains(&x) || (60..76).contains(&x) || (78..94).contains(&x) {
+                135
+            } else {
+                245
+            }
+        };
+        let page = RgbImage::from_fn(120, 100, |x, y| Rgb([tone(x, y); 3]));
+        let shape = GrayImage::from_fn(page.width(), page.height(), |x, y| {
+            Luma([u8::from(tone(x, y) != 245) * 255])
+        });
+        let mask = crop(&shape, 0, 0, page.width(), page.height());
+        let (fitted, _, _, _) = glyph_mask(&mask, bbox, &page, GlyphProposal::Segmented(bbox));
+        for x in [32, 50, 68, 86] {
+            assert!(fitted.contains(x, 50), "dense stroke at x={x} was dropped");
+        }
+    }
+
+    #[test]
+    fn mixed_box_and_segmented_ownership_respects_detector_support_in_both_orders() {
+        // 1. Smaller segmented SFX vs larger Box dialogue: dialogue must not
+        //    steal the SFX's recovered stroke edge 1 px outside its detector mask.
+        let page = RgbImage::from_fn(220, 160, |x, y| {
+            let sfx_stroke = (60..72).contains(&x) && (50..100).contains(&y);
+            let dialogue_stroke = (120..130).contains(&x) && (50..100).contains(&y);
+            Rgb(if sfx_stroke || dialogue_stroke {
+                [15, 15, 15]
+            } else {
+                [250, 250, 250]
+            })
+        });
+        let sfx_bbox = [52.0, 44.0, 80.0, 108.0];
+        let dialogue_bbox = [48.0, 36.0, 172.0, 124.0];
+        let mut sfx_pixels = vec![0u8; 28 * 64];
+        // Detector mask stops 1 px short of x=71 and keeps a cutout so it stays non-solid after trimming.
+        for y in 6..56 {
+            for x in 8..19 {
+                if !(x == 8 && y == 6) {
+                    sfx_pixels[y * 28 + x] = 255;
+                }
+            }
+        }
+        let sfx_mask = Mask {
+            x: 52,
+            y: 44,
+            width: 28,
+            height: 64,
+            pixels: sfx_pixels,
+        };
+        let dialogue_mask = Mask {
+            x: 48,
+            y: 36,
+            width: 124,
+            height: 88,
+            pixels: vec![255; 124 * 88],
+        };
+        let mut detections = [
+            KoharuLayoutDetection {
+                label_id: 0,
+                label: "onomatopoeia".to_owned(),
+                score: 0.9,
+                bbox: sfx_bbox,
+                area: sfx_mask.pixels.iter().filter(|&&p| p != 0).count() as u32,
+                mask: Arc::new(sfx_mask),
+            },
+            KoharuLayoutDetection {
+                label_id: 0,
+                label: "text".to_owned(),
+                score: 0.9,
+                bbox: dialogue_bbox,
+                area: 124 * 88,
+                mask: Arc::new(dialogue_mask),
+            },
+        ];
+        let [sfx, dialogue] = &mut detections;
+        fit_glyph_masks(
+            [
+                (GlyphProposal::Segmented(sfx_bbox), sfx),
+                (GlyphProposal::Box, dialogue),
+            ],
+            &page,
+        );
+        assert!(detections[0].mask.contains(71, 75));
+        assert!(!detections[1].mask.contains(71, 75));
+
+        // 2. Smaller Box dialogue overlapping a detector-supported stroke of a
+        //    larger segmented SFX: SFX keeps its detector-supported stroke.
+        let small_dialogue_bbox = [52.0, 44.0, 100.0, 108.0];
+        let large_sfx_bbox = [48.0, 36.0, 172.0, 124.0];
+        let mut large_sfx_pixels = vec![0u8; 124 * 88];
+        for y in 14..64 {
+            for x in 12..24 {
+                large_sfx_pixels[y * 124 + x] = 255;
+            }
+            for x in 72..82 {
+                large_sfx_pixels[y * 124 + x] = 255;
+            }
+        }
+        let large_sfx_mask = Mask {
+            x: 48,
+            y: 36,
+            width: 124,
+            height: 88,
+            pixels: large_sfx_pixels,
+        };
+        let small_dialogue_mask = Mask {
+            x: 52,
+            y: 44,
+            width: 48,
+            height: 64,
+            pixels: vec![255; 48 * 64],
+        };
+        let mut reverse = [
+            KoharuLayoutDetection {
+                label_id: 0,
+                label: "text".to_owned(),
+                score: 0.9,
+                bbox: small_dialogue_bbox,
+                area: 48 * 64,
+                mask: Arc::new(small_dialogue_mask),
+            },
+            KoharuLayoutDetection {
+                label_id: 0,
+                label: "onomatopoeia".to_owned(),
+                score: 0.9,
+                bbox: large_sfx_bbox,
+                area: large_sfx_mask.pixels.iter().filter(|&&p| p != 0).count() as u32,
+                mask: Arc::new(large_sfx_mask),
+            },
+        ];
+        let [small_dialogue, large_sfx] = &mut reverse;
+        fit_glyph_masks(
+            [
+                (GlyphProposal::Box, small_dialogue),
+                (GlyphProposal::Segmented(large_sfx_bbox), large_sfx),
+            ],
+            &page,
+        );
+        assert!(reverse[1].mask.contains(65, 75));
+        assert!(!reverse[0].mask.contains(65, 75));
     }
 }
