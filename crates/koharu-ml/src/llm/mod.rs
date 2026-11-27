@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 
 use self::model::Model;
 
-pub use koharu_llama::model::params::LlamaLoadMode;
+pub use koharu_llama::{context::params::KvCacheType, model::params::LlamaLoadMode};
 
 const DEFAULT_GPU_LAYERS: u32 = 1000;
 const DEFAULT_MAX_TOKENS: usize = 512;
@@ -49,12 +49,42 @@ impl Llm {
         self.model.eos_token()
     }
 
+    /// Returns the number of transformer layers in the loaded model.
+    #[must_use]
+    pub fn n_layer(&self) -> u32 {
+        self.model.n_layer()
+    }
+
+    /// Returns the total tensor size of the loaded model in bytes.
+    #[must_use]
+    pub fn model_size_bytes(&self) -> u64 {
+        self.model.model_size_bytes()
+    }
+
+    /// Returns the model's sliding window attention size, or `0` if unused.
+    #[must_use]
+    pub fn n_swa(&self) -> i32 {
+        self.model.n_swa()
+    }
+
+    /// Returns whether an MTP speculative decoding draft model is loaded.
+    #[must_use]
+    pub fn mtp_enabled(&self) -> bool {
+        self.model.mtp_enabled()
+    }
+
+    /// Returns the auto-planned MoE device cache size in bytes, or `0` if none was planned.
+    #[must_use]
+    pub fn recommended_moe_cache_bytes(&self) -> usize {
+        self.model.recommended_moe_cache_bytes()
+    }
+
     /// Applies the GGUF chat template with a generation prompt.
     pub fn render_chat_prompt(&self, messages: &[ChatMessage]) -> Result<String> {
         self.model.render_chat_prompt(messages)
     }
 
-    /// Generates unconstrained text for several inputs together.
+    /// Generates text for several inputs together.
     ///
     /// Returns one generation per input, in input order.
     pub fn inference_batch(
@@ -66,6 +96,20 @@ impl Llm {
     }
 }
 
+/// Controls CPU placement of Mixture-of-Experts tensors.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MoeOffload {
+    /// Automatically fit MoE tensors and dynamic expert cache to available VRAM.
+    #[default]
+    Auto,
+    /// Keep all MoE expert tensors on the selected accelerator.
+    None,
+    /// Place all MoE expert tensors on CPU.
+    AllCpu,
+    /// Place MoE expert tensors for the first `n` transformer layers on CPU.
+    FirstLayers(u32),
+}
+
 /// Options used while loading a GGUF model.
 #[derive(Debug, Clone)]
 pub struct LoadOptions {
@@ -75,8 +119,16 @@ pub struct LoadOptions {
     pub load_mode: LlamaLoadMode,
     /// Overrides an incorrect end-of-sequence token advertised by a GGUF file.
     pub eos_token_id: Option<i32>,
+    /// Controls CPU placement of Mixture-of-Experts tensors.
+    pub moe_offload: MoeOffload,
+    /// Bypass host memory buffers so extra buffer types can be used.
+    pub no_host: bool,
+    /// Use extra buffer types (for weight repacking).
+    pub use_extra_bufts: bool,
     /// Optional multimodal projector configuration.
     pub mtmd: Option<MtmdOptions>,
+    /// Optional Gemma 4 Multi-Token Prediction (MTP) speculative decoding configuration.
+    pub mtp: Option<MtpOptions>,
 }
 
 impl Default for LoadOptions {
@@ -85,7 +137,36 @@ impl Default for LoadOptions {
             gpu_layers: DEFAULT_GPU_LAYERS,
             load_mode: LlamaLoadMode::Auto,
             eos_token_id: None,
+            moe_offload: MoeOffload::Auto,
+            no_host: false,
+            use_extra_bufts: true,
             mtmd: None,
+            mtp: None,
+        }
+    }
+}
+
+/// Configuration for Gemma 4 Multi-Token Prediction (MTP) speculative decoding.
+#[derive(Debug, Clone)]
+pub struct MtpOptions {
+    /// Path to the MTP draft GGUF model.
+    pub model_path: PathBuf,
+    /// Number of draft layers to offload to the accelerator.
+    pub gpu_layers: u32,
+    /// Maximum number of draft tokens proposed per target forward pass.
+    pub n_draft: usize,
+    /// Minimum top-1 softmax probability required to keep a drafted token.
+    pub p_min: f32,
+}
+
+impl MtpOptions {
+    #[must_use]
+    pub fn new(model_path: impl Into<PathBuf>) -> Self {
+        Self {
+            model_path: model_path.into(),
+            gpu_layers: DEFAULT_GPU_LAYERS,
+            n_draft: 4,
+            p_min: 0.5,
         }
     }
 }
@@ -151,6 +232,23 @@ impl<'a> Input<'a> {
     }
 }
 
+/// GBNF grammar constraint for structured generation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Grammar {
+    pub gbnf: String,
+    pub root: String,
+}
+
+impl Grammar {
+    #[must_use]
+    pub fn new(gbnf: impl Into<String>, root: impl Into<String>) -> Self {
+        Self {
+            gbnf: gbnf.into(),
+            root: root.into(),
+        }
+    }
+}
+
 /// Sampling and context settings for one inference call.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GenerationOptions {
@@ -172,6 +270,31 @@ pub struct GenerationOptions {
     pub n_ubatch: Option<u32>,
     pub n_threads: Option<i32>,
     pub n_threads_batch: Option<i32>,
+    /// Enables flash attention (`LLAMA_FLASH_ATTN_TYPE_ENABLED` when true).
+    pub flash_attn: bool,
+    /// Uses full-size SWA KV cache instead of sliding window allocation.
+    pub swa_full: bool,
+    #[serde(with = "serde_kv_cache_type")]
+    pub kv_cache_type_k: Option<KvCacheType>,
+    #[serde(with = "serde_kv_cache_type")]
+    pub kv_cache_type_v: Option<KvCacheType>,
+    /// Shares a unified KV buffer across sequences when enabled.
+    pub kv_unified: bool,
+    /// Offloads KQV operations to the accelerator.
+    pub offload_kqv: bool,
+    /// Offloads host tensor operations to the accelerator.
+    pub op_offload: bool,
+    /// Device cache for MoE experts in host memory. `None` uses the automatic planner's
+    /// recommendation when available, `Some(0)` disables the cache, and `Some(n)` sets its size in bytes.
+    pub moe_cache_size: Option<usize>,
+    /// Share of MoE cache misses computed on CPU instead of uploaded (`0.0..=1.0`).
+    pub moe_cache_cpu_share: f32,
+    /// Optional GBNF grammar constraint enforced during sampling.
+    pub grammar: Option<Grammar>,
+    /// Whether to render special/control tokens into generated text.
+    pub decode_special_tokens: bool,
+    /// Whether to abort generation when a short token repetition loop is detected.
+    pub abort_on_repetition_loop: bool,
 }
 
 impl Default for GenerationOptions {
@@ -193,7 +316,92 @@ impl Default for GenerationOptions {
             n_ubatch: None,
             n_threads: None,
             n_threads_batch: None,
+            flash_attn: true,
+            swa_full: false,
+            kv_cache_type_k: None,
+            kv_cache_type_v: None,
+            kv_unified: false,
+            offload_kqv: true,
+            op_offload: true,
+            moe_cache_size: None,
+            moe_cache_cpu_share: 0.0,
+            grammar: None,
+            decode_special_tokens: false,
+            abort_on_repetition_loop: true,
         }
+    }
+}
+
+mod serde_kv_cache_type {
+    use koharu_llama::context::params::KvCacheType;
+    use serde::{Deserialize, Deserializer, Serializer, de, ser::Error as _};
+
+    macro_rules! cache_types {
+        ($($kind:ident),+ $(,)?) => {
+            const NAMES: &[(KvCacheType, &str)] = &[$((KvCacheType::$kind, stringify!($kind))),+];
+
+            fn name(kind: KvCacheType) -> Option<&'static str> {
+                match kind {
+                    $(KvCacheType::$kind => Some(stringify!($kind)),)+
+                    KvCacheType::Unknown(_) => None,
+                }
+            }
+        };
+    }
+
+    cache_types!(
+        F32, F16, Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q8_1, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, Q8_K, IQ2_XXS,
+        IQ2_XS, IQ3_XXS, IQ1_S, IQ4_NL, IQ3_S, IQ2_S, IQ4_XS, I8, I16, I32, I64, F64, IQ1_M, BF16,
+        TQ1_0, TQ2_0, MXFP4,
+    );
+
+    pub fn serialize<S: Serializer>(
+        value: &Option<KvCacheType>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        match value {
+            None => serializer.serialize_none(),
+            Some(kind) => serializer.serialize_some(
+                name(*kind)
+                    .ok_or_else(|| S::Error::custom(format!("unknown KvCacheType: {kind:?}")))?,
+            ),
+        }
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Option<KvCacheType>, D::Error> {
+        Option::<String>::deserialize(deserializer)?
+            .map(|name| {
+                NAMES
+                    .iter()
+                    .find(|(_, key)| key.eq_ignore_ascii_case(&name))
+                    .map(|&(kind, _)| kind)
+                    .ok_or_else(|| de::Error::custom(format!("unknown KvCacheType: {name}")))
+            })
+            .transpose()
+    }
+
+    #[cfg(test)]
+    #[test]
+    fn named_cache_types_round_trip_in_generation_options() {
+        use super::GenerationOptions;
+        for &(kind, name) in NAMES {
+            let options = GenerationOptions {
+                kv_cache_type_k: Some(kind),
+                ..Default::default()
+            };
+            let json = serde_json::to_value(&options).unwrap();
+            assert_eq!(json["kv_cache_type_k"], name);
+            let decoded: GenerationOptions = serde_json::from_value(json).unwrap();
+            assert_eq!(decoded.kv_cache_type_k, Some(kind));
+            assert_eq!(decoded.kv_cache_type_v, None);
+        }
+        let unknown = GenerationOptions {
+            kv_cache_type_v: Some(KvCacheType::Unknown(1000)),
+            ..Default::default()
+        };
+        assert!(serde_json::to_value(unknown).is_err());
     }
 }
 
