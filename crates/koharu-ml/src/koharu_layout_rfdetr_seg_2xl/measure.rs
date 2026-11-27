@@ -463,7 +463,7 @@ pub(super) fn outline(
     // Past the farthest ring, and twice the closing radius, so the closing
     // never reaches the canvas's edge, where imageproc's erosion would keep
     // it.
-    let margin = (far + 2).max(2 * radius);
+    let margin = (far + 6).max(2 * radius);
     let (x0, y0) = (left.saturating_sub(margin), top.saturating_sub(margin));
     let x1 = (left + glyphs.width() + margin).min(page.width());
     let y1 = (top + glyphs.height() + margin).min(page.height());
@@ -476,7 +476,7 @@ pub(super) fn outline(
     let mut body = close(&shape, Norm::LInf, radius as u8);
     fill_holes(&mut body);
     let distance = euclidean_squared_distance_transform(&shape);
-    let mut rings: Vec<Vec<[u8; 3]>> = vec![Vec::new(); far as usize + 3];
+    let mut rings: Vec<Vec<[u8; 3]>> = vec![Vec::new(); far as usize + 7];
     for (x, y, squared) in distance.enumerate_pixels() {
         let ring = squared.0[0].sqrt().ceil() as usize;
         if body.get_pixel(x, y).0[0] == 0 && (1..rings.len()).contains(&ring) {
@@ -490,25 +490,85 @@ pub(super) fn outline(
             .count();
         near as f32 / ring.len().max(1) as f32
     };
-    let band = rings.get(2).filter(|ring| ring.len() >= 16)?;
-    let color: [u8; 3] = std::array::from_fn(|at| {
-        let mut channel: Vec<u8> = band.iter().map(|pixel| pixel[at]).collect();
-        channel.sort_unstable();
-        channel[channel.len() / 2]
-    });
-    let unlike_ink = ink.is_none_or(|ink| (0..3).any(|at| ink[at].abs_diff(color[at]) > 80));
-    if share(band, color) < 0.8 || !unlike_ink {
-        return None;
-    }
-    let shares: Vec<f32> = rings.iter().map(|ring| share(ring, color)).collect();
-    let drop = |ring: usize| shares[ring] - shares[ring + 2];
-    let end =
-        (2..=far as usize).reduce(|end, ring| if drop(ring) > drop(end) { ring } else { end })?;
-    let held = shares[2..=end].iter().sum::<f32>() / (end - 1) as f32;
-    (drop(end) >= 0.15 && held >= 0.8 && rings[end + 2].len() >= 16).then_some(Outline {
-        color,
-        width: end as f32,
-    })
+    let ring_median = |ring: &[[u8; 3]]| -> [u8; 3] {
+        std::array::from_fn(|at| {
+            let mut channel: Vec<u8> = ring.iter().map(|pixel| pixel[at]).collect();
+            channel.sort_unstable();
+            channel[channel.len() / 2]
+        })
+    };
+    let try_ring = |start: usize, min_drop: f32, guard_aa: bool| -> Option<Outline> {
+        let band = rings.get(start).filter(|ring| ring.len() >= 16)?;
+        let color = ring_median(band);
+        let unlike_ink = ink.is_none_or(|ink| (0..3).any(|at| ink[at].abs_diff(color[at]) > 80));
+        if share(band, color) < 0.8 || !unlike_ink {
+            return None;
+        }
+        let shares: Vec<f32> = rings.iter().map(|ring| share(ring, color)).collect();
+        let drop = |ring: usize| shares[ring] - shares[ring + 2];
+        let limit = if guard_aa {
+            (far as usize).min(2)
+        } else {
+            far as usize
+        };
+        if start > limit {
+            return None;
+        }
+        let end =
+            (start..=limit).reduce(|end, ring| if drop(ring) > drop(end) { ring } else { end })?;
+        let held = shares[start..=end].iter().sum::<f32>() / (end - start + 1) as f32;
+        if drop(end) < min_drop || held < 0.8 || rings[end + 2].len() < 16 {
+            return None;
+        }
+        // Reject a thin border, screentone dot, or hatching line on uniform
+        // paper: the paper colour dips briefly at `end + 2` and bounces right
+        // back to >= 0.85 outside.
+        let bounces_back = ((end + 3)..rings.len().min(end + 7)).any(|r| {
+            rings[r].len() >= 16 && shares[r] >= 0.85 && shares[r] >= shares[end + 2] + 0.15
+        });
+        if bounces_back {
+            return None;
+        }
+
+        if guard_aa {
+            // Reject an antialiased transition ring between ink and a uniform background.
+            if let Some(ink_c) = ink {
+                let outer = ring_median(&rings[end + 2]);
+                if share(&rings[end + 2], outer) >= 0.65 {
+                    let diff = [
+                        f32::from(outer[0]) - f32::from(ink_c[0]),
+                        f32::from(outer[1]) - f32::from(ink_c[1]),
+                        f32::from(outer[2]) - f32::from(ink_c[2]),
+                    ];
+                    let norm_sq = diff[0] * diff[0] + diff[1] * diff[1] + diff[2] * diff[2];
+                    if norm_sq > 1.0 {
+                        let t = ((f32::from(color[0]) - f32::from(ink_c[0])) * diff[0]
+                            + (f32::from(color[1]) - f32::from(ink_c[1])) * diff[1]
+                            + (f32::from(color[2]) - f32::from(ink_c[2])) * diff[2])
+                            / norm_sq;
+                        if (0.12..=0.88).contains(&t) {
+                            let blend_err = (0..3)
+                                .map(|c| {
+                                    (f32::from(color[c]) - (f32::from(ink_c[c]) + t * diff[c]))
+                                        .abs()
+                                })
+                                .fold(0.0f32, f32::max);
+                            if blend_err <= 28.0 {
+                                return None;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let width = if end == 1 && shares.get(2).copied().unwrap_or(0.0) >= 0.45 {
+            2.0
+        } else {
+            end as f32
+        };
+        Some(Outline { color, width })
+    };
+    try_ring(2, 0.15, false).or_else(|| try_ring(1, 0.15, true))
 }
 
 /// Detector evidence available before a proposal is fitted to source ink.
@@ -736,14 +796,53 @@ fn glyph_mask(
     let labels = parts.pixels().map(|part| part.0[0]).max().unwrap_or(0) as usize;
     // Part 0 is the background, never near.
     let mut near = vec![false; labels + 1];
+    let mut part_area = vec![0u32; labels + 1];
+    let mut part_extents: Vec<Option<[u32; 4]>> = vec![None; labels + 1];
     let radius = reach as f32;
     for (x, y, part) in parts.enumerate_pixels() {
+        let l = part.0[0] as usize;
+        if l == 0 {
+            continue;
+        }
+        part_area[l] += 1;
+        let e = part_extents[l].get_or_insert([x, y, x, y]);
+        *e = [e[0].min(x), e[1].min(y), e[2].max(x), e[3].max(y)];
         let (page_x, page_y) = ((mask.x + x) as f32, (mask.y + y) as f32);
-        if part.0[0] != 0
-            && (left - radius..right + radius).contains(&page_x)
+        if (left - radius..right + radius).contains(&page_x)
             && (top - radius..bottom + radius).contains(&page_y)
         {
-            near[part.0[0] as usize] = true;
+            near[l] = true;
+        }
+    }
+    let largest_near = (1..=labels)
+        .filter(|&l| near[l])
+        .map(|l| part_area[l])
+        .max()
+        .unwrap_or(0);
+    if largest_near >= 64 {
+        let speck_side = scaled(5.0, page_width, page_height).max(4);
+        let speck_candidates: Vec<usize> = (1..=labels)
+            .filter(|&l| {
+                near[l]
+                    && part_extents[l].is_some_and(|[x0, y0, x1, y1]| {
+                        let side = (x1 - x0 + 1).max(y1 - y0 + 1);
+                        side <= speck_side && part_area[l] * 25 < largest_near
+                    })
+            })
+            .collect();
+        // Drop stray specks outside `bbox` or when many tiny specks appear
+        // (screentone fields), while preserving isolated small kana/punctuation
+        // inside `bbox` on small pages.
+        let many_specks = speck_candidates.len() >= 4;
+        for l in speck_candidates {
+            if let Some([x0, y0, x1, y1]) = part_extents[l] {
+                let cx = (mask.x + (x0 + x1) / 2) as f32;
+                let cy = (mask.y + (y0 + y1) / 2) as f32;
+                let inside_box = (left..right).contains(&cx) && (top..bottom).contains(&cy);
+                if !inside_box || many_specks || part_area[l] <= 12 {
+                    near[l] = false;
+                }
+            }
         }
     }
     let clipped = GrayImage::from_fn(mask.width, mask.height, |x, y| {
@@ -766,6 +865,7 @@ fn glyph_mask(
         corner: [left, top],
         held,
         paper,
+        borders,
         ..
     }) = ink(&block, page, reach, Some(bbox))
     else {
@@ -796,6 +896,42 @@ fn glyph_mask(
     // with no stroke evidence of its own. Keep only its source ink. For a
     // segmented proposal retain the detector's stroke and outline evidence.
     if matches!(proposal, GlyphProposal::Segmented(_)) && mask.pixels.contains(&0) {
+        // When `plain(boxed)` returned `None` (for example a translucent bubble
+        // over textured or gradient art), check whether the ink is outlined.
+        // If not, build a background palette from non-ink pixels outside `mask`
+        // and inside `bbox` away from ink strokes so coarse segmented blobs do
+        // not copy translucent background into the mask.
+        let bg_palette: Option<Vec<[u8; 3]>> = if paper.is_none() {
+            let approx_size = (bbox[2] - bbox[0]).min(bbox[3] - bbox[1]).max(12.0);
+            let ink_corner = [
+                (left + i64::from(margin)) as u32,
+                (top + i64::from(margin)) as u32,
+            ];
+            let block_ink = GrayImage::from_fn(block.width, block.height, |x, y| {
+                let ix = block.x + x;
+                let iy = block.y + y;
+                let set = ix >= ink_corner[0]
+                    && iy >= ink_corner[1]
+                    && ix - ink_corner[0] < ink.width()
+                    && iy - ink_corner[1] < ink.height()
+                    && ink.get_pixel(ix - ink_corner[0], iy - ink_corner[1]).0[0] != 0;
+                Luma([u8::from(set) * 255])
+            });
+            let has_outline = outline(page, &ink, ink_corner, approx_size, None).is_some()
+                || outlined(page, &block, &mask, &block_ink, [block.x, block.y], |_| {
+                    approx_size
+                })
+                .is_some();
+            if has_outline {
+                None
+            } else {
+                Some(sample_background_palette(
+                    page, &mask, &ink, ink_corner, bbox, reach,
+                ))
+            }
+        } else {
+            None
+        };
         for (index, _) in mask
             .pixels
             .iter()
@@ -804,11 +940,31 @@ fn glyph_mask(
         {
             let px = mask.x + index as u32 % mask.width;
             let py = mask.y + index as u32 / mask.width;
+            let (ix, iy) = (
+                i64::from(px) - (left + i64::from(margin)),
+                i64::from(py) - (top + i64::from(margin)),
+            );
+            if let Some(ref borders) = borders
+                && (0..i64::from(borders.width())).contains(&ix)
+                && (0..i64::from(borders.height())).contains(&iy)
+                && borders.get_pixel(ix as u32, iy as u32).0[0] != 0
+            {
+                continue;
+            }
+            let pixel = page[(px, py)].0;
             // A coarse RF-DETR blob can bridge open paper between glyphs.
-            // Its pixels carry no extra stroke evidence on uniform paper.
-            if paper.is_some_and(|paper| {
-                (0..3).all(|c| page[(px, py)][c].abs_diff(paper[c]) <= PAPER_TOLERANCE)
-            }) {
+            // Its pixels carry no extra stroke evidence on uniform paper or
+            // translucent bubble backgrounds.
+            if paper
+                .is_some_and(|paper| (0..3).all(|c| pixel[c].abs_diff(paper[c]) <= PAPER_TOLERANCE))
+            {
+                continue;
+            }
+            if let Some(ref palette) = bg_palette
+                && palette
+                    .iter()
+                    .any(|bg| (0..3).all(|c| pixel[c].abs_diff(bg[c]) <= PAPER_TOLERANCE))
+            {
                 continue;
             }
             let (x, y) = (i64::from(px) - left, i64::from(py) - top);
@@ -825,13 +981,41 @@ fn glyph_mask(
     let [box_left, box_top, box_right, box_bottom] = bbox;
     let mut enclosed = canvas.clone();
     fill_holes(&mut enclosed);
-    for (x, y, pixel) in enclosed.enumerate_pixels() {
-        let (page_x, page_y) = ((left + i64::from(x)) as f32, (top + i64::from(y)) as f32);
-        if pixel.0[0] != 0
-            && (box_left..box_right).contains(&page_x)
-            && (box_top..box_bottom).contains(&page_y)
-        {
-            canvas.put_pixel(x, y, Luma([255]));
+    let holes = GrayImage::from_fn(canvas.width(), canvas.height(), |x, y| {
+        Luma([
+            u8::from(enclosed.get_pixel(x, y).0[0] != 0 && canvas.get_pixel(x, y).0[0] == 0) * 255,
+        ])
+    });
+    let hole_parts = connected_components(&holes, Connectivity::Four, Luma([0]));
+    let hole_labels = hole_parts.pixels().map(|p| p.0[0]).max().unwrap_or(0) as usize;
+    let mut hole_extents: Vec<Option<[u32; 4]>> = vec![None; hole_labels + 1];
+    for (x, y, p) in hole_parts.enumerate_pixels() {
+        let l = p.0[0] as usize;
+        if l == 0 {
+            continue;
+        }
+        let e = hole_extents[l].get_or_insert([x, y, x, y]);
+        *e = [e[0].min(x), e[1].min(y), e[2].max(x), e[3].max(y)];
+    }
+    let box_area = ((box_right - box_left).max(1.0) * (box_bottom - box_top).max(1.0)) as u32;
+    let keep_hole: Vec<bool> = hole_extents
+        .into_iter()
+        .map(|ext| {
+            ext.is_some_and(|[x0, y0, x1, y1]| {
+                let (hw, hh) = (x1 - x0 + 1, y1 - y0 + 1);
+                // A glyph counter or outlined glyph fill is never nearly as
+                // large as an entire frame-enclosed text box.
+                hw * hh * 4 < 3 * box_area
+            })
+        })
+        .collect();
+    for (x, y, p) in hole_parts.enumerate_pixels() {
+        let l = p.0[0] as usize;
+        if l != 0 && keep_hole[l] {
+            let (page_x, page_y) = ((left + i64::from(x)) as f32, (top + i64::from(y)) as f32);
+            if (box_left..box_right).contains(&page_x) && (box_top..box_bottom).contains(&page_y) {
+                canvas.put_pixel(x, y, Luma([255]));
+            }
         }
     }
     let core = crop(&canvas, left, top, page_width, page_height);
@@ -845,7 +1029,7 @@ fn glyph_mask(
 
 /// Fills what `canvas`'s marked pixels enclose: unmarked areas its edge
 /// can't reach.
-fn fill_holes(canvas: &mut GrayImage) {
+pub(super) fn fill_holes(canvas: &mut GrayImage) {
     let (width, height) = (canvas.width() as usize, canvas.height() as usize);
     if width == 0 || height == 0 {
         return;
@@ -926,6 +1110,7 @@ struct Ink {
     corner: [u32; 2],
     held: Option<[u32; 4]>,
     paper: Option<[u8; 3]>,
+    borders: Option<GrayImage>,
 }
 
 /// The page's crop around the block and the detection's box, `reach` pixels
@@ -1048,14 +1233,14 @@ fn ink(block: &Mask, page: &RgbImage, reach: u32, bbox: Option<[f32; 4]>) -> Opt
         histogram[usize::from(pixel[0])] += 1.0;
     }
     let level = split_distribution(&histogram, 0.1);
-    let threshold = sample
+    let mut threshold = sample
         .as_raw()
         .iter()
         .copied()
         .filter(|value| *value < level)
         .max()
         .map_or(0, |value| u16::from(value) + 1);
-    let dark = GrayImage::from_fn(width, height, |x, y| {
+    let mut dark = GrayImage::from_fn(width, height, |x, y| {
         Luma([if u16::from(gray.get_pixel(x, y).0[0]) < threshold {
             255
         } else {
@@ -1063,21 +1248,103 @@ fn ink(block: &Mask, page: &RgbImage, reach: u32, bbox: Option<[f32; 4]>) -> Opt
         }])
     });
     let (mut around, mut dark_around, mut covered, mut dark_covered) = (0u32, 0u32, 0u32, 0u32);
+    let ring_x0 = offset_x.saturating_sub(surround);
+    let ring_y0 = offset_y.saturating_sub(surround);
+    let ring_x1 = (offset_x + block.width + surround).min(width);
+    let ring_y1 = (offset_y + block.height + surround).min(height);
     for (x, y, pixel) in dark.enumerate_pixels() {
         let is_dark = u32::from(pixel.0[0] != 0);
         if inside(x, y) {
             covered += 1;
             dark_covered += is_dark;
-        } else {
+        } else if (ring_x0..ring_x1).contains(&x) && (ring_y0..ring_y1).contains(&y) {
             around += 1;
             dark_around += is_dark;
         }
     }
-    let light_ink = if around > 0 {
+    // A solid rectangular box proposal holds both ink (minority) and background
+    // (majority); its immediate exterior can be a frame border or dark art
+    // outside a speech bubble.
+    let solid_box = bbox.is_some()
+        && !block.pixels.contains(&0)
+        && dark_covered > 0
+        && dark_covered < covered
+        && (4 * dark_covered < covered || 4 * (covered - dark_covered) < covered);
+    let mut light_ink = if solid_box {
+        2 * dark_covered > covered
+    } else if around > 0 {
         2 * dark_around > around
     } else {
         2 * dark_covered > covered
     };
+    // On a translucent bubble over textured art, global Otsu often merges the
+    // darkened bubble-tinted art with dark text ink into one bimodal class,
+    // which can even flip `dark_around > around / 2`. Check both the initial
+    // ink side and (when `light_ink` was flipped by mid-tone dark art) the
+    // dark side; if refined, recompute `dark` and polarity.
+    let refined = if !light_ink {
+        refine_bimodal_ink_threshold(sample, threshold, false)
+    } else {
+        None
+    }
+    .or_else(|| {
+        if light_ink && threshold > 110 {
+            // Only try dark-side refinement when the light class also reaches
+            // the region border (a light translucent bubble background, not
+            // light lettering enclosed in a dark outline over grey art).
+            let (sw, sh) = sample.dimensions();
+            let (mut b_total, mut b_light) = (0u32, 0u32);
+            for (x, y, p) in sample.enumerate_pixels() {
+                if x < 2 || y < 2 || x + 2 >= sw || y + 2 >= sh {
+                    b_total += 1;
+                    if u16::from(p.0[0]) >= threshold {
+                        b_light += 1;
+                    }
+                }
+            }
+            if b_total > 0 && (b_light as f32) >= 0.15 * b_total as f32 {
+                refine_bimodal_ink_threshold(sample, threshold, false)
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    });
+    if let Some(refined) = refined {
+        threshold = refined;
+        dark = GrayImage::from_fn(width, height, |x, y| {
+            Luma([if u16::from(gray.get_pixel(x, y).0[0]) < threshold {
+                255
+            } else {
+                0
+            }])
+        });
+        let (mut r_around, mut r_dark_around, mut r_covered, mut r_dark_covered) =
+            (0u32, 0u32, 0u32, 0u32);
+        for (x, y, pixel) in dark.enumerate_pixels() {
+            let is_dark = u32::from(pixel.0[0] != 0);
+            if inside(x, y) {
+                r_covered += 1;
+                r_dark_covered += is_dark;
+            } else if (ring_x0..ring_x1).contains(&x) && (ring_y0..ring_y1).contains(&y) {
+                r_around += 1;
+                r_dark_around += is_dark;
+            }
+        }
+        let r_solid_box = bbox.is_some()
+            && !block.pixels.contains(&0)
+            && r_dark_covered > 0
+            && r_dark_covered < r_covered
+            && (4 * r_dark_covered < r_covered || 4 * (r_covered - r_dark_covered) < r_covered);
+        light_ink = if r_solid_box {
+            2 * r_dark_covered > r_covered
+        } else if r_around > 0 {
+            2 * r_dark_around > r_around
+        } else {
+            2 * r_dark_covered > r_covered
+        };
+    }
     let is_ink = |x: u32, y: u32| (dark.get_pixel(x, y).0[0] != 0) != light_ink;
 
     if bbox.is_none() {
@@ -1094,6 +1361,7 @@ fn ink(block: &Mask, page: &RgbImage, reach: u32, bbox: Option<[f32; 4]>) -> Opt
             corner: [block.x, block.y],
             held: None,
             paper: None,
+            borders: None,
         });
     }
 
@@ -1154,9 +1422,11 @@ fn ink(block: &Mask, page: &RgbImage, reach: u32, bbox: Option<[f32; 4]>) -> Opt
     });
     let pieces = connected_components(&all_ink, Connectivity::Eight, Luma([0]));
     let mut lettering = vec![false; labels(&pieces)];
+    let mut drop_dot = vec![false; labels(&pieces)];
     // The extent of the glyphs the block holds inside the box, in the crop.
     let mut held_extent: Option<[u32; 4]> = None;
     let mut paper_color = None;
+    let mut is_plain_bg = false;
     if let (Some(boxed), Some(lined)) = (boxed, lined) {
         let within = |[box_left, box_top, box_right, box_bottom]: [u32; 4], x: u32, y: u32| {
             (box_left..box_right).contains(&(x + left))
@@ -1202,8 +1472,67 @@ fn ink(block: &Mask, page: &RgbImage, reach: u32, bbox: Option<[f32; 4]>) -> Opt
                 (close as f32 >= PLAIN_PAPER * count as f32).then_some(medians)
             }
         };
-        paper_color = plain(boxed);
-        let (plain_box, plain_line) = (paper_color.is_some(), plain(lined).is_some());
+        // Screentone dot fields leave only uniform white gaps after dilating
+        // `all_ink`, which would otherwise fool `plain()` into treating every
+        // dot inside a loose box as lettering. Detect screentone by counting
+        // tiny isolated ink specks when genuine glyph-sized components exist.
+        let dot_side = scaled(5.0, page.width(), page.height()).max(5);
+        let piece_count = labels(&pieces);
+        let mut piece_area = vec![0u32; piece_count];
+        let mut piece_extents: Vec<Option<[u32; 4]>> = vec![None; piece_count];
+        let mut piece_in_box = vec![false; piece_count];
+        for (x, y, p) in pieces.enumerate_pixels() {
+            let l = p.0[0] as usize;
+            if l == 0 {
+                continue;
+            }
+            piece_area[l] += 1;
+            let e = piece_extents[l].get_or_insert([x, y, x, y]);
+            *e = [e[0].min(x), e[1].min(y), e[2].max(x), e[3].max(y)];
+            if within(boxed, x, y) {
+                piece_in_box[l] = true;
+            }
+        }
+        let mut tiny_dots = 0u32;
+        let mut has_large_glyph = false;
+        let mut is_screentone_dot = vec![false; piece_count];
+        for l in 1..piece_count {
+            if let Some([x0, y0, x1, y1]) = piece_extents[l] {
+                let side = (x1 - x0 + 1).max(y1 - y0 + 1);
+                if side <= dot_side && piece_area[l] <= dot_side * dot_side {
+                    tiny_dots += 1;
+                    is_screentone_dot[l] = true;
+                } else if piece_in_box[l] && side >= 12 && piece_area[l] >= 40 {
+                    has_large_glyph = true;
+                }
+            }
+        }
+        let has_screentone = has_large_glyph && tiny_dots >= 12;
+        if has_screentone {
+            let large_img = GrayImage::from_fn(width, height, |x, y| {
+                let l = pieces.get_pixel(x, y).0[0] as usize;
+                Luma([u8::from(l != 0 && !is_screentone_dot[l]) * 255])
+            });
+            let near_large = dilate(&large_img, Norm::LInf, 5);
+            let mut dot_near_glyph = vec![false; piece_count];
+            for (x, y, p) in pieces.enumerate_pixels() {
+                let l = p.0[0] as usize;
+                if l != 0 && is_screentone_dot[l] && near_large.get_pixel(x, y).0[0] != 0 {
+                    dot_near_glyph[l] = true;
+                }
+            }
+            for l in 1..piece_count {
+                if is_screentone_dot[l] && !dot_near_glyph[l] {
+                    drop_dot[l] = true;
+                }
+            }
+        }
+        paper_color = if has_screentone { None } else { plain(boxed) };
+        let (plain_box, plain_line) = (
+            paper_color.is_some(),
+            !has_screentone && plain(lined).is_some(),
+        );
+        is_plain_bg = plain_box || plain_line;
         if plain_box || plain_line {
             // The paper's parts, and the one covering most of the box.
             let paper = connected_components(&all_ink, Connectivity::Four, Luma([255]));
@@ -1279,13 +1608,24 @@ fn ink(block: &Mask, page: &RgbImage, reach: u32, bbox: Option<[f32; 4]>) -> Opt
             }
         }
     }
+    let border_mask = if line >= 12 && is_plain_bg {
+        crossing_border_mask(&all_ink, &pieces, &near, &inside, line)
+    } else {
+        None
+    };
+    let is_border = |x: u32, y: u32| {
+        border_mask
+            .as_ref()
+            .is_some_and(|mask| mask.get_pixel(x, y).0[0] != 0)
+    };
     let ink = GrayImage::from_fn(width, height, |x, y| {
         let part = parts.get_pixel(x, y).0[0] as usize;
+        let piece = pieces.get_pixel(x, y).0[0] as usize;
         let cut_off = joins[part] && !runs_on[part];
         Luma([
-            if (inside(x, y) && is_ink(x, y))
-                || cut_off
-                || lettering[pieces.get_pixel(x, y).0[0] as usize]
+            if !is_border(x, y)
+                && !drop_dot[piece]
+                && ((inside(x, y) && is_ink(x, y)) || cut_off || lettering[piece])
             {
                 255
             } else {
@@ -1304,7 +1644,435 @@ fn ink(block: &Mask, page: &RgbImage, reach: u32, bbox: Option<[f32; 4]>) -> Opt
         corner: [left, top],
         held,
         paper: paper_color,
+        borders: border_mask,
     })
+}
+
+/// Identifies pixels of panel bars, speedlines, grazing bubble walls, and
+/// enclosing frame loops that cross or surround `block`. Intersections with
+/// genuine glyph strokes are protected so glyph recall is preserved.
+fn crossing_border_mask(
+    all_ink: &GrayImage,
+    pieces: &ImageBuffer<Luma<u32>, Vec<u32>>,
+    near: &GrayImage,
+    inside: &impl Fn(u32, u32) -> bool,
+    line: u32,
+) -> Option<GrayImage> {
+    let (width, height) = all_ink.dimensions();
+    let max_label = pieces.pixels().map(|p| p.0[0]).max().unwrap_or(0) as usize;
+    if max_label == 0 {
+        return None;
+    }
+    let mut leaves_near = vec![false; max_label + 1];
+    let mut in_block = vec![false; max_label + 1];
+    let mut comp_area = vec![0u64; max_label + 1];
+    let mut extents: Vec<Option<[u32; 4]>> = vec![None; max_label + 1];
+    for (x, y, p) in pieces.enumerate_pixels() {
+        let l = p.0[0] as usize;
+        if l == 0 {
+            continue;
+        }
+        comp_area[l] += 1;
+        if near.get_pixel(x, y).0[0] == 0 {
+            leaves_near[l] = true;
+        }
+        if inside(x, y) {
+            in_block[l] = true;
+        }
+        let e = extents[l].get_or_insert([x, y, x, y]);
+        *e = [e[0].min(x), e[1].min(y), e[2].max(x), e[3].max(y)];
+    }
+
+    // 1. Detect enclosed frame loops: hollow components longer than `line` that
+    //    enclose separate glyph-sized ink components inside their interior.
+    let mut is_frame_loop = vec![false; max_label + 1];
+    for l in 1..=max_label {
+        if !in_block[l] {
+            continue;
+        }
+        let Some([x0, y0, x1, y1]) = extents[l] else {
+            continue;
+        };
+        let (ew, eh) = (u64::from(x1 - x0 + 1), u64::from(y1 - y0 + 1));
+        if ew.max(eh) <= u64::from(line) || ew.min(eh) < 16 || comp_area[l] * 4 >= ew * eh {
+            continue;
+        }
+        // Check if this component encloses both paper margin and separate
+        // glyph-sized ink components (never triggers on an outline shell
+        // tightly hugging its glyphs).
+        let (cw, ch) = ((x1 - x0 + 3), (y1 - y0 + 3));
+        let mut comp_img = GrayImage::new(cw, ch);
+        for yy in y0..=y1 {
+            for xx in x0..=x1 {
+                if pieces.get_pixel(xx, yy).0[0] as usize == l {
+                    comp_img.put_pixel(xx - x0 + 1, yy - y0 + 1, Luma([255]));
+                }
+            }
+        }
+        let mut filled = comp_img.clone();
+        fill_holes(&mut filled);
+        let mut enclosed_other_ink = 0u32;
+        let mut enclosed_paper = 0u32;
+        for yy in y0..=y1 {
+            for xx in x0..=x1 {
+                if filled.get_pixel(xx - x0 + 1, yy - y0 + 1).0[0] != 0
+                    && comp_img.get_pixel(xx - x0 + 1, yy - y0 + 1).0[0] == 0
+                {
+                    let pl = pieces.get_pixel(xx, yy).0[0] as usize;
+                    if pl == 0 {
+                        enclosed_paper += 1;
+                    } else if pl != l {
+                        enclosed_other_ink += 1;
+                    }
+                }
+            }
+        }
+        if enclosed_other_ink >= 16 && enclosed_paper > enclosed_other_ink {
+            is_frame_loop[l] = true;
+        }
+    }
+
+    // 2. Detect components exiting `near` (or enclosing the text as a frame loop)
+    //    that are long and thin/sparse.
+    let candidate: Vec<bool> = (0..=max_label)
+        .map(|l| {
+            in_block[l]
+                && (is_frame_loop[l]
+                    || (leaves_near[l]
+                        && extents[l].is_some_and(|[x0, y0, x1, y1]| {
+                            let (ew, eh) = (u64::from(x1 - x0 + 1), u64::from(y1 - y0 + 1));
+                            let long = ew.max(eh);
+                            let short = ew.min(eh);
+                            let thin_bar = u64::from((line / 3).clamp(4, 16));
+                            long > u64::from(line)
+                                && (short <= thin_bar || comp_area[l] * 4 < ew * eh)
+                        })))
+        })
+        .collect();
+
+    if !candidate.iter().any(|&c| c) {
+        return None;
+    }
+
+    // Precompute 36 fixed unit directions covering [0, pi) in 5-degree steps.
+    let dirs: [(f32, f32); 36] = std::array::from_fn(|k| {
+        let theta = (k as f32) * std::f32::consts::PI / 36.0;
+        (theta.cos(), theta.sin())
+    });
+    let min_chord = (line as f32 * 0.85).max(20.0);
+    let max_steps = ((width.max(height) / 2) as i32).min(200);
+
+    let has_ink_3x3 = |fx: f32, fy: f32| -> Option<(u32, u32)> {
+        let ix = fx.round() as i32;
+        let iy = fy.round() as i32;
+        if ix < 0 || iy < 0 || ix >= width as i32 || iy >= height as i32 {
+            return None;
+        }
+        if all_ink.get_pixel(ix as u32, iy as u32).0[0] != 0 {
+            return Some((ix as u32, iy as u32));
+        }
+        let (x0, y0) = ((ix - 1).max(0) as u32, (iy - 1).max(0) as u32);
+        let (x1, y1) = (
+            (ix + 1).min(width as i32 - 1) as u32,
+            (iy + 1).min(height as i32 - 1) as u32,
+        );
+        for yy in y0..=y1 {
+            for xx in x0..=x1 {
+                if all_ink.get_pixel(xx, yy).0[0] != 0 {
+                    return Some((xx, yy));
+                }
+            }
+        }
+        None
+    };
+
+    let mut raw_border = GrayImage::new(width, height);
+    let mut comp_in_total = vec![0u32; max_label + 1];
+    let mut comp_in_border = vec![0u32; max_label + 1];
+
+    for (x, y, p) in pieces.enumerate_pixels() {
+        let l = p.0[0] as usize;
+        if !candidate[l] || !inside(x, y) {
+            continue;
+        }
+        comp_in_total[l] += 1;
+        let require_exit = !is_frame_loop[l];
+        let mut is_line = false;
+        for &(dx, dy) in &dirs {
+            let mut len = 1.0f32;
+            let mut exits = !require_exit;
+            for sign in [-1.0f32, 1.0f32] {
+                let (sdx, sdy) = (dx * sign, dy * sign);
+                let mut steps = 0;
+                for s in 1..=max_steps {
+                    let dist = 2.0 * s as f32;
+                    let Some((sx, sy)) = has_ink_3x3(x as f32 + sdx * dist, y as f32 + sdy * dist)
+                    else {
+                        break;
+                    };
+                    steps = s;
+                    if near.get_pixel(sx, sy).0[0] == 0 {
+                        exits = true;
+                        if len + 2.0 * steps as f32 >= min_chord {
+                            break;
+                        }
+                    }
+                }
+                len += 2.0 * steps as f32;
+                if exits && len >= min_chord {
+                    break;
+                }
+            }
+            if exits && len >= min_chord {
+                is_line = true;
+                break;
+            }
+        }
+        if is_line {
+            raw_border.put_pixel(x, y, Luma([255]));
+            comp_in_border[l] += 1;
+        }
+    }
+
+    // Protect glyph intersections: any non-border pixel of a crossing
+    // component inside `block` is dilated by 4 px so glyph strokes crossed by
+    // a panel bar, speedline, or bubble wall are never clipped. Pure borders
+    // (>= 85% line/arc) and enclosed frame loops are dropped completely.
+    let mut non_border = GrayImage::new(width, height);
+    for (x, y, p) in pieces.enumerate_pixels() {
+        let l = p.0[0] as usize;
+        if !candidate[l] || !inside(x, y) {
+            continue;
+        }
+        let pure_border =
+            comp_in_total[l] > 0 && (comp_in_border[l] as f32) >= 0.85 * comp_in_total[l] as f32;
+        if pure_border {
+            raw_border.put_pixel(x, y, Luma([255]));
+        } else if raw_border.get_pixel(x, y).0[0] == 0 {
+            non_border.put_pixel(x, y, Luma([255]));
+        }
+    }
+    let protected = dilate(&non_border, Norm::LInf, 4);
+    let mut final_border = GrayImage::new(width, height);
+    let mut any = false;
+    for (x, y, p) in raw_border.enumerate_pixels() {
+        if p.0[0] != 0 && protected.get_pixel(x, y).0[0] == 0 {
+            final_border.put_pixel(x, y, Luma([255]));
+            any = true;
+        }
+    }
+    any.then_some(final_border)
+}
+
+/// Refines a single-pass Otsu threshold when the ink-side class is strongly
+/// bimodal (such as dark text ink merged with darkened translucent-bubble art).
+fn refine_bimodal_ink_threshold(
+    sample: &GrayImage,
+    threshold: u16,
+    light_ink: bool,
+) -> Option<u16> {
+    let mut sub_hist = [0.0f32; 256];
+    let mut sub_total = 0u32;
+    for p in sample.pixels() {
+        let v = u16::from(p.0[0]);
+        let in_ink_side = if light_ink {
+            v >= threshold
+        } else {
+            v < threshold
+        };
+        if in_ink_side {
+            sub_hist[usize::from(p.0[0])] += 1.0;
+            sub_total += 1;
+        }
+    }
+    if sub_total < 64 {
+        return None;
+    }
+    let sub_level = split_distribution(&sub_hist, 0.1);
+    let sub_threshold = sample
+        .as_raw()
+        .iter()
+        .copied()
+        .filter(|&v| {
+            let in_side = if light_ink {
+                u16::from(v) >= threshold
+            } else {
+                u16::from(v) < threshold
+            };
+            in_side && v < sub_level
+        })
+        .max()
+        .map_or(0, |v| u16::from(v) + 1);
+    if sub_threshold == 0 || sub_threshold >= 256 {
+        return None;
+    }
+    let (mut extreme_sum, mut extreme_cnt) = (0u64, 0u32);
+    let (mut mid_sum, mut mid_cnt) = (0u64, 0u32);
+    let (mut border_total, mut border_mid, mut border_extreme) = (0u32, 0u32, 0u32);
+    let (w, h) = sample.dimensions();
+    let mut extreme_img = GrayImage::new(w, h);
+    for (x, y, p) in sample.enumerate_pixels() {
+        let v = u16::from(p.0[0]);
+        let in_side = if light_ink {
+            v >= threshold
+        } else {
+            v < threshold
+        };
+        let on_border = x < 2 || y < 2 || x + 2 >= w || y + 2 >= h;
+        if on_border {
+            border_total += 1;
+        }
+        if !in_side {
+            continue;
+        }
+        let is_extreme = if light_ink {
+            v >= sub_threshold
+        } else {
+            v < sub_threshold
+        };
+        if is_extreme {
+            extreme_sum += u64::from(v);
+            extreme_cnt += 1;
+            extreme_img.put_pixel(x, y, Luma([255]));
+            if on_border {
+                border_extreme += 1;
+            }
+        } else {
+            mid_sum += u64::from(v);
+            mid_cnt += 1;
+            if on_border {
+                border_mid += 1;
+            }
+        }
+    }
+    if extreme_cnt < 32 || mid_cnt < extreme_cnt {
+        return None;
+    }
+    let mean_extreme = extreme_sum as f32 / extreme_cnt as f32;
+    let mean_mid = mid_sum as f32 / mid_cnt as f32;
+    let extreme_is_pure = if light_ink {
+        mean_extreme >= 200.0
+    } else {
+        mean_extreme <= 60.0
+    };
+    if !extreme_is_pure || (mean_mid - mean_extreme).abs() < 60.0 {
+        return None;
+    }
+    if border_total == 0
+        || (border_mid as f32) < 0.12 * border_total as f32
+        || border_mid <= border_extreme
+    {
+        return None;
+    }
+    let near_extreme = dilate(&extreme_img, Norm::LInf, 2);
+    let mut far_mid = 0u32;
+    for (x, y, p) in sample.enumerate_pixels() {
+        let v = u16::from(p.0[0]);
+        let in_side = if light_ink {
+            v >= threshold
+        } else {
+            v < threshold
+        };
+        let is_extreme = if light_ink {
+            v >= sub_threshold
+        } else {
+            v < sub_threshold
+        };
+        if in_side && !is_extreme && near_extreme.get_pixel(x, y).0[0] == 0 {
+            far_mid += 1;
+        }
+    }
+    if far_mid * 2 < mid_cnt {
+        return None;
+    }
+    Some(sub_threshold)
+}
+
+/// Samples dominant non-ink background RGB colors around `bbox` (both outside
+/// `mask` and inside `bbox` away from ink strokes), used to filter coarse
+/// segmented blobs over translucent textured or gradient bubbles without
+/// removing strokes or outlines.
+fn sample_background_palette(
+    page: &RgbImage,
+    mask: &Mask,
+    ink: &GrayImage,
+    ink_corner: [u32; 2],
+    bbox: [f32; 4],
+    reach: u32,
+) -> Vec<[u8; 3]> {
+    let pad = reach.max(8);
+    let bx0 = bbox[0].floor().max(0.0) as u32;
+    let by0 = bbox[1].floor().max(0.0) as u32;
+    let bx1 = (bbox[2].ceil().max(0.0) as u32).min(page.width());
+    let by1 = (bbox[3].ceil().max(0.0) as u32).min(page.height());
+    let x0 = bx0.saturating_sub(pad);
+    let y0 = by0.saturating_sub(pad);
+    let x1 = (bx1 + pad).min(page.width());
+    let y1 = (by1 + pad).min(page.height());
+    let ink_edges = dilate(ink, Norm::LInf, 2);
+    let mut bins = HashMap::<[u8; 3], (u32, [u64; 3])>::new();
+    let mut total = 0u32;
+    for py in y0..y1 {
+        for px in x0..x1 {
+            if mask.contains(px, py) {
+                continue;
+            }
+            if px >= ink_corner[0]
+                && py >= ink_corner[1]
+                && px - ink_corner[0] < ink_edges.width()
+                && py - ink_corner[1] < ink_edges.height()
+                && ink_edges
+                    .get_pixel(px - ink_corner[0], py - ink_corner[1])
+                    .0[0]
+                    != 0
+            {
+                continue;
+            }
+            let rgb = page.get_pixel(px, py).0;
+            let key = rgb.map(|c| c / 24);
+            let (cnt, sum) = bins.entry(key).or_default();
+            *cnt += 1;
+            for (s, c) in sum.iter_mut().zip(rgb) {
+                *s += u64::from(c);
+            }
+            total += 1;
+        }
+    }
+    if total < 32 {
+        return Vec::new();
+    }
+    // Never include the dominant ink colour in the background palette so we
+    // never strip genuine glyph strokes even when art shares the ink tone.
+    let mut ink_bins = HashMap::<[u8; 3], (u32, [u64; 3])>::new();
+    for (x, y, p) in ink.enumerate_pixels() {
+        if p.0[0] != 0 {
+            let px = ink_corner[0] + x;
+            let py = ink_corner[1] + y;
+            if px < page.width() && py < page.height() {
+                let rgb = page.get_pixel(px, py).0;
+                let (cnt, sum) = ink_bins.entry(rgb.map(|c| c / 16)).or_default();
+                *cnt += 1;
+                for (s, c) in sum.iter_mut().zip(rgb) {
+                    *s += u64::from(c);
+                }
+            }
+        }
+    }
+    let dominant_ink = ink_bins
+        .into_values()
+        .max_by_key(|(cnt, _)| *cnt)
+        .map(|(cnt, sum)| sum.map(|s| (s / u64::from(cnt)) as u8));
+
+    let min_bin = (total / 40).max(8);
+    bins.into_values()
+        .filter(|(cnt, _)| *cnt >= min_bin)
+        .map(|(cnt, sum)| sum.map(|s| (s / u64::from(cnt)) as u8))
+        .filter(|bg| {
+            let not_pure_dark = bg.iter().copied().max().unwrap_or(0) >= 70;
+            not_pure_dark
+                && dominant_ink.is_none_or(|ink_c| (0..3).any(|c| bg[c].abs_diff(ink_c[c]) > 48))
+        })
+        .collect()
 }
 
 /// `numaSplitDistribution`, plus one: the split with the best Otsu score,
@@ -1982,6 +2750,199 @@ mod tests {
             kept,
             target_ink.len(),
             "smaller tilted neighbor stole target ink pixels"
+        );
+    }
+
+    #[test]
+    fn thin_two_pixel_outline_detected_while_aa_fringe_is_rejected() {
+        // Two black glyphs with a 2 px white outline over colored art.
+        let mut outlined_page = RgbImage::from_pixel(160, 160, Rgb([180, 50, 50]));
+        for y in 48..102 {
+            for x in 58..82 {
+                outlined_page.put_pixel(x, y, Rgb([255, 255, 255]));
+            }
+        }
+        for (x, y) in (60..80).flat_map(|x| (50..70).chain(80..100).map(move |y| (x, y))) {
+            outlined_page.put_pixel(x, y, Rgb([0, 0, 0]));
+        }
+        let glyphs = GrayImage::from_fn(20, 50, |_, y| {
+            Luma([if (20..30).contains(&y) { 0 } else { 255 }])
+        });
+        let found = outline(&outlined_page, &glyphs, [60, 50], 20.0, Some([0; 3]));
+        assert_eq!(
+            found,
+            Some(Outline {
+                color: [255; 3],
+                width: 2.0,
+            })
+        );
+
+        // Plain black glyphs on uniform white paper with a 1 px grey AA fringe
+        // must not trigger a false outline.
+        let mut aa_page = RgbImage::from_pixel(160, 160, Rgb([255, 255, 255]));
+        for y in 49..101 {
+            for x in 59..81 {
+                aa_page.put_pixel(x, y, Rgb([128, 128, 128]));
+            }
+        }
+        for (x, y) in (60..80).flat_map(|x| (50..70).chain(80..100).map(move |y| (x, y))) {
+            aa_page.put_pixel(x, y, Rgb([0, 0, 0]));
+        }
+        assert_eq!(
+            outline(&aa_page, &glyphs, [60, 50], 20.0, Some([0; 3])),
+            None
+        );
+    }
+
+    #[test]
+    fn translucent_bubble_over_checker_art_keeps_glyphs_without_bleed() {
+        let is_glyph = |x: u32, y: u32| {
+            ((60..66).contains(&x) && (50..90).contains(&y))
+                || ((82..88).contains(&x) && (50..90).contains(&y))
+                || ((104..110).contains(&x) && (50..90).contains(&y))
+        };
+        let page = RgbImage::from_fn(200, 160, |x, y| {
+            if is_glyph(x, y) {
+                return Rgb([15, 15, 15]);
+            }
+            let art = if (x / 10 + y / 10).is_multiple_of(2) {
+                20u16
+            } else {
+                245u16
+            };
+            // Translucent white bubble (alpha = 0.55) covering the central region.
+            let in_bubble = (30..170).contains(&x) && (25..135).contains(&y);
+            let v = if in_bubble {
+                ((art * 45 + 255 * 55) / 100) as u8
+            } else {
+                art as u8
+            };
+            Rgb([v, v, v])
+        });
+        let bbox = [50.0, 40.0, 120.0, 100.0];
+        let mut mask = Mask {
+            x: 50,
+            y: 40,
+            width: 70,
+            height: 60,
+            pixels: vec![255; 70 * 60],
+        };
+        // Mark a non-solid segmented blob by clearing the 4 corners.
+        mask.pixels[0] = 0;
+        let (fitted, _, _) = glyph_mask(&mask, bbox, &page, GlyphProposal::Segmented(bbox));
+        let mut glyph_total = 0u32;
+        let mut glyph_hit = 0u32;
+        let mut bg_bleed = 0u32;
+        for y in 40..100 {
+            for x in 50..120 {
+                let in_fitted = fitted.contains(x, y);
+                if is_glyph(x, y) {
+                    glyph_total += 1;
+                    glyph_hit += u32::from(in_fitted);
+                } else if in_fitted {
+                    bg_bleed += 1;
+                }
+            }
+        }
+        assert_eq!(glyph_hit, glyph_total, "must preserve all glyph pixels");
+        assert!(
+            (bg_bleed as f32) < 0.25 * (70 * 60 - glyph_total) as f32,
+            "excessive translucent background bleed: {bg_bleed}"
+        );
+        let typo = fitted.typography(&page).expect("typography");
+        let ink_c = typo.ink.expect("ink color");
+        assert!(ink_c[0] < 40 && ink_c[1] < 40 && ink_c[2] < 40, "{ink_c:?}");
+        assert_eq!(typo.outline, None);
+    }
+
+    #[test]
+    fn crossing_panel_bar_is_excluded_without_clipping_glyph_strokes() {
+        let is_glyph = |x: u32, y: u32| {
+            ((70..76).contains(&x) && (55..95).contains(&y))
+                || ((92..98).contains(&x) && (55..95).contains(&y))
+        };
+        let is_bar = |y: u32| (72..75).contains(&y);
+        let page = RgbImage::from_fn(220, 160, |x, y| {
+            Rgb(if is_glyph(x, y) || is_bar(y) {
+                [10, 10, 10]
+            } else {
+                [250, 250, 250]
+            })
+        });
+        let bbox = [55.0, 45.0, 125.0, 105.0];
+        let mask = Mask {
+            x: 55,
+            y: 45,
+            width: 70,
+            height: 60,
+            pixels: vec![255; 70 * 60],
+        };
+        let (fitted, _, _) = glyph_mask(&mask, bbox, &page, GlyphProposal::Box);
+        // Every glyph pixel must remain covered.
+        for y in 55..95 {
+            for x in (70..76).chain(92..98) {
+                assert!(fitted.contains(x, y), "clipped glyph pixel at ({x}, {y})");
+            }
+        }
+        // Panel bar pixels well away from the glyphs inside the box should be excluded.
+        assert!(
+            !fitted.contains(58, 73),
+            "panel bar left stub should be excluded"
+        );
+        assert!(
+            !fitted.contains(120, 73),
+            "panel bar right stub should be excluded"
+        );
+    }
+
+    #[test]
+    fn loose_bbox_filters_screentone_specks_but_preserves_ellipsis_dots() {
+        // 1. Loose bbox containing two glyphs surrounded by periodic screentone dots.
+        let is_glyph = |x: u32, y: u32| {
+            ((80..96).contains(&x) && (60..76).contains(&y))
+                || ((80..96).contains(&x) && (86..102).contains(&y))
+        };
+        let is_dot = |x: u32, y: u32| x % 12 < 2 && y % 12 < 2;
+        let page = RgbImage::from_fn(220, 200, |x, y| {
+            Rgb(if is_glyph(x, y) || is_dot(x, y) {
+                [15, 15, 15]
+            } else {
+                [250, 250, 250]
+            })
+        });
+        let bbox = [40.0, 30.0, 140.0, 140.0];
+        let mask = Mask {
+            x: 40,
+            y: 30,
+            width: 100,
+            height: 110,
+            pixels: vec![255; 100 * 110],
+        };
+        let (fitted, _, _) = glyph_mask(&mask, bbox, &page, GlyphProposal::Box);
+        assert!(fitted.contains(88, 68) && fitted.contains(88, 94));
+        // Far screentone dot inside the loose bbox must be dropped.
+        assert!(
+            !fitted.contains(48, 36),
+            "stray screentone dot should be excluded"
+        );
+
+        // 2. Standalone 3-dot ellipsis block must keep all 3 dots.
+        let ellipsis_page = RgbImage::from_fn(120, 120, |x, y| {
+            let dot = (58..62).contains(&x)
+                && ((36..40).contains(&y) || (52..56).contains(&y) || (68..72).contains(&y));
+            Rgb(if dot { [15, 15, 15] } else { [250, 250, 250] })
+        });
+        let e_bbox = [50.0, 30.0, 70.0, 80.0];
+        let e_mask = Mask {
+            x: 50,
+            y: 30,
+            width: 20,
+            height: 50,
+            pixels: vec![255; 20 * 50],
+        };
+        let (e_fitted, _, _) = glyph_mask(&e_mask, e_bbox, &ellipsis_page, GlyphProposal::Box);
+        assert!(
+            e_fitted.contains(60, 38) && e_fitted.contains(60, 54) && e_fitted.contains(60, 70)
         );
     }
 }
