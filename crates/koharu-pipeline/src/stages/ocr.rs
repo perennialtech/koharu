@@ -301,7 +301,7 @@ fn normalize_ocr_text(text: String) -> String {
 fn misread_dot(character: char) -> bool {
     matches!(
         character,
-        '\u{25A0}'..='\u{27BF}' | '\u{1F300}'..='\u{1FAFF}' | '∗' | '•' | '�'
+        '\u{25A0}'..='\u{27BF}' | '\u{2B1B}' | '\u{2B1C}' | '\u{2B24}' | '\u{2B55}' | '\u{1F300}'..='\u{1FAFF}' | '∗' | '•' | '�'
     ) && !matches!(character, '♡' | '♥' | '❤' | '♩' | '♪' | '♫' | '♬')
 }
 
@@ -946,6 +946,11 @@ mod tests {
             "☀️ 🌞 ☁️ ☉ ⚪️ ☛️",
             "・ ●  ・ ●  ・",
             "●・",
+            "⬛ ⬛ ⬛",
+            "⬛\u{FE0F}⬛\u{FE0F}⬛\u{FE0F}",
+            "⬜\n⬜",
+            "⬤⬤⬤",
+            "⭕ ⭕",
         ] {
             assert_eq!(normalize_ocr_text(text.to_owned()), "…", "{text}");
         }
