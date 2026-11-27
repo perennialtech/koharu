@@ -28,7 +28,10 @@ pub use request::{InpaintingMask, Operation, Request, RequestTranslation, StopTo
 pub use resources::{DeviceResources, ResourceSnapshot};
 pub use scope::{Bounds, Scope};
 pub use stage::Stage;
-pub use stages::KoharuLayoutRFDetrSeg2XLConfig;
+pub use stages::{
+    DetectionFusionConfig, FusedDetectionLayout, KoharuLayoutRFDetrSeg2XLConfig, LayoutItem,
+    fuse_detections,
+};
 
 use images::ImageCache;
 use model_cell::ModelCell;
