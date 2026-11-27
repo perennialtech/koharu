@@ -25,6 +25,7 @@ use std::string::FromUtf8Error;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 pub mod context;
+mod gguf;
 pub mod llama_backend;
 pub mod llama_batch;
 mod log;
@@ -35,6 +36,8 @@ pub mod sampling;
 pub mod timing;
 pub mod token;
 pub mod token_type;
+
+pub use gguf::{GgufInfo, GgufKvLayer, inspect_gguf};
 
 pub use crate::context::session::{LlamaStateSeqFlags, SeqState};
 
@@ -504,6 +507,44 @@ pub fn list_llama_ggml_backend_devices() -> Vec<LlamaBackendDevice> {
         });
     }
     devices
+}
+
+/// Finds the ggml backend device index corresponding to the Nth GPU or integrated GPU device.
+#[must_use]
+pub fn gpu_backend_device_index(gpu_ordinal: usize) -> Option<usize> {
+    let mut seen_gpus = 0usize;
+    let count = unsafe { koharu_llama_sys::ggml_backend_dev_count() };
+    for i in 0..count {
+        let dev = unsafe { koharu_llama_sys::ggml_backend_dev_get(i) };
+        let dev_type = unsafe { koharu_llama_sys::ggml_backend_dev_type(dev) };
+        if matches!(
+            dev_type,
+            koharu_llama_sys::GGML_BACKEND_DEVICE_TYPE_GPU
+                | koharu_llama_sys::GGML_BACKEND_DEVICE_TYPE_IGPU
+        ) {
+            if seen_gpus == gpu_ordinal {
+                return Some(i);
+            }
+            seen_gpus += 1;
+        }
+    }
+    None
+}
+
+/// Queries `(free, total)` memory in bytes for a ggml backend device by index.
+#[must_use]
+pub fn backend_device_memory(index: usize) -> Option<(usize, usize)> {
+    let count = unsafe { koharu_llama_sys::ggml_backend_dev_count() };
+    if index >= count {
+        return None;
+    }
+    let dev = unsafe { koharu_llama_sys::ggml_backend_dev_get(index) };
+    let mut free = 0usize;
+    let mut total = 0usize;
+    unsafe {
+        koharu_llama_sys::ggml_backend_dev_memory(dev, &raw mut free, &raw mut total);
+    }
+    Some((free, total))
 }
 
 /// Options to configure how llama.cpp logs are intercepted.

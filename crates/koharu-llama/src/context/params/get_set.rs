@@ -1,4 +1,4 @@
-﻿use std::num::NonZeroU32;
+use std::num::NonZeroU32;
 
 use super::{
     KvCacheType, LlamaAttentionType, LlamaContextParams, LlamaContextType, LlamaPoolingType,
@@ -719,5 +719,31 @@ impl LlamaContextParams {
     #[must_use]
     pub fn kv_unified(&self) -> bool {
         self.context_params.kv_unified
+    }
+
+    /// Set the device cache size in bytes for MoE experts kept in host memory (0 = disabled).
+    #[must_use]
+    pub fn with_moe_cache_size(mut self, size: usize) -> Self {
+        self.context_params.moe_cache_size = size;
+        self
+    }
+
+    /// Get the MoE device cache size in bytes.
+    #[must_use]
+    pub fn moe_cache_size(&self) -> usize {
+        self.context_params.moe_cache_size
+    }
+
+    /// Set the share of MoE cache misses computed on CPU instead of uploaded (0.0 = all uploaded).
+    #[must_use]
+    pub fn with_moe_cache_cpu_share(mut self, share: f32) -> Self {
+        self.context_params.moe_cache_cpu_share = share;
+        self
+    }
+
+    /// Get the share of MoE cache misses computed on CPU.
+    #[must_use]
+    pub fn moe_cache_cpu_share(&self) -> f32 {
+        self.context_params.moe_cache_cpu_share
     }
 }

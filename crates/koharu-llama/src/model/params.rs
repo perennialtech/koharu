@@ -2,7 +2,7 @@
 
 use crate::LlamaCppError;
 use crate::model::params::kv_overrides::KvOverrides;
-use std::ffi::{CStr, c_char, c_void};
+use std::ffi::{CStr, CString, c_char, c_void};
 use std::fmt::{Debug, Formatter};
 use std::pin::Pin;
 use std::ptr::null;
@@ -172,6 +172,7 @@ pub struct LlamaModelParams {
     pub(crate) params: koharu_llama_sys::llama_model_params,
     kv_overrides: Vec<koharu_llama_sys::llama_model_kv_override>,
     buft_overrides: Vec<koharu_llama_sys::llama_model_tensor_buft_override>,
+    buft_override_patterns: Vec<CString>,
     devices: Pin<Box<[koharu_llama_sys::ggml_backend_dev_t; LLAMA_CPP_MAX_DEVICES]>>,
     progress_callback: Option<Box<dyn FnMut(f32) -> bool>>,
 }
@@ -228,59 +229,67 @@ impl LlamaModelParams {
     ///
     /// assert_eq!(k.to_bytes(), b"key", "expected key to be 'key', was {:?}", k);
     /// ```
-    #[allow(clippy::missing_panics_doc)] // panics are just to enforce internal invariants, not user errors
+    ///
+    /// # Panics
+    ///
+    /// Panics if the key exceeds 127 bytes or a string value lacks a NUL terminator.
     pub fn append_kv_override(
         mut self: Pin<&mut Self>,
         key: &CStr,
         value: kv_overrides::ParamOverrideValue,
     ) {
-        let kv_override = self
-            .kv_overrides
-            .get_mut(0)
-            .expect("kv_overrides did not have a next allocated");
-
-        assert_eq!(kv_override.key[0], 0, "last kv_override was not empty");
-
-        // There should be some way to do this without iterating over everything.
-        for (i, &c) in key.to_bytes_with_nul().iter().enumerate() {
-            kv_override.key[i] = c_char::try_from(c).expect("invalid character in key");
+        let bytes = key.to_bytes_with_nul();
+        let mut native_key = [0; 128];
+        assert!(
+            bytes.len() <= native_key.len(),
+            "override key exceeds 127 bytes"
+        );
+        for (dst, &src) in native_key.iter_mut().zip(bytes) {
+            *dst = src as c_char;
+        }
+        if let kv_overrides::ParamOverrideValue::Str(string) = &value {
+            assert!(
+                string.contains(&0),
+                "override string must be NUL-terminated"
+            );
         }
 
-        kv_override.tag = value.tag();
-        kv_override.__bindgen_anon_1 = value.value();
-
-        // set to null pointer for panic safety (as push may move the vector, invalidating the pointer)
-        self.params.kv_overrides = null();
-
-        // push the next one to ensure we maintain the iterator invariant of ending with a 0
-        self.kv_overrides
-            .push(koharu_llama_sys::llama_model_kv_override {
-                key: [0; 128],
-                tag: 0,
-                __bindgen_anon_1: koharu_llama_sys::llama_model_kv_override__bindgen_ty_1 {
-                    val_i64: 0,
-                },
-            });
-
-        // set the pointer to the (potentially) new vector
+        // Keep the sentinel as the last entry, including if allocation unwinds.
+        let sentinel = self.kv_overrides.len() - 1;
+        self.kv_overrides.insert(
+            sentinel,
+            koharu_llama_sys::llama_model_kv_override {
+                key: native_key,
+                tag: value.tag(),
+                __bindgen_anon_1: value.value(),
+            },
+        );
         self.params.kv_overrides = self.kv_overrides.as_ptr();
-
-        eprintln!("saved ptr: {:?}", self.params.kv_overrides);
     }
 }
 
-impl LlamaModelParams {
-    /// Adds buffer type overides to move all mixture-of-experts layers to CPU.
-    pub fn add_cpu_moe_override(self: Pin<&mut Self>) {
-        self.add_cpu_buft_override(c"\\.ffn_(up|down|gate)_(ch|)exps");
-    }
+const CPU_MOE_ALL_PATTERN: &str = r"\.ffn_(up|down|gate|gate_up)_(ch|)exps";
 
-    /// Appends a buffer type override to the model parameters, to move layers matching pattern to CPU.
-    /// It must be pinned as this creates a self-referential struct.
-    pub fn add_cpu_buft_override(mut self: Pin<&mut Self>, key: &CStr) {
+fn cpu_moe_layer_pattern(layer: u32) -> CString {
+    CString::new(format!(
+        r"blk\.{layer}\.ffn_(up|down|gate|gate_up)_(ch|)exps"
+    ))
+    .expect("layer MoE override pattern contains no interior NUL")
+}
+
+impl LlamaModelParams {
+    fn push_buft_override(
+        &mut self,
+        pattern: CString,
+        buft: koharu_llama_sys::ggml_backend_buffer_type_t,
+    ) {
+        // Each CString owns a heap allocation whose address stays stable even if the outer Vec reallocates.
+        let pattern_ptr = pattern.as_ptr();
+        self.buft_override_patterns.push(pattern);
+
         let buft_override = self
             .buft_overrides
-            .get_mut(0)
+            .last_mut()
             .expect("buft_overrides did not have a next allocated");
 
         assert!(
@@ -288,18 +297,13 @@ impl LlamaModelParams {
             "last buft_override was not empty"
         );
 
-        // There should be some way to do this without iterating over everything.
-        for &c in key.to_bytes_with_nul().iter() {
-            c_char::try_from(c).expect("invalid character in key");
-        }
-
-        buft_override.pattern = key.as_ptr();
-        buft_override.buft = unsafe { koharu_llama_sys::ggml_backend_cpu_buffer_type() };
+        buft_override.pattern = pattern_ptr;
+        buft_override.buft = buft;
 
         // set to null pointer for panic safety (as push may move the vector, invalidating the pointer)
         self.params.tensor_buft_overrides = null();
 
-        // push the next one to ensure we maintain the iterator invariant of ending with a 0
+        // push the next sentinel to maintain the null-terminated array invariant
         self.buft_overrides
             .push(koharu_llama_sys::llama_model_tensor_buft_override {
                 pattern: std::ptr::null(),
@@ -310,22 +314,55 @@ impl LlamaModelParams {
         self.params.tensor_buft_overrides = self.buft_overrides.as_ptr();
     }
 
+    /// Adds a buffer type override to move all mixture-of-experts layers to CPU.
+    pub fn add_cpu_moe_override(self: Pin<&mut Self>) {
+        self.add_cpu_buft_override(c"\\.ffn_(up|down|gate|gate_up)_(ch|)exps");
+    }
+
+    /// Moves all mixture-of-experts layers to CPU.
+    #[must_use]
+    pub fn with_cpu_moe(mut self) -> Self {
+        let pattern = CString::new(CPU_MOE_ALL_PATTERN)
+            .expect("CPU MoE override pattern contains no interior NUL");
+        let buft = unsafe { koharu_llama_sys::ggml_backend_cpu_buffer_type() };
+        self.push_buft_override(pattern, buft);
+        self
+    }
+
+    /// Moves mixture-of-experts tensors for the first `n_layers` transformer blocks to CPU.
+    #[must_use]
+    pub fn with_n_cpu_moe(mut self, n_layers: u32) -> Self {
+        if n_layers == 0 {
+            return self;
+        }
+        let buft = unsafe { koharu_llama_sys::ggml_backend_cpu_buffer_type() };
+        for i in 0..n_layers {
+            self.push_buft_override(cpu_moe_layer_pattern(i), buft);
+        }
+        self
+    }
+
+    /// Appends a buffer type override to the model parameters, to move layers matching pattern to CPU.
+    pub fn add_cpu_buft_override(mut self: Pin<&mut Self>, key: &CStr) {
+        let buft = unsafe { koharu_llama_sys::ggml_backend_cpu_buffer_type() };
+        self.as_mut()
+            .get_mut()
+            .push_buft_override(key.to_owned(), buft);
+    }
+
     /// Returns the tensor-name patterns of the buffer-type overrides currently set on these
     /// parameters, in order.
     ///
-    /// This is the read-only counterpart to [`add_cpu_buft_override`](Self::add_cpu_buft_override)
-    /// and [`add_cpu_moe_override`](Self::add_cpu_moe_override). Returns an empty vector when no
-    /// overrides are set. The trailing null-terminator entry the override list carries is skipped;
-    /// only entries with a non-null pattern are returned.
+    /// Returns an empty vector when no overrides are set. The trailing null-terminator entry is
+    /// skipped; only entries with a non-null pattern are returned.
     #[must_use]
     pub fn tensor_buft_override_patterns(&self) -> Vec<String> {
         self.buft_overrides
             .iter()
             .filter(|o| !o.pattern.is_null())
             .map(|o| {
-                // SAFETY: the setter accepts a NUL-terminated `CStr`. Its callers must keep that
-                // string alive for at least as long as these params; every in-tree caller passes a
-                // static literal.
+                // SAFETY: every non-null pattern pointer refers to an owned CString in
+                // `self.buft_override_patterns`.
                 unsafe { CStr::from_ptr(o.pattern) }
                     .to_string_lossy()
                     .into_owned()
@@ -449,28 +486,71 @@ impl LlamaModelParams {
     ///
     /// # Errors
     /// Returns `LlamaCppError::BackendDeviceNotFound` if any device index is invalid.
-    pub fn with_devices(mut self, devices: &[usize]) -> Result<Self, LlamaCppError> {
+    fn set_devices_with<F>(
+        &mut self,
+        devices: &[usize],
+        max_backend_devices: usize,
+        dev_count: usize,
+        mut dev_get: F,
+    ) -> Result<(), LlamaCppError>
+    where
+        F: FnMut(usize) -> koharu_llama_sys::ggml_backend_dev_t,
+    {
         for dev in self.devices.iter_mut() {
             *dev = std::ptr::null_mut();
         }
-        // Check device count
-        let max_devices = crate::max_devices().min(LLAMA_CPP_MAX_DEVICES);
+        // Reserve the final slot for the NULL sentinel required by llama.cpp.
+        let max_devices = max_backend_devices.min(self.devices.len() - 1);
         if devices.len() > max_devices {
             return Err(LlamaCppError::MaxDevicesExceeded(max_devices));
         }
         for (i, &dev) in devices.iter().enumerate() {
-            if dev >= unsafe { koharu_llama_sys::ggml_backend_dev_count() } {
+            if dev >= dev_count {
                 return Err(LlamaCppError::BackendDeviceNotFound(dev));
             }
-            let backend_dev = unsafe { koharu_llama_sys::ggml_backend_dev_get(dev) };
-            self.devices[i] = backend_dev;
+            self.devices[i] = dev_get(dev);
         }
-        if self.devices.is_empty() {
+        if devices.is_empty() {
             self.params.devices = std::ptr::null_mut();
         } else {
             self.params.devices = self.devices.as_mut_ptr();
         }
+        Ok(())
+    }
+
+    pub fn with_devices(mut self, devices: &[usize]) -> Result<Self, LlamaCppError> {
+        let max_backend_devices = crate::max_devices();
+        let dev_count = unsafe { koharu_llama_sys::ggml_backend_dev_count() };
+        self.set_devices_with(devices, max_backend_devices, dev_count, |dev| unsafe {
+            koharu_llama_sys::ggml_backend_dev_get(dev)
+        })?;
         Ok(self)
+    }
+
+    /// Sets whether to bypass the host buffer so extra buffer types can be used.
+    #[must_use]
+    pub fn with_no_host(mut self, no_host: bool) -> Self {
+        self.params.no_host = no_host;
+        self
+    }
+
+    /// Returns whether host buffer bypass is enabled.
+    #[must_use]
+    pub fn no_host(&self) -> bool {
+        self.params.no_host
+    }
+
+    /// Sets whether to use extra buffer types (used for weight repacking).
+    #[must_use]
+    pub fn with_use_extra_bufts(mut self, use_extra_bufts: bool) -> Self {
+        self.params.use_extra_bufts = use_extra_bufts;
+        self
+    }
+
+    /// Returns whether extra buffer types are enabled.
+    #[must_use]
+    pub fn use_extra_bufts(&self) -> bool {
+        self.params.use_extra_bufts
     }
 
     /// Set `no_alloc`
@@ -545,8 +625,124 @@ impl Default for LlamaModelParams {
                 pattern: std::ptr::null(),
                 buft: std::ptr::null_mut(),
             }],
+            buft_override_patterns: Vec::new(),
             devices: Box::pin([std::ptr::null_mut(); 16]),
             progress_callback: None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::pin::pin;
+
+    fn zeroed_params() -> LlamaModelParams {
+        LlamaModelParams {
+            params: unsafe { std::mem::zeroed() },
+            kv_overrides: vec![koharu_llama_sys::llama_model_kv_override {
+                key: [0; 128],
+                tag: 0,
+                __bindgen_anon_1: koharu_llama_sys::llama_model_kv_override__bindgen_ty_1 {
+                    val_i64: 0,
+                },
+            }],
+            buft_overrides: vec![koharu_llama_sys::llama_model_tensor_buft_override {
+                pattern: std::ptr::null(),
+                buft: std::ptr::null_mut(),
+            }],
+            buft_override_patterns: Vec::new(),
+            devices: Box::pin([std::ptr::null_mut(); LLAMA_CPP_MAX_DEVICES]),
+            progress_callback: None,
+        }
+    }
+
+    #[test]
+    fn multiple_buft_overrides_preserve_order_sentinel_and_pointer_stability() {
+        let mut params = zeroed_params();
+        let fake_buft = 0x1234usize as koharu_llama_sys::ggml_backend_buffer_type_t;
+        for i in 0..32u32 {
+            params.push_buft_override(cpu_moe_layer_pattern(i), fake_buft);
+        }
+
+        let patterns = params.tensor_buft_override_patterns();
+        assert_eq!(patterns.len(), 32);
+        assert_eq!(patterns[0], r"blk\.0\.ffn_(up|down|gate|gate_up)_(ch|)exps");
+        assert_eq!(
+            patterns[31],
+            r"blk\.31\.ffn_(up|down|gate|gate_up)_(ch|)exps"
+        );
+        assert_eq!(params.buft_overrides.len(), 33);
+        assert!(params.buft_overrides.last().unwrap().pattern.is_null());
+        assert_eq!(
+            params.params.tensor_buft_overrides,
+            params.buft_overrides.as_ptr()
+        );
+    }
+
+    #[test]
+    fn multiple_kv_overrides_append_without_overwriting_first() {
+        let mut params = pin!(zeroed_params());
+        params
+            .as_mut()
+            .append_kv_override(c"first.key", kv_overrides::ParamOverrideValue::Int(1));
+        params
+            .as_mut()
+            .append_kv_override(c"second.key", kv_overrides::ParamOverrideValue::Int(2));
+
+        let pairs: Vec<_> = params.kv_overrides().into_iter().collect();
+        assert_eq!(pairs.len(), 2);
+        assert_eq!(pairs[0].0.to_bytes(), b"first.key");
+        assert_eq!(pairs[0].1, kv_overrides::ParamOverrideValue::Int(1));
+        assert_eq!(pairs[1].0.to_bytes(), b"second.key");
+        assert_eq!(pairs[1].1, kv_overrides::ParamOverrideValue::Int(2));
+    }
+
+    #[test]
+    fn overlong_override_key_preserves_prior_entries_and_sentinel() {
+        use kv_overrides::ParamOverrideValue::Int;
+        let mut params = pin!(zeroed_params());
+        let longest = CString::new(vec![b'k'; 127]).unwrap();
+        params.as_mut().append_kv_override(&longest, Int(1));
+        let overlong = CString::new(vec![b'x'; 128]).unwrap();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            params.as_mut().append_kv_override(&overlong, Int(2));
+        }));
+
+        assert!(result.is_err());
+        assert_eq!(params.params.kv_overrides, params.kv_overrides.as_ptr());
+        assert_eq!(params.kv_overrides.len(), 2);
+        assert_eq!(params.kv_overrides[1].key, [0; 128]);
+        params.as_mut().append_kv_override(c"next", Int(3));
+        assert_eq!(
+            params.kv_overrides().into_iter().collect::<Vec<_>>(),
+            [(longest, Int(1)), (c"next".to_owned(), Int(3))]
+        );
+    }
+
+    #[test]
+    fn with_devices_handles_empty_null_sentinel_and_bounds() {
+        let mut params = zeroed_params();
+        let fake_dev = |i: usize| (0x1000 + i) as koharu_llama_sys::ggml_backend_dev_t;
+
+        params.set_devices_with(&[], 32, 32, fake_dev).unwrap();
+        assert!(params.params.devices.is_null());
+
+        let fifteen: Vec<usize> = (0..15).collect();
+        params.set_devices_with(&fifteen, 32, 32, fake_dev).unwrap();
+        assert_eq!(params.params.devices, params.devices.as_mut_ptr());
+        assert!(!params.devices[14].is_null());
+        assert!(params.devices[15].is_null());
+
+        let sixteen: Vec<usize> = (0..16).collect();
+        assert!(matches!(
+            params.set_devices_with(&sixteen, 32, 32, fake_dev),
+            Err(LlamaCppError::MaxDevicesExceeded(15))
+        ));
+
+        assert!(matches!(
+            params.set_devices_with(&[4], 32, 4, fake_dev),
+            Err(LlamaCppError::BackendDeviceNotFound(4))
+        ));
     }
 }
