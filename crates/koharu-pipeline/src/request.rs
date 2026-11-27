@@ -1,7 +1,4 @@
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, Ordering},
-};
+use std::sync::Arc;
 
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
@@ -96,15 +93,23 @@ impl Default for Request {
 }
 
 #[derive(Clone, Default)]
-pub struct StopToken(Arc<AtomicBool>);
+pub struct StopToken(tokio::sync::watch::Sender<bool>);
 
 impl StopToken {
     pub fn stop(&self) {
-        self.0.store(true, Ordering::Release);
+        self.0.send_replace(true);
     }
 
     #[must_use]
     pub fn stopped(&self) -> bool {
-        self.0.load(Ordering::Acquire)
+        *self.0.borrow()
+    }
+
+    pub async fn cancelled(&self) {
+        let mut receiver = self.0.subscribe();
+        receiver
+            .wait_for(|&stopped| stopped)
+            .await
+            .expect("the stop token holds the sender");
     }
 }

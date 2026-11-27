@@ -2,10 +2,10 @@
 
 use anyhow::Context;
 use reqwest::Client;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use url::Url;
 
-use super::send_json;
+use super::{ChatResponse, send_json};
 use crate::{
     GenerationConfig, ProvidersConfig, Result, TranslationRequest,
     backend::encode_image,
@@ -74,19 +74,7 @@ pub(super) async fn translate(
         None => http,
     };
     let response: ChatResponse = send_json("openai-compatible", http).await?;
-    let text = response
-        .choices
-        .into_iter()
-        .next()
-        .context("OpenAI-compatible backend returned no choices")?
-        .message
-        .content
-        .context("OpenAI-compatible backend returned no message content")?;
-    Ok(prompt::translations(
-        "openai-compatible",
-        &text,
-        &request.segments,
-    )?)
+    Ok(response.translations("openai-compatible", &request.segments)?)
 }
 
 fn endpoint(base_url: &Url, suffix: &str) -> String {
@@ -153,21 +141,6 @@ enum ContentPart {
 #[derive(Serialize)]
 struct ImageUrl {
     url: String,
-}
-
-#[derive(Deserialize)]
-struct ChatResponse {
-    choices: Vec<Choice>,
-}
-
-#[derive(Deserialize)]
-struct Choice {
-    message: ResponseMessage,
-}
-
-#[derive(Deserialize)]
-struct ResponseMessage {
-    content: Option<String>,
 }
 
 #[cfg(test)]

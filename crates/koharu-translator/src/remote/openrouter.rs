@@ -6,9 +6,9 @@
 
 use anyhow::Context;
 use reqwest::Client;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 
-use super::send_json;
+use super::{ChatResponse, send_json};
 use crate::{
     GenerationConfig, Result, TranslationRequest,
     backend::encode_image,
@@ -75,19 +75,7 @@ pub(super) async fn translate(
         client.post(CHAT_URL).bearer_auth(api_key).json(&body),
     )
     .await?;
-    let text = response
-        .choices
-        .into_iter()
-        .next()
-        .context("OpenRouter returned no choices")?
-        .message
-        .content
-        .context("OpenRouter returned no message content")?;
-    Ok(prompt::translations(
-        "openrouter",
-        &text,
-        &request.segments,
-    )?)
+    Ok(response.translations("openrouter", &request.segments)?)
 }
 
 #[derive(Serialize)]
@@ -157,21 +145,6 @@ enum ContentPart {
 #[derive(Serialize)]
 struct ImageUrl {
     url: String,
-}
-
-#[derive(Deserialize)]
-struct ChatResponse {
-    choices: Vec<Choice>,
-}
-
-#[derive(Deserialize)]
-struct Choice {
-    message: ResponseMessage,
-}
-
-#[derive(Deserialize)]
-struct ResponseMessage {
-    content: Option<String>,
 }
 
 #[cfg(test)]

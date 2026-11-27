@@ -37,7 +37,18 @@ impl StageRunner {
         let started = Instant::now();
         let page = job.input.page();
         let model = self.stages.model(job.stage).to_owned();
-        let outcome = self.run_with_recovery(&job, &model).await;
+        let run = self.run_with_recovery(&job, &model);
+        // Hosted requests can be dropped. Native stages must keep their permit
+        // until blocking inference returns.
+        let outcome = if job.stage == Stage::Translation {
+            tokio::select! {
+                biased;
+                () = job.stop.cancelled() => Ok(StageOutcome::Stopped),
+                outcome = run => outcome,
+            }
+        } else {
+            run.await
+        };
         StageCompletion {
             page,
             stage: job.stage,

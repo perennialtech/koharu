@@ -149,6 +149,7 @@ struct TranslationInput<'a> {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct TranslationOutput {
     translations: Vec<String>,
 }
@@ -198,6 +199,7 @@ mod tests {
         let source = ["one".to_owned(), "two".to_owned()];
         for response in [
             "```json\n{\"translations\":[\"hello\",\"world\"]}\n```",
+            r#"{"translations":["hello","world"],"notes":[]}"#,
             r#"{translations: ['hello', 'world']}"#,
             r#"Here is the result: {"translations": ["hello", "world"]}"#,
             "{\"translations\":[\"hello\",\"world\"",
