@@ -7,8 +7,6 @@ use std::{collections::HashMap, sync::Arc};
 use image::{GrayImage, ImageBuffer, Luma, RgbImage, imageops};
 use imageproc::{
     distance_transform::{Norm, euclidean_squared_distance_transform},
-    filter::gaussian_blur_f32,
-    gradients::{horizontal_sobel, vertical_sobel},
     morphology::{close, dilate},
     region_labelling::{Connectivity, connected_components},
 };
@@ -127,54 +125,88 @@ impl Mask {
         }
         let largest = sizes.values().copied().max().unwrap_or(0);
         let body = |part: u32| part != 0 && 10 * sizes[&part] >= largest;
-        // A border, so the edges at the crop's sides have gradients too.
-        let border = 4;
-        let body_image = GrayImage::from_fn(width + 2 * border, height + 2 * border, |x, y| {
-            let inside = (border..border + width).contains(&x)
-                && (border..border + height).contains(&y)
-                && body(parts.get_pixel(x - border, y - border).0[0]);
-            Luma([if inside { 255 } else { 0 }])
-        });
-        let smooth = gaussian_blur_f32(&body_image, 1.5);
-        let (across, down) = (horizontal_sobel(&smooth), vertical_sobel(&smooth));
-        // A direction in degrees, modulo 90°, within ±45°.
-        let fold = |degrees: f64| (degrees + 45.0).rem_euclid(90.0) - 45.0;
-        let edges: Vec<(f64, f64)> = across
-            .pixels()
-            .zip(down.pixels())
-            .map(|(gx, gy)| (f64::from(gx.0[0]), f64::from(gy.0[0])))
-            .filter(|&(gx, gy)| gx != 0.0 || gy != 0.0)
-            .map(|(gx, gy)| (fold(gy.atan2(gx).to_degrees()), gx.hypot(gy)))
-            .collect();
-        let (cosine, sine) =
-            edges
-                .iter()
-                .fold((0.0, 0.0), |(cosine, sine), &(direction, strength)| {
-                    let angle = 4.0 * direction.to_radians();
-                    (
-                        cosine + strength * angle.cos(),
-                        sine + strength * angle.sin(),
-                    )
-                });
-        let mut angle = (f64::atan2(sine, cosine) / 4.0).to_degrees();
-        for _ in 0..8 {
-            let (turn, weight) = edges
-                .iter()
-                .map(|&(direction, strength)| (fold(direction - angle), strength))
-                .filter(|(turn, _)| turn.abs() <= TILT_REACH)
-                .fold((0.0, 0.0), |(turn, weight), (by, strength)| {
-                    (turn + by * strength, weight + strength)
-                });
-            if weight == 0.0 {
-                break;
-            }
-            let shift = turn / weight;
-            angle = fold(angle + shift);
-            if shift.abs() < 0.01 {
-                break;
+        // Estimate the lines' tilt modulo 90° by maximizing the L2 energy of
+        // the ink's 1D projections across and along candidate axes in [-45°, 45°).
+        // Aligned lines concentrate ink into narrow peaks with clear gutters,
+        // while isotropic shapes (such as circular dots) have nearly flat energy
+        // across angles and stay upright.
+        let mut points: Vec<(f32, f32)> = Vec::new();
+        for (x, y, part) in parts.enumerate_pixels() {
+            if body(part.0[0]) && self.contains(x + left, y + top) {
+                points.push((x as f32, y as f32));
             }
         }
-        let angle = angle as f32;
+        // Subsample deterministically on very high-resolution masks so the angle
+        // sweep stays fast.
+        if points.len() > 4096 {
+            let step = points.len() / 4096;
+            points = points.into_iter().step_by(step).collect();
+        }
+        let max_dim = (width.max(height) as f32).max(1.0);
+        // Scale bin size gently on very large crops so projection energy measures
+        // line/glyph alignment rather than single-pixel aliasing.
+        let bin_size = (max_dim / 256.0).max(1.0);
+        let projection_energy = |deg: f32| -> f64 {
+            if points.is_empty() {
+                return 0.0;
+            }
+            let (sin, cos) = deg.to_radians().sin_cos();
+            let (mut min_u, mut max_u) = (f32::MAX, f32::MIN);
+            let (mut min_v, mut max_v) = (f32::MAX, f32::MIN);
+            for &(x, y) in &points {
+                let u = x * cos + y * sin;
+                let v = y * cos - x * sin;
+                min_u = min_u.min(u);
+                max_u = max_u.max(u);
+                min_v = min_v.min(v);
+                max_v = max_v.max(v);
+            }
+            let len_u = (((max_u - min_u) / bin_size).floor() as usize) + 1;
+            let len_v = (((max_v - min_v) / bin_size).floor() as usize) + 1;
+            let mut hist_u = vec![0u32; len_u];
+            let mut hist_v = vec![0u32; len_v];
+            for &(x, y) in &points {
+                let u = (((x * cos + y * sin) - min_u) / bin_size).floor() as usize;
+                let v = (((y * cos - x * sin) - min_v) / bin_size).floor() as usize;
+                hist_u[u] += 1;
+                hist_v[v] += 1;
+            }
+            let eu: f64 = hist_u.iter().map(|&c| f64::from(c) * f64::from(c)).sum();
+            let ev: f64 = hist_v.iter().map(|&c| f64::from(c) * f64::from(c)).sum();
+            eu + ev
+        };
+        let zero_energy = projection_energy(0.0);
+        let mut best_deg = 0.0f32;
+        let mut best_energy = zero_energy;
+        let mut sum_energy = 0.0f64;
+        for step in -45..45 {
+            let deg = step as f32;
+            let e = projection_energy(deg);
+            sum_energy += e;
+            if e > best_energy {
+                best_energy = e;
+                best_deg = deg;
+            }
+        }
+        // Refine around the coarse peak in 0.25° steps.
+        let coarse = best_deg;
+        for q in -4..=4 {
+            let deg = coarse + q as f32 * 0.25;
+            let folded = (deg + 45.0).rem_euclid(90.0) - 45.0;
+            let e = projection_energy(folded);
+            if e > best_energy {
+                best_energy = e;
+                best_deg = folded;
+            }
+        }
+        let mean_energy = sum_energy / 90.0;
+        let angle = if best_energy <= zero_energy * MIN_TILT_GAIN_OVER_UPRIGHT
+            || best_energy <= mean_energy * MIN_TILT_GAIN_OVER_MEAN
+        {
+            0.0
+        } else {
+            best_deg
+        };
 
         // The lines run along the body's longer extent at that angle, or
         // down its columns.
@@ -216,7 +248,7 @@ impl Mask {
             };
             (stroke_width, tilt)
         };
-        let outlined = outlined(page, &block, &ink, [left, top], |ink| {
+        let outlined = outlined(page, &block, self, &ink, [left, top], |ink| {
             breadth(ink, vertical, strokes(ink).1)
         });
         let ink = outlined.as_ref().map_or(&ink, |outlined| &outlined.glyphs);
@@ -512,22 +544,52 @@ pub fn fit_glyph_masks<'a>(
                 GlyphProposal::Segmented(original) => original,
                 GlyphProposal::Box => detection.bbox,
             };
-            (original, proposal, detection)
+            (original, proposal, Mask::default(), detection)
         })
         .collect();
-    letters.par_iter_mut().for_each(|(_, proposal, detection)| {
-        let (mask, grown) = glyph_mask(&detection.mask, detection.bbox, page, *proposal);
-        detection.mask = Arc::new(mask);
-        detection.bbox = grown;
-    });
+    letters
+        .par_iter_mut()
+        .for_each(|(_, proposal, core, detection)| {
+            let input_mask = Arc::clone(&detection.mask);
+            let (mask, core_mask, grown) = glyph_mask(&input_mask, detection.bbox, page, *proposal);
+            // For segmented proposals, anchor ownership tie-breaking to core
+            // ink supported by the detector's own mask so plain-paper box
+            // expansion cannot pull a tilted neighbour's glyphs into our core.
+            let anchored = if matches!(proposal, GlyphProposal::Segmented(_))
+                && core_mask.width > 0
+                && core_mask.height > 0
+            {
+                let mut anchored = core_mask.clone();
+                let mut any = false;
+                for y in 0..anchored.height {
+                    for x in 0..anchored.width {
+                        let idx = (y * anchored.width + x) as usize;
+                        if anchored.pixels[idx] != 0 {
+                            if input_mask.contains(anchored.x + x, anchored.y + y) {
+                                any = true;
+                            } else {
+                                anchored.pixels[idx] = 0;
+                            }
+                        }
+                    }
+                }
+                if any { anchored } else { core_mask }
+            } else {
+                core_mask
+            };
+            *core = anchored;
+            detection.mask = Arc::new(mask);
+            detection.bbox = grown;
+        });
     let area = |[left, top, right, bottom]: [f32; 4]| (right - left) * (bottom - top);
     letters.sort_by(|(a, ..), (b, ..)| area(*a).total_cmp(&area(*b)));
-    // As in 2cac72fa, ties go to the smaller box. Restrict each comparison
-    // to the intersection of the two cropped masks.
+    // Resolve shared pixels by Euclidean distance to each region's uncontested
+    // pre-dilation core ink before falling back to original-box distance and
+    // smaller-box tie-breaking.
     for i in 0..letters.len() {
         let (earlier, later) = letters.split_at_mut(i + 1);
-        let (bbox, _, first) = &mut earlier[i];
-        for (other, _, second) in later {
+        let (bbox, _, core_a, first) = &mut earlier[i];
+        for (other, _, core_b, second) in later {
             let (a, b) = (&first.mask, &second.mask);
             let (x0, y0) = (a.x.max(b.x), a.y.max(b.y));
             let (x1, y1) = (
@@ -537,6 +599,52 @@ pub fn fit_glyph_masks<'a>(
             if x0 >= x1 || y0 >= y1 {
                 continue;
             }
+            let has_overlap = (y0..y1).any(|y| {
+                (x0..x1).any(|x| {
+                    let ai = ((y - a.y) * a.width + x - a.x) as usize;
+                    let bi = ((y - b.y) * b.width + x - b.x) as usize;
+                    a.pixels[ai] != 0 && b.pixels[bi] != 0
+                })
+            });
+            if !has_overlap {
+                continue;
+            }
+            let ux0 = x0.min(core_a.x).min(core_b.x);
+            let uy0 = y0.min(core_a.y).min(core_b.y);
+            let ux1 = x1.max(core_a.x + core_a.width).max(core_b.x + core_b.width);
+            let uy1 = y1
+                .max(core_a.y + core_a.height)
+                .max(core_b.y + core_b.height);
+            let (uw, uh) = (ux1 - ux0, uy1 - uy0);
+            let mut only_a = GrayImage::new(uw, uh);
+            let mut only_b = GrayImage::new(uw, uh);
+            let (mut any_a, mut any_b) = (false, false);
+            for (index, &value) in core_a.pixels.iter().enumerate() {
+                if value != 0 {
+                    let px = core_a.x + index as u32 % core_a.width;
+                    let py = core_a.y + index as u32 / core_a.width;
+                    if !core_b.contains(px, py) {
+                        only_a.put_pixel(px - ux0, py - uy0, Luma([255]));
+                        any_a = true;
+                    }
+                }
+            }
+            for (index, &value) in core_b.pixels.iter().enumerate() {
+                if value != 0 {
+                    let px = core_b.x + index as u32 % core_b.width;
+                    let py = core_b.y + index as u32 / core_b.width;
+                    if !core_a.contains(px, py) {
+                        only_b.put_pixel(px - ux0, py - uy0, Luma([255]));
+                        any_b = true;
+                    }
+                }
+            }
+            let core_distances = (any_a && any_b).then(|| {
+                (
+                    euclidean_squared_distance_transform(&only_a),
+                    euclidean_squared_distance_transform(&only_b),
+                )
+            });
             let a = Arc::make_mut(&mut first.mask);
             let b = Arc::make_mut(&mut second.mask);
             for y in y0..y1 {
@@ -544,7 +652,19 @@ pub fn fit_glyph_masks<'a>(
                     let ai = ((y - a.y) * a.width + x - a.x) as usize;
                     let bi = ((y - b.y) * b.width + x - b.x) as usize;
                     if a.pixels[ai] != 0 && b.pixels[bi] != 0 {
-                        if box_distance(*other, x, y) < box_distance(*bbox, x, y) {
+                        let second_wins = match &core_distances {
+                            Some((dist_a, dist_b)) => {
+                                let da = dist_a.get_pixel(x - ux0, y - uy0).0[0];
+                                let db = dist_b.get_pixel(x - ux0, y - uy0).0[0];
+                                if db != da {
+                                    db < da
+                                } else {
+                                    box_distance(*other, x, y) < box_distance(*bbox, x, y)
+                                }
+                            }
+                            None => box_distance(*other, x, y) < box_distance(*bbox, x, y),
+                        };
+                        if second_wins {
                             a.pixels[ai] = 0;
                         } else {
                             b.pixels[bi] = 0;
@@ -576,17 +696,18 @@ fn glyph_mask(
     bbox: [f32; 4],
     page: &RgbImage,
     proposal: GlyphProposal,
-) -> (Mask, [f32; 4]) {
+) -> (Mask, Mask, [f32; 4]) {
     let (page_width, page_height) = page.dimensions();
     // imageproc 0.27.0 labels the first foreground pixel 1 even when its
     // union-find table has just one slot (image-rs/imageproc#824).
     if mask.pixels.len() <= 1 || page_width == 0 || page_height == 0 {
-        return (proposal.without_ink(mask.clone()), bbox);
+        let fallback = proposal.without_ink(mask.clone());
+        return (fallback.clone(), fallback, bbox);
     }
     // RF-DETR's mask can stop a few pixels short of a glyph's ends, and LaMa
     // grows even a sliver of ink left outside into a stroke, so the ink may
     // reach as far past the block as the block's closing radius.
-    let reach = scaled(6.0, page_width, page_height);
+    let reach = scaled(6.0, page_width, page_height).min(MAX_BLOCK_CLOSING_RADIUS);
     // RF-DETR predicts each query's mask over the whole page, and a lettering
     // mask can take in specks of other lettering far from its box, whose
     // surroundings then sway the ink split. Its own glyphs can run past the
@@ -648,7 +769,8 @@ fn glyph_mask(
         ..
     }) = ink(&block, page, reach, Some(bbox))
     else {
-        return (proposal.without_ink(mask), bbox);
+        let fallback = proposal.without_ink(mask);
+        return (fallback.clone(), fallback, bbox);
     };
     let bbox = held.map_or(bbox, |held| {
         let [x0, y0, x1, y1] = held.map(|edge| edge as f32);
@@ -712,8 +834,13 @@ fn glyph_mask(
             canvas.put_pixel(x, y, Luma([255]));
         }
     }
+    let core = crop(&canvas, left, top, page_width, page_height);
     let fitted = dilate(&canvas, Norm::L2, margin as u8);
-    (crop(&fitted, left, top, page_width, page_height), bbox)
+    (
+        crop(&fitted, left, top, page_width, page_height),
+        core,
+        bbox,
+    )
 }
 
 /// Fills what `canvas`'s marked pixels enclose: unmarked areas its edge
@@ -768,7 +895,7 @@ fn block(mask: &Mask, page_width: u32, page_height: u32) -> Mask {
     if mask.width == 0 || mask.height == 0 {
         return mask.clone();
     }
-    let radius = scaled(6.0, page_width, page_height);
+    let radius = scaled(6.0, page_width, page_height).min(MAX_BLOCK_CLOSING_RADIUS);
     // Twice the radius, so the dilation never reaches the canvas's edge,
     // where imageproc's erosion would keep it.
     let pad = 2 * radius;
@@ -782,7 +909,7 @@ fn block(mask: &Mask, page_width: u32, page_height: u32) -> Mask {
         let (x, y) = (index as u32 % mask.width, index as u32 / mask.width);
         canvas.put_pixel(x + pad, y + pad, Luma([255]));
     }
-    let mut closed = close(&canvas, Norm::LInf, radius as u8);
+    let mut closed = close(&canvas, Norm::L2, radius as u8);
     fill_holes(&mut closed);
     let (left, top) = (
         i64::from(mask.x) - i64::from(pad),
@@ -1264,11 +1391,15 @@ fn find_stroke_width(ink: &GrayImage, threshold: f32) -> Option<f32> {
     Some((area as f32 / (boundary / 2) as f32 + distance_width) * 0.5)
 }
 
-/// How far from the lines' direction, in degrees, a block's edge still
-/// counts toward it: a turned block's sides, stepped on the pixel grid,
-/// spread about that far, while a mark leaning further, such as a
-/// hand-lettered !!, doesn't count.
-const TILT_REACH: f64 = 10.0;
+/// Minimum relative projection-energy gain over upright (0°) and over the
+/// mean across all candidate angles required before emitting a non-zero tilt.
+const MIN_TILT_GAIN_OVER_UPRIGHT: f64 = 1.05;
+const MIN_TILT_GAIN_OVER_MEAN: f64 = 1.15;
+
+/// Cap on the block closing and stroke-extension radius in pixels so
+/// ultra-high-resolution pages (e.g. 4961px) do not bridge inter-column
+/// gutters.
+const MAX_BLOCK_CLOSING_RADIUS: u32 = 12;
 
 /// The tilt, in degrees, under which lettering reads as upright, as a missed
 /// turn costs less than a false one: the 41 upright texts that the plain
@@ -1352,7 +1483,7 @@ mod tests {
                     .map(|i| if i % 46 < 2 && i / 46 < 2 { 0 } else { 255 })
                     .collect(),
             };
-            let (fitted, _) = glyph_mask(&mask, bbox, &page, GlyphProposal::Segmented(bbox));
+            let (fitted, _, _) = glyph_mask(&mask, bbox, &page, GlyphProposal::Segmented(bbox));
             assert!(fitted.contains(34, 38) && fitted.contains(69, 40));
             assert!(fitted.contains(70, 40)); // scale-dependent antialias margin
             assert!(!fitted.contains(51, 36) && !fitted.contains(22, 48));
@@ -1371,7 +1502,7 @@ mod tests {
                 pixels,
             };
             let bbox = [0., 0., w as f32, h as f32];
-            let (fitted, grown) = glyph_mask(&mask, bbox, &page, GlyphProposal::Segmented(bbox));
+            let (fitted, _, grown) = glyph_mask(&mask, bbox, &page, GlyphProposal::Segmented(bbox));
             assert_eq!(fitted.pixels, mask.pixels);
             assert_eq!(grown, bbox);
             assert!(fitted.typography(&page).is_none());
@@ -1446,7 +1577,7 @@ mod tests {
             pixels,
         };
         let bbox = [80.0, 36.0, 120.0, 180.0];
-        let (fitted, _) = glyph_mask(&detected, bbox, &page, GlyphProposal::Segmented(bbox));
+        let (fitted, _, _) = glyph_mask(&detected, bbox, &page, GlyphProposal::Segmented(bbox));
         assert!(fitted.contains(100, 192));
         assert!(!fitted.contains(100, 213));
     }
@@ -1485,7 +1616,7 @@ mod tests {
             pixels,
         };
         let bbox = [80.0, 36.0, 120.0, 180.0];
-        let (fitted, _) = glyph_mask(&detected, bbox, &page, GlyphProposal::Segmented(bbox));
+        let (fitted, _, _) = glyph_mask(&detected, bbox, &page, GlyphProposal::Segmented(bbox));
         assert!(fitted.contains(100, 48));
         assert!(!fitted.contains(100, 16));
     }
@@ -1519,7 +1650,7 @@ mod tests {
                 })
                 .collect(),
         };
-        let (fitted, grown) = glyph_mask(&detected, bbox, &page, GlyphProposal::Segmented(bbox));
+        let (fitted, _, grown) = glyph_mask(&detected, bbox, &page, GlyphProposal::Segmented(bbox));
         assert!(fitted.contains(45, 113));
         assert!(grown[3] >= 114.0);
         assert!(!fitted.contains(45, 131) && grown[3] < 130.0);
@@ -1699,5 +1830,158 @@ mod tests {
         // On white paper the band never ends.
         let on_paper = outline(&page(Rgb([255; 3])), &glyphs, [60, 60], 20.0, Some([0; 3]));
         assert_eq!(on_paper, None);
+    }
+
+    #[test]
+    fn steeply_tilted_column_recovers_tilt_without_collapsing_to_upright() {
+        use imageproc::{drawing::draw_polygon_mut, point::Point};
+
+        for expected in [-30.0f32, 35.0f32] {
+            let mut page = RgbImage::from_pixel(560, 560, Rgb([255, 255, 255]));
+            let (sin, cos) = expected.to_radians().sin_cos();
+            for row in 0..5 {
+                let top = -70.0 + 30.0 * row as f32;
+                let corners = [
+                    (-14.0, top),
+                    (14.0, top),
+                    (14.0, top + 22.0),
+                    (-14.0, top + 22.0),
+                ];
+                let points = corners.map(|(x, y)| {
+                    Point::new(
+                        (280.0 + x * cos - y * sin).round() as i32,
+                        (280.0 + x * sin + y * cos).round() as i32,
+                    )
+                });
+                draw_polygon_mut(&mut page, &points, Rgb([0, 0, 0]));
+            }
+            let pixels = page
+                .pixels()
+                .map(|pixel| if pixel.0[0] < 128 { 255 } else { 0 })
+                .collect();
+            let lettering = Mask {
+                x: 0,
+                y: 0,
+                width: 560,
+                height: 560,
+                pixels,
+            };
+            let typo = lettering
+                .typography(&page)
+                .expect("tilted column holds ink");
+            assert!(
+                (typo.tilt - expected).abs() < 2.0,
+                "expected ~{expected}°, got {}°",
+                typo.tilt
+            );
+        }
+    }
+
+    #[test]
+    fn upright_circular_dot_column_stays_upright() {
+        let mut page = RgbImage::from_pixel(440, 440, Rgb([255, 255, 255]));
+        for cy in [160i32, 220, 280] {
+            for y in cy - 5..=cy + 5 {
+                for x in 215i32..=225 {
+                    let dx = x - 220;
+                    let dy = y - cy;
+                    if dx * dx + dy * dy <= 16 {
+                        page.put_pixel(x as u32, y as u32, Rgb([0, 0, 0]));
+                    }
+                }
+            }
+        }
+        let pixels = page
+            .pixels()
+            .map(|pixel| if pixel.0[0] < 128 { 255 } else { 0 })
+            .collect();
+        let lettering = Mask {
+            x: 0,
+            y: 0,
+            width: 440,
+            height: 440,
+            pixels,
+        };
+        let typo = lettering.typography(&page).expect("dot column holds ink");
+        assert_eq!(
+            typo.tilt, 0.0,
+            "upright dots must not snap to diagonal tilt"
+        );
+    }
+
+    #[test]
+    fn tilted_adjacent_columns_preserve_target_ink_despite_overlapping_aabbs() {
+        use imageproc::{drawing::draw_polygon_mut, point::Point};
+
+        let mut page = RgbImage::from_pixel(300, 300, Rgb([255, 255, 255]));
+        let (sin, cos) = (-12.0f32).to_radians().sin_cos();
+        let mut draw_col = |cx: f32, rows: i32| -> (Mask, [f32; 4], Vec<(u32, u32)>) {
+            let mut canvas = GrayImage::new(300, 300);
+            let mut ink_pts = Vec::new();
+            let (mut x0, mut y0, mut x1, mut y1) = (300u32, 300u32, 0u32, 0u32);
+            for row in 0..rows {
+                let top = -80.0 + 28.0 * row as f32;
+                let corners = [
+                    (-9.0, top),
+                    (9.0, top),
+                    (9.0, top + 20.0),
+                    (-9.0, top + 20.0),
+                ];
+                let points = corners.map(|(x, y)| {
+                    Point::new(
+                        (cx + x * cos - y * sin).round() as i32,
+                        (150.0 + x * sin + y * cos).round() as i32,
+                    )
+                });
+                draw_polygon_mut(&mut page, &points, Rgb([0, 0, 0]));
+                draw_polygon_mut(&mut canvas, &points, Luma([255]));
+            }
+            for (x, y, p) in canvas.enumerate_pixels() {
+                if p.0[0] != 0 {
+                    ink_pts.push((x, y));
+                    x0 = x0.min(x);
+                    y0 = y0.min(y);
+                    x1 = x1.max(x + 1);
+                    y1 = y1.max(y + 1);
+                }
+            }
+            let mask = crop(&canvas, 0, 0, 300, 300);
+            (mask, [x0 as f32, y0 as f32, x1 as f32, y1 as f32], ink_pts)
+        };
+        // Larger target column (6 glyphs) next to a smaller neighbor (4 glyphs)
+        // 4px away so their axis-aligned bounding boxes overlap heavily.
+        let (target_mask, target_bbox, target_ink) = draw_col(130.0, 6);
+        let (neighbor_mask, neighbor_bbox, _) = draw_col(152.0, 4);
+        assert!(
+            target_bbox[2] > neighbor_bbox[0],
+            "AABBs must overlap to exercise tie-breaking"
+        );
+
+        let make_det = |mask: Mask, bbox: [f32; 4]| KoharuLayoutDetection {
+            label_id: 0,
+            label: "text".into(),
+            score: 0.9,
+            bbox,
+            area: mask.pixels.iter().filter(|&&v| v != 0).count() as u32,
+            mask: Arc::new(mask),
+        };
+        let mut dets = [
+            make_det(target_mask, target_bbox),
+            make_det(neighbor_mask, neighbor_bbox),
+        ];
+        fit_glyph_masks(
+            dets.iter_mut()
+                .map(|d| (GlyphProposal::Segmented(d.bbox), d)),
+            &page,
+        );
+        let kept = target_ink
+            .iter()
+            .filter(|&&(x, y)| dets[0].mask.contains(x, y))
+            .count();
+        assert_eq!(
+            kept,
+            target_ink.len(),
+            "smaller tilted neighbor stole target ink pixels"
+        );
     }
 }
