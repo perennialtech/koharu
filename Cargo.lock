@@ -2637,6 +2637,7 @@ dependencies = [
  "nvml-wrapper",
  "rayon",
  "serde",
+ "serde_json",
  "specta",
  "strum",
  "sysinfo 0.40.1",
