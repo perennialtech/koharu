@@ -758,19 +758,23 @@ impl MtmdInputChunks {
     ///
     /// # Errors
     ///
-    /// Returns `MtmdEvalError::EvalFailure` if any encoding or decoding operation fails.
+    /// Returns `MtmdEvalError::EvalFailure` for MTP contexts or if encoding or decoding fails.
     ///
     /// This function is NOT thread-safe.
     pub fn eval_chunks(
         &self,
         mtmd_ctx: &MtmdContext,
-        llama_ctx: &LlamaContext,
+        llama_ctx: &mut LlamaContext,
         n_past: koharu_llama_sys::llama_pos,
         seq_id: koharu_llama_sys::llama_seq_id,
         n_batch: i32,
         logits_last: bool,
     ) -> Result<koharu_llama_sys::llama_pos, MtmdEvalError> {
+        if llama_ctx.requires_embd_state {
+            return Err(MtmdEvalError::EvalFailure(-1));
+        }
         let mut new_n_past: koharu_llama_sys::llama_pos = 0;
+        llama_ctx.initialized_logits.clear();
         crate::clear_allocation_failure();
 
         let result = unsafe {

@@ -250,6 +250,18 @@ impl Header {
     }
 }
 
+/// The native loader reads model metadata from the first shard. Numeric GGUF
+/// arrays, including the sliding-window pattern, are absent from a loaded model.
+pub(crate) fn model_kv_layers(
+    path: &Path,
+    architecture: &str,
+    blocks: u32,
+) -> Option<Vec<GgufKvLayer>> {
+    let header = Header::open(path)?;
+    let key = |suffix: &str| header.key(&CString::new(format!("{architecture}.{suffix}")).ok()?);
+    header.kv_layers(key, blocks)
+}
+
 fn shard_paths(path: &Path, index: u16, count: u16) -> Option<Vec<PathBuf>> {
     if count <= 1 {
         return (index == 0).then(|| vec![path.to_owned()]);

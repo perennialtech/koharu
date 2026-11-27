@@ -1,8 +1,11 @@
 //! Safe wrapper around `llama_batch`.
 
+use crate::DecodeError;
+use crate::context::LlamaContext;
 use crate::token::LlamaToken;
 use koharu_llama_sys::{llama_batch, llama_batch_free, llama_batch_init, llama_pos, llama_seq_id};
 use std::marker::PhantomData;
+use std::num::NonZeroI32;
 
 /// A safe wrapper around `llama_batch`.
 #[derive(Debug)]
@@ -218,5 +221,143 @@ impl<'a> Drop for LlamaBatch<'a> {
                 llama_batch_free(self.llama_batch);
             }
         }
+    }
+}
+
+/// Errors returned when adding entries to a [`LlamaBatchExtScope`].
+#[derive(thiserror::Error, Debug, PartialEq, Eq)]
+pub enum BatchExtError {
+    /// Failed to allocate `llama_batch_ext`.
+    #[error("llama_batch_ext_init returned null")]
+    NullInit,
+    /// The batch is full.
+    #[error("extended batch is full")]
+    Full,
+    /// Invalid token id or embedding.
+    #[error("invalid token or embedding for extended batch")]
+    InvalidToken,
+    /// Invalid sequence id.
+    #[error("invalid sequence id for extended batch")]
+    InvalidSeqId,
+    /// Unknown negative error code from `llama_batch_ext_add*`.
+    #[error("extended batch error {0}")]
+    Unknown(i32),
+}
+
+/// An extended batch borrowing its originating context until decoded or discarded.
+#[derive(Debug)]
+pub struct LlamaBatchExtScope<'ctx, 'model> {
+    pub(crate) ctx: &'ctx mut LlamaContext<'model>,
+    pub(crate) batch: std::ptr::NonNull<koharu_llama_sys::llama_batch_ext>,
+    pub(crate) n_entries: usize,
+    pub(crate) next_embd_state: usize,
+    pub(crate) initialized_logits: Vec<i32>,
+}
+
+impl LlamaBatchExtScope<'_, '_> {
+    /// Adds a token entry for `seq_id` and returns its batch index.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BatchExtError`] if llama.cpp rejects the entry.
+    pub fn add_token(&mut self, seq_id: i32, token: LlamaToken) -> Result<i32, BatchExtError> {
+        if !(0..self.ctx.model().n_vocab()).contains(&token.0) {
+            return Err(BatchExtError::InvalidToken);
+        }
+        if seq_id < 0 {
+            return Err(BatchExtError::InvalidSeqId);
+        }
+        let idx = unsafe {
+            koharu_llama_sys::llama_batch_ext_add_token(self.batch.as_ptr(), seq_id, token.0)
+        };
+        if idx >= 0 {
+            if self.ctx.requires_embd_state {
+                self.n_entries += 1;
+            }
+            Ok(idx)
+        } else {
+            Err(match idx {
+                -1 => BatchExtError::Full,
+                -2 => BatchExtError::InvalidToken,
+                -3 => BatchExtError::InvalidSeqId,
+                other => BatchExtError::Unknown(other),
+            })
+        }
+    }
+
+    /// Associates an additional sequence id with batch entry `idx`.
+    pub fn add_seq(&mut self, idx: i32, seq_id: i32) -> bool {
+        unsafe { koharu_llama_sys::llama_batch_ext_add_seq(self.batch.as_ptr(), idx, seq_id) }
+    }
+
+    /// Sets the position for text token entry `idx`.
+    pub fn set_pos(&mut self, idx: i32, pos: llama_pos) -> bool {
+        unsafe {
+            koharu_llama_sys::llama_batch_ext_set_pos(self.batch.as_ptr(), idx, [pos; 4].as_ptr())
+        }
+    }
+
+    /// Sets the single-row hidden state embedding for entry `idx` (e.g. MTP target state).
+    /// MTP states must be set once each in token order because the native batch
+    /// appends state rows in the order they are supplied.
+    pub fn set_embd_state(&mut self, idx: i32, state: &[f32]) -> bool {
+        if self.ctx.requires_embd_state && usize::try_from(idx) != Ok(self.next_embd_state) {
+            return false;
+        }
+        let embd = koharu_llama_sys::llama_embd {
+            data: state.as_ptr(),
+            n_rows: 1,
+            n_embd: state.len(),
+        };
+        let ok = unsafe {
+            koharu_llama_sys::llama_batch_ext_set_embd_state(self.batch.as_ptr(), idx, embd)
+        };
+        if ok && self.ctx.requires_embd_state {
+            self.next_embd_state += 1;
+        }
+        ok
+    }
+
+    /// Enables or disables output logits for entry `idx`.
+    pub fn set_output_logits(&mut self, idx: i32, value: bool) -> bool {
+        let ok = unsafe {
+            koharu_llama_sys::llama_batch_ext_set_output_logits(self.batch.as_ptr(), idx, value)
+        };
+        if ok {
+            if value {
+                if !self.initialized_logits.contains(&idx) {
+                    self.initialized_logits.push(idx);
+                }
+            } else {
+                self.initialized_logits.retain(|l| l != &idx);
+            }
+        }
+        ok
+    }
+
+    /// Decodes this batch and makes its requested logits available on success.
+    pub fn decode(self) -> Result<(), DecodeError> {
+        if self.ctx.requires_embd_state {
+            if self.n_entries == 0 {
+                return Err(DecodeError::NTokensZero);
+            }
+            if self.next_embd_state != self.n_entries {
+                return Err(DecodeError::MissingEmbdState);
+            }
+        }
+        self.ctx.initialized_logits.clear();
+        crate::clear_allocation_failure();
+        let result = unsafe {
+            koharu_llama_sys::llama_process(
+                self.ctx.context.as_ptr(),
+                koharu_llama_sys::LLAMA_PROCESS_TYPE_DECODE,
+                self.batch.as_ptr(),
+            )
+        };
+        if let Some(error) = NonZeroI32::new(result) {
+            return Err(DecodeError::from(error));
+        }
+        self.ctx.initialized_logits = self.initialized_logits;
+        Ok(())
     }
 }

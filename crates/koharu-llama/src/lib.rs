@@ -122,6 +122,9 @@ pub enum MetaValError {
 /// Failed to Load context
 #[derive(Debug, Eq, PartialEq, thiserror::Error)]
 pub enum LlamaContextLoadError {
+    /// The draft context cannot share the target's KV cache or hidden states.
+    #[error("incompatible llama.cpp target and draft context pair")]
+    IncompatiblePair,
     /// llama.cpp returned null
     #[error("null reference from llama.cpp")]
     NullReturn,
@@ -146,6 +149,9 @@ pub enum StateSeqError {
 /// Failed to decode a batch.
 #[derive(Debug, Eq, PartialEq, thiserror::Error)]
 pub enum DecodeError {
+    /// An MTP batch entry is missing its hidden state.
+    #[error("MTP decoding requires a hidden state for every batch entry")]
+    MissingEmbdState,
     /// No kv cache slot was available.
     #[error("Decode Error 1: NoKvCacheSlot")]
     NoKvCacheSlot,

@@ -262,7 +262,7 @@ impl Model {
             let (next_token, position) = self.prefill(
                 prepared,
                 mtmd.as_deref(),
-                &mut context,
+                context.as_mut(),
                 &mut sampler,
                 context_config.n_batch,
                 i32::try_from(index).context("sequence index exceeds i32")?,
