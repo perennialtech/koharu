@@ -3,7 +3,7 @@
 //! https://github.com/roboflow/rf-detr/blob/4ab7c18729de9d02ffd0495795d0831b5630f01b/src/rfdetr/detr.py
 //! https://github.com/roboflow/rf-detr/blob/4ab7c18729de9d02ffd0495795d0831b5630f01b/src/rfdetr/models/postprocess.py
 
-use std::borrow::Cow;
+use std::{borrow::Cow, sync::Arc};
 
 use anyhow::{Result, ensure};
 use image::DynamicImage;
@@ -18,9 +18,24 @@ use super::{
 const MEAN: [f32; 3] = [0.485, 0.456, 0.406];
 const STD: [f32; 3] = [0.229, 0.224, 0.225];
 
+// Class slots in the checkpoint's classification head.
+const TEXT: usize = 0;
+const BUBBLE: usize = 2;
+
+impl super::KoharuLayoutRFDetrSeg2XL {
+    /// Retains the bubble mask proposal alongside a query's semantic label for
+    /// fusion with a separate balloon detector.
+    #[must_use]
+    pub fn with_bubble_proposals(mut self) -> Self {
+        self.processor.keep_bubble_proposals = true;
+        self
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct KoharuLayoutRFDetrImageProcessor {
     num_select: usize,
+    keep_bubble_proposals: bool,
     class_names: Vec<String>,
     recommended_thresholds: KoharuLayoutThresholds,
 }
@@ -38,6 +53,7 @@ impl KoharuLayoutRFDetrImageProcessor {
         );
         Ok(Self {
             num_select: config.num_select as usize,
+            keep_bubble_proposals: false,
             class_names: config.class_names(),
             recommended_thresholds: config.recommended_thresholds,
         })
@@ -110,11 +126,27 @@ impl KoharuLayoutRFDetrImageProcessor {
         image_height: u32,
         thresholds: KoharuLayoutThresholds,
     ) -> Result<KoharuLayoutDetections> {
+        self.decode_detections(
+            &output.pred_logits,
+            &output.pred_boxes,
+            (image_width, image_height),
+            thresholds,
+            |queries| model.masks(output, queries),
+        )
+    }
+
+    fn decode_detections(
+        &self,
+        pred_logits: &[f32],
+        pred_boxes: &[f32],
+        (image_width, image_height): (u32, u32),
+        thresholds: KoharuLayoutThresholds,
+        decode_masks: impl FnOnce(&[usize]) -> Result<Vec<f32>>,
+    ) -> Result<KoharuLayoutDetections> {
         validate_thresholds(thresholds)?;
         // PostProcess ranks every query/class pair, including the checkpoint's
         // fifth background logit slot, before applying the caller threshold.
-        let scores = output
-            .pred_logits
+        let scores = pred_logits
             .iter()
             .map(|&logit| 1.0 / (1.0 + (-logit).exp()))
             .collect::<Vec<f32>>();
@@ -122,11 +154,26 @@ impl KoharuLayoutRFDetrImageProcessor {
         ranked.sort_by(|&left, &right| scores[right].total_cmp(&scores[left]));
         ranked.truncate(self.num_select);
         let thresholds = thresholds.with_background();
-        let selected = ranked
-            .into_iter()
-            .filter(|&index| scores[index] > thresholds[index % NUM_CLASSES_WITH_BACKGROUND])
-            .collect::<Vec<_>>();
-        if selected.is_empty() {
+        ranked.retain(|&index| scores[index] > thresholds[index % NUM_CLASSES_WITH_BACKGROUND]);
+
+        // The first passing class is the highest scoring, but a passing text
+        // label takes precedence over ambiguous lettering (upstream 08193a3c).
+        // In fusion mode the comic detector supplies balloon boxes, so an RF
+        // bubble proposal does not compete with any of the semantic classes.
+        let auxiliary = |label| self.keep_bubble_proposals && label == BUBBLE;
+        let mut chosen = [None; NUM_QUERIES];
+        for &index in &ranked {
+            let label = index % NUM_CLASSES_WITH_BACKGROUND;
+            let choice = &mut chosen[index / NUM_CLASSES_WITH_BACKGROUND];
+            if !auxiliary(label) && (choice.is_none() || label == TEXT) {
+                *choice = Some(index);
+            }
+        }
+        ranked.retain(|&index| {
+            chosen[index / NUM_CLASSES_WITH_BACKGROUND] == Some(index)
+                || auxiliary(index % NUM_CLASSES_WITH_BACKGROUND)
+        });
+        if ranked.is_empty() {
             return Ok(KoharuLayoutDetections {
                 image_width,
                 image_height,
@@ -134,26 +181,37 @@ impl KoharuLayoutRFDetrImageProcessor {
             });
         }
 
-        let queries = selected
-            .iter()
-            .map(|index| index / NUM_CLASSES_WITH_BACKGROUND)
-            .collect::<Vec<_>>();
-        let masks = model.masks(output, &queries)?;
+        let mut queries = Vec::new();
+        let mut mask_slots = [None; NUM_QUERIES];
+        for &index in &ranked {
+            let query = index / NUM_CLASSES_WITH_BACKGROUND;
+            mask_slots[query].get_or_insert_with(|| {
+                queries.push(query);
+                queries.len() - 1
+            });
+        }
+        let logits = decode_masks(&queries)?;
         let rows = bilinear_taps(MASK_RESOLUTION, image_height as usize);
         let columns = bilinear_taps(MASK_RESOLUTION, image_width as usize);
+        let masks: Vec<_> = logits
+            .par_chunks_exact(MASK_RESOLUTION * MASK_RESOLUTION)
+            .map(|logits| {
+                let (area, mask) = page_mask(logits, &rows, &columns);
+                (area, Arc::new(mask))
+            })
+            .collect();
         let size = [
             image_width as f32,
             image_height as f32,
             image_width as f32,
             image_height as f32,
         ];
-        let detections = selected
-            .par_iter()
-            .zip(&queries)
-            .zip(masks.par_chunks_exact(MASK_RESOLUTION * MASK_RESOLUTION))
-            .map(|((&index, &query), logits)| {
+        let detections = ranked
+            .into_iter()
+            .map(|index| {
+                let query = index / NUM_CLASSES_WITH_BACKGROUND;
                 let label_id = index % NUM_CLASSES_WITH_BACKGROUND;
-                let [center_x, center_y, width, height]: [f32; 4] = output.pred_boxes
+                let [center_x, center_y, width, height]: [f32; 4] = pred_boxes
                     [query * 4..query * 4 + 4]
                     .try_into()
                     .expect("box has four coordinates");
@@ -165,7 +223,7 @@ impl KoharuLayoutRFDetrImageProcessor {
                     center_x + half_width,
                     center_y + half_height,
                 ];
-                let (area, mask) = page_mask(logits, &rows, &columns);
+                let (area, mask) = &masks[mask_slots[query].expect("selected query has a mask")];
                 KoharuLayoutDetection {
                     label_id,
                     label: self
@@ -175,8 +233,8 @@ impl KoharuLayoutRFDetrImageProcessor {
                         .unwrap_or_else(|| "__background__".to_owned()),
                     score: scores[index],
                     bbox: std::array::from_fn(|axis| corners[axis] * size[axis]),
-                    area,
-                    mask,
+                    area: *area,
+                    mask: Arc::clone(mask),
                 }
             })
             .collect();
@@ -379,7 +437,7 @@ pub struct KoharuLayoutDetection {
     pub bbox: [f32; 4],
     pub area: u32,
     #[serde(skip_serializing)]
-    pub mask: KoharuLayoutMask,
+    pub mask: Arc<KoharuLayoutMask>,
 }
 
 #[derive(Debug, Clone)]
@@ -418,10 +476,105 @@ mod tests {
         RESOLUTION, STD, bilinear_taps, page_mask, validate_thresholds,
     };
 
+    fn detect_queries(
+        logits: &[[f32; 5]],
+        keep_bubble_proposals: bool,
+        expected_queries: &[usize],
+    ) -> Vec<super::KoharuLayoutDetection> {
+        let thresholds = KoharuLayoutThresholds {
+            text: 0.5,
+            onomatopoeia: 0.5,
+            bubble: 0.05,
+            panel: 0.5,
+        };
+        let processor = KoharuLayoutRFDetrImageProcessor {
+            num_select: logits.len() * 5,
+            class_names: ["text", "onomatopoeia", "bubble", "panel"]
+                .map(str::to_owned)
+                .to_vec(),
+            keep_bubble_proposals,
+            recommended_thresholds: thresholds,
+        };
+        let boxes = vec![[0.5, 0.5, 0.5, 0.5]; logits.len()];
+        processor
+            .decode_detections(
+                logits.as_flattened(),
+                boxes.as_flattened(),
+                (16, 8),
+                thresholds,
+                |queries| {
+                    assert_eq!(queries, expected_queries);
+                    let plane = MASK_RESOLUTION * MASK_RESOLUTION;
+                    let mut masks = vec![-1.0; queries.len() * plane];
+                    for (&query, mask) in queries.iter().zip(masks.chunks_exact_mut(plane)) {
+                        let height = MASK_RESOLUTION * (query + 1) / (logits.len() + 1);
+                        mask[..height * MASK_RESOLUTION].fill(1.0);
+                    }
+                    Ok(masks)
+                },
+            )
+            .unwrap()
+            .detections
+    }
+
+    #[test]
+    fn a_passing_text_wins_its_query_at_its_own_score_rank() {
+        // Query 0's sound effect would rank first. Its text ranks behind query
+        // 1's panel, whose lower-scoring sound effect also passes.
+        let detections = detect_queries(
+            &[[1.0, 3.0, -8.0, -8.0, -8.0], [-8.0, 0.5, -8.0, 2.0, -8.0]],
+            false,
+            &[1, 0],
+        );
+        let labels: Vec<_> = detections
+            .iter()
+            .map(|detection| detection.label.as_str())
+            .collect();
+        assert_eq!(labels, ["panel", "text"]);
+    }
+
+    #[test]
+    fn auxiliary_bubble_proposals_share_the_semantic_query_mask() {
+        // A weak bubble on one text query, a bubble outranking the panel
+        // on another, and a third query with only a bubble proposal.
+        let logits = [
+            [1.0, 1.5, -2.5, -8.0, -8.0],
+            [-8.0, -8.0, 3.0, 2.0, -8.0],
+            [-8.0, -8.0, -2.8, -8.0, -8.0],
+        ];
+        let detections = detect_queries(&logits, true, &[1, 0, 2]);
+        let labels: Vec<_> = detections
+            .iter()
+            .map(|detection| detection.label.as_str())
+            .collect();
+        assert_eq!(labels, ["bubble", "panel", "text", "bubble", "bubble"]);
+        // Decode slots hold queries 1, 0 and 2, with respective page heights
+        // of 4, 2 and 6 pixels. Each class must retrieve its query's mask.
+        for (detection, height) in detections.iter().zip([4, 4, 2, 2, 6]) {
+            assert_eq!(detection.mask.height, height);
+            assert_eq!(detection.area, 16 * height);
+        }
+        for (a, b) in [(0, 1), (2, 3)] {
+            assert!(std::sync::Arc::ptr_eq(
+                &detections[a].mask,
+                &detections[b].mask
+            ));
+            assert_eq!(detections[a].bbox, [4.0, 2.0, 12.0, 6.0]);
+        }
+
+        let standalone = detect_queries(&logits, false, &[1, 0, 2]);
+        let labels: Vec<_> = standalone
+            .iter()
+            .map(|detection| detection.label.as_str())
+            .collect();
+        assert_eq!(labels, ["bubble", "text", "bubble"]);
+    }
+
     #[test]
     fn preprocess_matches_per_pixel_interpolation() {
         let processor = KoharuLayoutRFDetrImageProcessor {
             num_select: 1,
+            keep_bubble_proposals: false,
             class_names: Vec::new(),
             recommended_thresholds: KoharuLayoutThresholds {
                 text: 0.5,
