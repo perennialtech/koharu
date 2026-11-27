@@ -1,5 +1,7 @@
 //! Renderer ownership, scene interpretation, resources, and retained updates.
 
+mod lettering;
+
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     sync::{Arc, OnceLock, Weak},
@@ -34,7 +36,10 @@ use crate::{
     Error, FontFamily, FontStyle, Frame, ImageKind, ImageMetadata, Layer, LayerKind, Presentation,
     RasterImage, RenderBounds, RenderDependency, RenderDiagnostic, Result, RetentionStats,
     TextAlign, TextMetadata, TypesettingConfig, WritingMode,
-    bubble::{GeometryFrame, LayoutBox, contour, flow_cells, geometry_bounds, geometry_frame},
+    bubble::{
+        GeometryFrame, LayoutBox, contour, expanded_cell, flow_cells, geometry_bounds,
+        geometry_frame, page_polygon,
+    },
     fonts::{FontPreview, FontRequest, Fonts},
     frame::{
         FrameData, ImageNodeDescriptor, LayerData, LocalTextMetadata, NodeDescriptor, RetainedNode,
@@ -42,7 +47,7 @@ use crate::{
     },
     images::{DEFAULT_IMAGE_CACHE_BYTES, DecodedImage, ImageCache, decode},
     script::{is_chinese_or_japanese_text, shaping_direction_for_text},
-    text_renderer::{StrokeOptions, TextNodeDescriptor, TextRenderer},
+    text_renderer::{StrokeOptions, TextNodeDescriptor, TextRenderer, TextSetting},
 };
 
 const MAX_SURFACE_DIMENSION: u32 = 32_768;
@@ -54,9 +59,6 @@ const ASSETS_KIND: &str = "dev.koharu.assets";
 // from phone screenshots to 600 dpi. 9 px on a 1654 px wide page.
 const MINIMUM_FONT_SIZE: f32 = 9.0;
 const MINIMUM_FONT_SIZE_PER_PAGE_SIDE: f32 = 1.0 / 180.0;
-// Free text whose source region is at least this much taller than wide is a
-// vertical column that horizontal translations cannot fill.
-const FREE_TEXT_COLUMN_ASPECT: f32 = 1.5;
 const FREE_TEXT_GAP: f32 = 4.0;
 
 #[derive(Clone)]
@@ -255,6 +257,28 @@ impl Renderer {
         previous: Option<&Frame>,
         affected: Option<&AffectedDependencies>,
     ) -> Result<Frame> {
+        let mut compiled = compiled;
+        let reused_lettering = previous.zip(affected).is_some_and(|(previous, affected)| {
+            lettering::reuse(&mut compiled, previous, affected)
+        });
+        let compiled = if !reused_lettering
+            && compiled
+                .layers
+                .iter()
+                .any(|layer| matches!(layer.descriptor, NodeDescriptor::Text(_)))
+        {
+            self.inner
+                .fonts
+                .prepare(&font_requests(&compiled.layers))
+                .await
+                .map_err(Error::FontResource)?;
+            let fonts = self.inner.fonts.clone();
+            self.workers()?
+                .spawn_async(move || lettering::coordinate(compiled, &fonts))
+                .await?
+        } else {
+            compiled
+        };
         let mut nodes = vec![None; compiled.layers.len()];
         let mut pending = Vec::new();
         let mut reused = 0;
@@ -263,14 +287,16 @@ impl Renderer {
             let mut node_cache = self.inner.nodes.lock();
 
             for (index, draft) in compiled.layers.iter().enumerate() {
-                let candidate = previous.is_none()
-                    || previous
-                        .and_then(|frame| frame.layer(draft.entity))
-                        .is_none()
-                    || affected.is_some_and(|affected| affected.intersects(&draft.dependencies));
+                let previous_layer = previous.and_then(|frame| frame.layer(draft.entity));
+                let candidate = match &draft.descriptor {
+                    NodeDescriptor::Text(_) => !reused_lettering,
+                    NodeDescriptor::Image(_) => {
+                        previous_layer.is_none()
+                            || affected.is_some_and(|a| a.intersects(&draft.dependencies))
+                    }
+                };
                 candidates += usize::from(candidate);
-                let previous_node = previous
-                    .and_then(|frame| frame.layer(draft.entity))
+                let previous_node = previous_layer
                     .map(|layer| &layer.0.node)
                     .filter(|node| node.descriptor == draft.descriptor);
                 if let Some(node) = previous_node {
@@ -288,12 +314,6 @@ impl Renderer {
             }
         }
 
-        let font_requests = font_requests(&pending);
-        self.inner
-            .fonts
-            .prepare(&font_requests)
-            .await
-            .map_err(Error::FontResource)?;
         let image_ids = pending
             .iter()
             .filter_map(|(_, descriptor)| match descriptor {
@@ -479,7 +499,25 @@ enum DraftMetadata {
         alignment: TextAlign,
         writing_mode: WritingMode,
         angle_degrees: f32,
+        lettering: Box<LetteringIntent>,
     },
+}
+
+#[derive(Clone, Default)]
+struct LetteringIntent {
+    /// The containing balloon, even when a sound effect uses its free-text frame.
+    balloon: Option<EntityId>,
+    sound: bool,
+    authored_frame: bool,
+    original_room: Option<LayoutBox>,
+    share: Option<FlowShare>,
+}
+
+#[derive(Clone)]
+struct FlowShare {
+    frame: GeometryFrame,
+    wall: Arc<[(f32, f32)]>,
+    cell: Vec<(f32, f32)>,
 }
 
 struct CompiledPage {
@@ -488,6 +526,7 @@ struct CompiledPage {
     width: u32,
     height: u32,
     layers: Vec<LayerDraft>,
+    balloons: Vec<(EntityId, lettering::BalloonOutline)>,
     dependencies: Arc<[RenderDependency]>,
     diagnostics: Vec<RenderDiagnostic>,
 }
@@ -561,12 +600,74 @@ impl Renderer {
             },
             &[],
         )?;
+        // Analysis regions need no text layer to reserve their balloon on the page.
+        let mut balloons = Vec::new();
+        let mut wall_dependencies = Vec::new();
+        if traversal
+            .layers
+            .iter()
+            .any(|l| matches!(l.descriptor, NodeDescriptor::Text(_)))
+        {
+            for entity in snapshot.descendants(page)? {
+                let id = entity.id();
+                let region = component_dependency::<Region>(id);
+                traversal.dependencies.insert(region.clone());
+                if entity
+                    .component::<Region>()?
+                    .is_some_and(|r| r.kind == BubbleRegion::kind())
+                {
+                    wall_dependencies.extend([
+                        region,
+                        component_dependency::<Geometry>(id),
+                        RenderDependency::Hierarchy(id),
+                    ]);
+                    if let Some(geometry) = entity.component::<Geometry>()? {
+                        balloons.push((id, lettering::BalloonOutline::from_geometry(&geometry)));
+                    }
+                }
+            }
+        }
+        traversal
+            .dependencies
+            .extend(wall_dependencies.iter().cloned());
+        // A changed translation can change the page median and every movable
+        // neighbour. Share the dependency set; equality of the resolved local
+        // descriptors still retains glyph nodes whose lettering didn't change.
+        let text_dependencies: Arc<[_]> = traversal
+            .layers
+            .iter()
+            .filter(|l| matches!(l.descriptor, NodeDescriptor::Text(_)))
+            .flat_map(|l| l.dependencies.iter().cloned())
+            .chain(
+                traversal
+                    .layers
+                    .iter()
+                    .filter(|layer| matches!(layer.descriptor, NodeDescriptor::Text(_)))
+                    .flat_map(|layer| {
+                        layer
+                            .ancestry
+                            .iter()
+                            .copied()
+                            .map(component_dependency::<Visibility>)
+                    }),
+            )
+            .chain(wall_dependencies)
+            .chain([component_dependency::<Page>(page)])
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        for layer in &mut traversal.layers {
+            if matches!(layer.descriptor, NodeDescriptor::Text(_)) {
+                layer.dependencies = text_dependencies.clone();
+            }
+        }
         Ok(CompiledPage {
             revision: snapshot.revision(),
             page,
             width,
             height,
             layers: traversal.layers,
+            balloons,
             dependencies: traversal.dependencies.into_iter().collect(),
             diagnostics: traversal.diagnostics,
         })
@@ -747,6 +848,7 @@ impl Traversal<'_> {
         let mut analysis = None;
         let mut source_font_size = None;
         let mut source_bounds = None;
+        let mut sound_region = None;
         if let Some(recognized) = self.snapshot.relation_from::<RecognizedFrom>(content)? {
             let region = recognized.value().target;
             dependencies.insert(RenderDependency::Relation(recognized.id()));
@@ -754,6 +856,14 @@ impl Traversal<'_> {
             dependencies.insert(component_dependency::<OcrAnalysis>(region));
             dependencies.insert(component_dependency::<Geometry>(region));
             dependencies.insert(component_dependency::<SourceText>(content));
+            dependencies.insert(component_dependency::<Region>(region));
+            if self
+                .snapshot
+                .component::<Region>(region)?
+                .is_some_and(|r| r.label.as_deref() == Some("onomatopoeia"))
+            {
+                sound_region = Some(region);
+            }
             analysis = self.snapshot.component::<OcrAnalysis>(region)?;
             source_bounds = self
                 .snapshot
@@ -766,16 +876,38 @@ impl Traversal<'_> {
                 .zip(source_bounds)
                 .and_then(|(source, bounds)| source_glyph_size(&source.text.value, bounds));
         }
+        let minimum_font_size = readable_font_size(self.width, self.height);
+        let source_font_size = typography
+            .as_ref()
+            .and_then(|t| t.size)
+            .or(source_font_size);
         let authored = self.snapshot.component::<Geometry>(entity)?;
         let is_authored = authored.is_some();
-        let placement = if let Some(placement) = self.balloon_flows.get(&entity) {
+        let placement = if sound_region.is_some() {
+            self.fit(entity, source_font_size, sound_region, dependencies)?
+        } else if let Some(placement) = self.balloon_flows.get(&entity) {
             dependencies.extend(placement.dependencies.iter().cloned());
             Some(placement.clone())
         } else if let Some(placement) = self.balloon_flow(entity, dependencies)? {
             Some(placement)
         } else {
-            self.fit(entity, source_font_size, dependencies)?
+            self.fit(entity, source_font_size, None, dependencies)?
         };
+        let mut lettering = placement
+            .as_ref()
+            .map(|p| p.lettering.clone())
+            .unwrap_or_default();
+        lettering.sound = sound_region.is_some();
+        if lettering.sound
+            && let Some(flow) = self.snapshot.relation_from::<FlowsIn>(entity)?
+        {
+            dependencies.insert(RenderDependency::Relation(flow.id()));
+            lettering.balloon = Some(flow.value().target);
+        }
+        lettering.authored_frame = is_authored;
+        if is_authored {
+            lettering.original_room = None;
+        }
         let (geometry, frame, balloon_contour) = if let Some(geometry) = authored {
             let Some(frame) = geometry_frame(&geometry, layout.angle_degrees) else {
                 return Ok(None);
@@ -795,8 +927,12 @@ impl Traversal<'_> {
                 placement.balloon_contour,
             )
         };
-        let writing_mode =
-            resolve_writing_mode(&text, frame.bounds, typography.as_ref(), analysis.as_ref());
+        let writing_mode = resolve_writing_mode(
+            &text,
+            lettering.original_room.unwrap_or(frame.bounds),
+            typography.as_ref(),
+            analysis.as_ref(),
+        );
         let (direction, _) = shaping_direction_for_text(&text, writing_mode);
         let alignment = resolve_alignment(
             typography.as_ref().and_then(|value| value.alignment),
@@ -814,25 +950,23 @@ impl Traversal<'_> {
         // A box the user drew is theirs to fill; only an automatic free text
         // placement is held to the area of the lettering it replaces.
         let source_area = source_bounds
+            .or(lettering.original_room)
             .filter(|_| !is_bubble && !is_authored)
             .map(|bounds| bounds.width * bounds.height);
         let foreground_color = typography
             .as_ref()
             .and_then(|value| value.color)
             .unwrap_or([0, 0, 0, 255]);
-        let stroke = resolve_stroke(typography.as_ref()).or_else(|| {
-            // Free text spreads past the lettering it replaces, onto artwork
-            // the source never had to stand out against, so lettering without
-            // an outline gets one in the contrasting color. On the background
-            // the source did stand on, that outline is invisible. An outline
-            // the user removed stays removed.
-            let user = typography
-                .as_ref()
-                .is_some_and(|value| matches!(value.origin, Origin::User));
-            (!is_bubble && !user)
-                .then_some(source_font_size)
-                .flatten()
-                .map(|size| contrast_outline(foreground_color, size))
+        let foreground_color = neutral_fill(foreground_color);
+        let user = typography
+            .as_ref()
+            .is_some_and(|t| matches!(t.origin, Origin::User));
+        let source_em = source_font_size.unwrap_or(minimum_font_size);
+        let stroke = resolve_stroke(typography.as_ref(), foreground_color).or_else(|| {
+            (!user).then(|| StrokeOptions {
+                color: contrast_color(foreground_color),
+                width_px: source_em / if lettering.sound { 16.0 } else { 8.0 },
+            })
         });
         let descriptor = TextNodeDescriptor {
             entity,
@@ -851,7 +985,7 @@ impl Traversal<'_> {
             font_size: typography.as_ref().and_then(|value| value.size),
             source_font_size,
             source_area,
-            minimum_font_size: readable_font_size(self.width, self.height),
+            minimum_font_size,
             auto_fit: typography.as_ref().is_none_or(|value| value.auto_fit),
             alignment,
             writing_mode,
@@ -860,7 +994,8 @@ impl Traversal<'_> {
             line_height: 1.2,
             letter_spacing: 0.0,
             word_spacing: 0.0,
-            text_inset: [4.0; 4],
+            text_inset: [0.0; 4],
+            setting: TextSetting::default(),
             point_text: !is_bubble && layout.kind == TextLayoutKind::Point,
         };
         Ok(Some(LayerDraft {
@@ -876,6 +1011,7 @@ impl Traversal<'_> {
                 alignment,
                 writing_mode,
                 angle_degrees: frame.angle_degrees,
+                lettering: Box::new(lettering),
             },
             dependencies: dependencies.iter().cloned().collect(),
         }))
@@ -885,63 +1021,54 @@ impl Traversal<'_> {
         &self,
         entity: EntityId,
         source_font_size: Option<f32>,
+        source_region: Option<EntityId>,
         dependencies: &mut BTreeSet<RenderDependency>,
     ) -> Result<Option<ResolvedPlacement>> {
-        let Some(relation) = self.snapshot.relation_from::<FitsTo>(entity)? else {
+        let target = if let Some(relation) = self.snapshot.relation_from::<FitsTo>(entity)? {
+            dependencies.insert(RenderDependency::Relation(relation.id()));
+            relation.value().target
+        } else if let Some(source) = source_region {
+            source
+        } else {
             return Ok(None);
         };
-        let target = relation.value().target;
         if !belongs_to_page(self.snapshot, target, self.page)? {
             return Ok(None);
         }
-        dependencies.insert(RenderDependency::Relation(relation.id()));
         dependencies.insert(RenderDependency::Entity(target));
         dependencies.insert(component_dependency::<Geometry>(target));
         let geometry = self.snapshot.analysis_region(target)?.geometry()?;
         let Some(frame) = geometry_frame(&geometry, None) else {
             return Ok(None);
         };
-        if frame.bounds.height < frame.bounds.width * FREE_TEXT_COLUMN_ASPECT {
-            return Ok(Some(ResolvedPlacement {
-                geometry,
-                frame,
-                balloon_contour: None,
-                dependencies: Arc::from([]),
-            }));
-        }
         // Neighbouring free text keeps at least half a source glyph of space.
         let gap = source_font_size.map_or(FREE_TEXT_GAP, |size| (size * 0.5).max(FREE_TEXT_GAP));
         // A tilted column widens in its own axes. Its unrotated bounds share
         // the column's center, which is close enough to test neighbours at the
         // few degrees lettering is tilted by.
-        let bounds = self.widen_free_text(target, frame.bounds, gap, dependencies)?;
-        let (sin, cos) = f64::from(frame.angle_degrees).to_radians().sin_cos();
-        let center_x = f64::from(bounds.x) + f64::from(bounds.width) * 0.5;
-        let center_y = f64::from(bounds.y) + f64::from(bounds.height) * 0.5;
-        let (half_width, half_height) = (
-            f64::from(bounds.width) * 0.5,
-            f64::from(bounds.height) * 0.5,
-        );
-        let geometry = Geometry {
-            origin: geometry.origin,
-            points: [(-1.0, -1.0), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0)]
-                .into_iter()
-                .map(|(x, y)| {
-                    let (x, y) = (x * half_width, y * half_height);
-                    koharu_scene::Point {
-                        x: center_x + x * cos - y * sin,
-                        y: center_y + x * sin + y * cos,
-                    }
-                })
-                .collect(),
+        let bounds =
+            self.widen_free_text(target, frame.bounds, gap, source_font_size, dependencies)?;
+        let room = LayoutBox {
+            x: bounds.x - frame.bounds.x,
+            y: bounds.y - frame.bounds.y,
+            ..bounds
+        };
+        let geometry = page_polygon(frame, &room.corners(), geometry.origin);
+        let Some(widened) = geometry_frame(&geometry, Some(frame.angle_degrees)) else {
+            return Ok(None);
         };
         Ok(Some(ResolvedPlacement {
             geometry,
-            frame: GeometryFrame {
-                bounds,
-                angle_degrees: frame.angle_degrees,
-            },
+            frame: widened,
             balloon_contour: None,
+            lettering: LetteringIntent {
+                original_room: Some(LayoutBox {
+                    x: frame.bounds.x - bounds.x,
+                    y: frame.bounds.y - bounds.y,
+                    ..frame.bounds
+                }),
+                ..Default::default()
+            },
             dependencies: Arc::from([]),
         }))
     }
@@ -953,6 +1080,7 @@ impl Traversal<'_> {
         target: EntityId,
         column: LayoutBox,
         gap: f32,
+        source_em: Option<f32>,
         dependencies: &mut BTreeSet<RenderDependency>,
     ) -> Result<LayoutBox> {
         dependencies.insert(RenderDependency::Hierarchy(self.page));
@@ -967,7 +1095,9 @@ impl Traversal<'_> {
                 continue;
             };
             let panel = region.kind == PanelRegion::kind();
-            if !panel && region.kind != TextRegion::kind() && region.kind != BubbleRegion::kind() {
+            let text = region.kind == TextRegion::kind()
+                || region.label.as_deref() == Some("onomatopoeia");
+            if !panel && !text && region.kind != BubbleRegion::kind() {
                 continue;
             }
             dependencies.insert(component_dependency::<Geometry>(entity));
@@ -984,7 +1114,7 @@ impl Traversal<'_> {
             } else {
                 obstacles.push(Obstacle {
                     bounds,
-                    shared: region.kind == TextRegion::kind(),
+                    shared: text,
                 });
             }
         }
@@ -994,7 +1124,31 @@ impl Traversal<'_> {
             width: self.width as f32,
             height: self.height as f32,
         };
-        Ok(widen_column(column, &panels, page, &obstacles, gap))
+        let width = column.width.max(column.height.min(2.5 * column.width));
+        let widened = grow_horizontal(column, &panels, page, &obstacles, gap, width);
+        let height = column
+            .height
+            .max(3.0 * source_em.unwrap_or(column.width.min(column.height)));
+        let transpose = |r: LayoutBox| LayoutBox {
+            x: r.y,
+            y: r.x,
+            width: r.height,
+            height: r.width,
+        };
+        Ok(transpose(grow_horizontal(
+            transpose(widened),
+            &panels.into_iter().map(transpose).collect::<Vec<_>>(),
+            transpose(page),
+            &obstacles
+                .into_iter()
+                .map(|o| Obstacle {
+                    bounds: transpose(o.bounds),
+                    ..o
+                })
+                .collect::<Vec<_>>(),
+            gap,
+            height,
+        )))
     }
 
     fn balloon_flow(
@@ -1018,6 +1172,10 @@ impl Traversal<'_> {
         };
         Ok(Some(ResolvedPlacement {
             balloon_contour: Some(contour(&geometry, frame)),
+            lettering: LetteringIntent {
+                balloon: Some(target),
+                ..Default::default()
+            },
             geometry,
             frame,
             dependencies: Arc::from([]),
@@ -1036,12 +1194,13 @@ struct Obstacle {
 /// its center, keeping `gap` from the panel edge and from text and balloons
 /// beside it. Growth is centered and spills to the other side when one side is
 /// blocked.
-fn widen_column(
+fn grow_horizontal(
     column: LayoutBox,
     panels: &[LayoutBox],
     page: LayoutBox,
     obstacles: &[Obstacle],
     gap: f32,
+    desired_width: f32,
 ) -> LayoutBox {
     let center_x = column.x + column.width * 0.5;
     let center_y = column.y + column.height * 0.5;
@@ -1083,7 +1242,7 @@ fn widen_column(
     }
     let left_room = (column.x - left).max(0.0);
     let right_room = (right - column_right).max(0.0);
-    let extra = (column.height - column.width).min(left_room + right_room);
+    let extra = (desired_width - column.width).min(left_room + right_room);
     if extra <= 0.0 {
         return column;
     }
@@ -1102,6 +1261,7 @@ struct ResolvedPlacement {
     geometry: Geometry,
     frame: GeometryFrame,
     balloon_contour: Option<Vec<(f32, f32)>>,
+    lettering: LetteringIntent,
     dependencies: Arc<[RenderDependency]>,
 }
 
@@ -1155,6 +1315,16 @@ fn resolve_balloon_flows(snapshot: &Snapshot, page: EntityId) -> Result<BalloonF
             if translation.text.value.trim().is_empty() {
                 continue;
             }
+            if let Some(recognized) = snapshot.relation_from::<RecognizedFrom>(content)? {
+                let region = recognized.value().target;
+                dependencies.insert(component_dependency::<Region>(region));
+                if snapshot
+                    .component::<Region>(region)?
+                    .is_some_and(|r| r.label.as_deref() == Some("onomatopoeia"))
+                {
+                    continue;
+                }
+            }
             let anchor = flow_anchor(snapshot, content, &mut dependencies)?;
             groups.entry(balloon).or_default().push(FlowSeed {
                 layer: entity,
@@ -1195,30 +1365,19 @@ fn resolve_balloon_flows(snapshot: &Snapshot, page: EntityId) -> Result<BalloonF
             .collect::<Vec<_>>();
         let cells = (seeds.len() > 1).then(|| flow_cells(frame, &balloon_contour, &anchors));
         let dependencies: Arc<[RenderDependency]> = dependencies.iter().cloned().collect();
+        let wall: Arc<[_]> = balloon_contour.into();
         for (index, seed) in seeds.into_iter().enumerate() {
             // Persisting a canvas transform must preserve the exact shape used
             // for layout, including the division between joined balloon lobes.
-            let geometry = if let Some(cell) = cells.as_ref().and_then(|cells| cells.get(index)) {
-                let (sin, cos) = f64::from(frame.angle_degrees).to_radians().sin_cos();
-                let half_width = f64::from(frame.bounds.width) * 0.5;
-                let half_height = f64::from(frame.bounds.height) * 0.5;
-                Geometry {
-                    origin: geometry.origin.clone(),
-                    points: cell
-                        .iter()
-                        .map(|&(x, y)| {
-                            let x = f64::from(x) - half_width;
-                            let y = f64::from(y) - half_height;
-                            koharu_scene::Point {
-                                x: f64::from(frame.bounds.x) + half_width + x * cos - y * sin,
-                                y: f64::from(frame.bounds.y) + half_height + x * sin + y * cos,
-                            }
-                        })
-                        .collect(),
-                }
-            } else {
-                geometry.clone()
-            };
+            let share = cells.as_ref().map(|cells| FlowShare {
+                frame,
+                wall: wall.clone(),
+                cell: cells[index].clone(),
+            });
+            let geometry = share.as_ref().map_or_else(
+                || geometry.clone(),
+                |share| page_polygon(frame, &share.cell, geometry.origin.clone()),
+            );
             let Some(frame) = geometry_frame(&geometry, Some(frame.angle_degrees)) else {
                 continue;
             };
@@ -1226,6 +1385,11 @@ fn resolve_balloon_flows(snapshot: &Snapshot, page: EntityId) -> Result<BalloonF
                 seed.layer,
                 ResolvedPlacement {
                     balloon_contour: Some(contour(&geometry, frame)),
+                    lettering: LetteringIntent {
+                        balloon: Some(balloon),
+                        share,
+                        ..Default::default()
+                    },
                     geometry,
                     frame,
                     dependencies: dependencies.clone(),
@@ -1398,6 +1562,7 @@ fn assemble_frame(
                 alignment,
                 writing_mode,
                 angle_degrees,
+                ..
             } => {
                 let metadata = node
                     .text
@@ -1476,18 +1641,20 @@ fn placement(draft: &LayerDraft, node: &RetainedNode) -> Affine {
             f64::from(draft.frame.bounds.x),
             f64::from(draft.frame.bounds.y),
         )),
-        NodeDescriptor::Text(_) => {
-            let frame = draft.frame.bounds;
-            Affine::translate((
-                f64::from(frame.x + frame.width * 0.5),
-                f64::from(frame.y + frame.height * 0.5),
-            )) * Affine::rotate(f64::from(draft.frame.angle_degrees).to_radians())
-                * Affine::translate((
-                    -f64::from(frame.width * 0.5),
-                    -f64::from(frame.height * 0.5),
-                ))
-        }
+        NodeDescriptor::Text(_) => text_placement(draft.frame),
     }
+}
+
+fn text_placement(geometry: GeometryFrame) -> Affine {
+    let frame = geometry.bounds;
+    Affine::translate((
+        f64::from(frame.x + frame.width * 0.5),
+        f64::from(frame.y + frame.height * 0.5),
+    )) * Affine::rotate(f64::from(geometry.angle_degrees).to_radians())
+        * Affine::translate((
+            -f64::from(frame.width * 0.5),
+            -f64::from(frame.height * 0.5),
+        ))
 }
 
 fn transform_bounds(bounds: RenderBounds, transform: Affine) -> RenderBounds {
@@ -1524,11 +1691,11 @@ fn transform_diagnostic(diagnostic: RenderDiagnostic, transform: Affine) -> Rend
     }
 }
 
-fn font_requests(pending: &[(usize, NodeDescriptor)]) -> Vec<FontRequest> {
+fn font_requests(layers: &[LayerDraft]) -> Vec<FontRequest> {
     let mut seen = BTreeSet::new();
     let mut requests = Vec::new();
-    for (_, descriptor) in pending {
-        let NodeDescriptor::Text(text) = descriptor else {
+    for layer in layers {
+        let NodeDescriptor::Text(text) = &layer.descriptor else {
             continue;
         };
         for family in text
@@ -1675,26 +1842,44 @@ fn resolve_alignment(
 
 /// An outline a tenth of the source em wide, about what detection measures on
 /// outlined manga lettering, in white or black opposite the fill.
-fn contrast_outline(fill: [u8; 4], source_font_size: f32) -> StrokeOptions {
-    let [red, green, blue, _] = fill.map(f32::from);
-    let luma = 0.299 * red + 0.587 * green + 0.114 * blue;
-    StrokeOptions {
-        color: if luma < 128.0 {
-            [u8::MAX; 4]
-        } else {
-            [0, 0, 0, u8::MAX]
-        },
-        width_px: source_font_size * 0.1,
-    }
+fn neutral(color: [u8; 4]) -> bool {
+    let [r, g, b, _] = color;
+    r.max(g).max(b) - r.min(g).min(b) < 26
 }
 
-fn resolve_stroke(typography: Option<&Typography>) -> Option<StrokeOptions> {
+fn contrast_color([r, g, b, _]: [u8; 4]) -> [u8; 4] {
+    let linear = |c: u8| {
+        let c = f32::from(c) / 255.0;
+        if c <= 0.04045 {
+            c / 12.92
+        } else {
+            ((c + 0.055) / 1.055).powf(2.4)
+        }
+    };
+    let light = 0.2126 * linear(r) + 0.7152 * linear(g) + 0.0722 * linear(b) > 0.5;
+    let value = if light { 0 } else { 255 };
+    [value, value, value, 255]
+}
+
+fn neutral_fill(color: [u8; 4]) -> [u8; 4] {
+    if !neutral(color) {
+        return color;
+    }
+    let value = 255 - contrast_color(color)[0];
+    [value, value, value, color[3]]
+}
+
+fn resolve_stroke(typography: Option<&Typography>, fill: [u8; 4]) -> Option<StrokeOptions> {
     let typography = typography?;
     let width_px = typography.stroke_width.filter(|width| *width > 0.0)?;
-    Some(StrokeOptions {
-        color: typography.stroke_color.unwrap_or([u8::MAX; 4]),
-        width_px,
-    })
+    let mut color = typography
+        .stroke_color
+        .unwrap_or_else(|| contrast_color(fill));
+    if neutral(color) {
+        let [v, _, _, _] = contrast_color(fill);
+        color = [v, v, v, color[3]];
+    }
+    Some(StrokeOptions { color, width_px })
 }
 
 struct CachedNode {
@@ -1965,7 +2150,7 @@ impl OutlinePen for PreviewOutline<'_> {
 mod tests {
     #[test]
     fn free_columns_widen_inside_their_panel_and_stop_at_neighbours() {
-        use super::{LayoutBox, Obstacle, widen_column};
+        use super::{LayoutBox, Obstacle, grow_horizontal};
         let rect = |x, y, width, height| LayoutBox {
             x,
             y,
@@ -1978,7 +2163,7 @@ mod tests {
         // Unobstructed: centered growth to a square, inside the panel.
         let panel = rect(300.0, 50.0, 500.0, 400.0);
         assert_eq!(
-            widen_column(column, &[panel], page, &[], 4.0),
+            grow_horizontal(column, &[panel], page, &[], 4.0, column.height),
             rect(420.0, 100.0, 200.0, 200.0)
         );
         // A balloon on the right blocks that side; growth spills left.
@@ -1987,20 +2172,20 @@ mod tests {
             shared: false,
         };
         assert_eq!(
-            widen_column(column, &[panel], page, &[balloon], 4.0),
+            grow_horizontal(column, &[panel], page, &[balloon], 4.0, column.height),
             rect(356.0, 100.0, 200.0, 200.0)
         );
         // A tight panel limits both sides, short of its border.
         let narrow = rect(480.0, 50.0, 100.0, 400.0);
         assert_eq!(
-            widen_column(column, &[narrow, panel], page, &[], 4.0),
+            grow_horizontal(column, &[narrow, panel], page, &[], 4.0, column.height),
             rect(484.0, 100.0, 92.0, 200.0)
         );
     }
 
     #[test]
     fn neighbouring_free_columns_split_the_gap_between_them() {
-        use super::{LayoutBox, Obstacle, widen_column};
+        use super::{LayoutBox, Obstacle, grow_horizontal};
         let rect = |x, y, width, height| LayoutBox {
             x,
             y,
@@ -2015,8 +2200,10 @@ mod tests {
             shared: true,
         };
 
-        let widened_first = widen_column(first, &[], page, &[shared(second)], 10.0);
-        let widened_second = widen_column(second, &[], page, &[shared(first)], 10.0);
+        let widened_first =
+            grow_horizontal(first, &[], page, &[shared(second)], 10.0, first.height);
+        let widened_second =
+            grow_horizontal(second, &[], page, &[shared(first)], 10.0, second.height);
 
         assert_eq!(widened_first.x + widened_first.width, 565.0);
         assert_eq!(widened_second.x, 575.0);
@@ -2284,7 +2471,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fit_relation_changes_target_only_the_source_text_layer() {
+    async fn text_layers_share_the_dependencies_of_page_lettering() {
         let mut session = Session::memory().await.unwrap();
         let mut ids = None;
         let create = session
@@ -2376,13 +2563,19 @@ mod tests {
         let fitted = session.commit(add_fit).await.unwrap();
         let affected = AffectedDependencies::new(&fitted.snapshot, &fitted.changes).unwrap();
         assert!(affected.intersects(first_dependencies));
-        assert!(!affected.intersects(second_dependencies));
+        assert!(affected.intersects(second_dependencies));
 
         let fitted_compiled = renderer.compile(&fitted.snapshot, page).unwrap();
         let first_dependencies = &fitted_compiled
             .layers
             .iter()
             .find(|layer| layer.entity == first)
+            .unwrap()
+            .dependencies;
+        let second_dependencies = &fitted_compiled
+            .layers
+            .iter()
+            .find(|layer| layer.entity == second)
             .unwrap()
             .dependencies;
         let relation = fitted
@@ -2398,7 +2591,7 @@ mod tests {
         let removed = session.commit(remove_fit).await.unwrap();
         let affected = AffectedDependencies::new(&removed.snapshot, &removed.changes).unwrap();
         assert!(affected.intersects(first_dependencies));
-        assert!(!affected.intersects(second_dependencies));
+        assert!(affected.intersects(second_dependencies));
     }
 
     #[tokio::test]
@@ -2506,6 +2699,15 @@ mod tests {
         assert!(first_right > 45.0 && first_right < 105.0);
 
         let original = renderer.render(&joined.snapshot, page).await.unwrap();
+        let size = |id| match original.layer(id).unwrap().kind() {
+            LayerKind::Text(t) => t.font_size,
+            _ => unreachable!(),
+        };
+        assert_eq!(size(layers[0]), size(layers[1]));
+        let actual_share = geometry_frame(original.layer(layers[0]).unwrap().geometry(), Some(0.0))
+            .unwrap()
+            .bounds;
+        assert!(actual_share.width > bounds[0].width);
         let mut geometry = original.layer(layers[0]).unwrap().geometry().clone();
         for point in &mut geometry.points {
             point.x += 1.0;
@@ -2582,12 +2784,10 @@ mod tests {
                     continue;
                 }
                 assert!(
-                    (after.frame.bounds.width - before.frame.bounds.width * scale as f32).abs()
-                        < 1e-4
+                    (after.frame.bounds.width - actual_share.width * scale as f32).abs() < 1e-4
                 );
                 assert!(
-                    (after.frame.bounds.height - before.frame.bounds.height * scale as f32).abs()
-                        < 1e-4
+                    (after.frame.bounds.height - actual_share.height * scale as f32).abs() < 1e-4
                 );
                 assert_eq!(after.frame.angle_degrees, angle);
             }

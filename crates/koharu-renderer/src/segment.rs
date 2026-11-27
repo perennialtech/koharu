@@ -189,7 +189,6 @@ impl LineBreaker {
         let Some(config) = self.hyphenation else {
             return vec![segment];
         };
-
         let segment_text = &text[segment.range.clone()];
         let Some((core_start, core_end)) = hyphenatable_word_bounds(segment_text) else {
             return vec![segment];
@@ -198,7 +197,9 @@ impl LineBreaker {
         let core = &segment_text[core_start..core_end];
         let mut points = Vec::new();
         let letters = core.chars().count();
-        if let Some(lang) = config.language
+        if let Some(point) = drawn_out_break(core) {
+            points.push(point);
+        } else if let Some(lang) = config.language
             && letters >= config.minimum_word_length
         {
             let mut offset = 0;
@@ -225,9 +226,6 @@ impl LineBreaker {
                 }
                 points.push(offset);
             }
-        }
-        if points.is_empty() {
-            points.extend(drawn_out_break(core));
         }
 
         let mut result = Vec::with_capacity(points.len() + 1);
@@ -537,6 +535,27 @@ mod tests {
         assert_eq!(pieces, ["tow", "er ", "with", "in"]);
         assert_eq!(segments[0].break_suffix, Some(LineBreakSuffix::Hyphen));
         assert_eq!(segments[2].break_suffix, Some(LineBreakSuffix::Hyphen));
+    }
+
+    #[test]
+    fn a_sound_breaks_in_its_run_only_when_discretionary_breaks_are_enabled() {
+        let text = "«GwAAAAaah!»";
+        let whole = LineBreaker::new().line_segments(text);
+        assert_eq!(whole.len(), 1);
+        assert_eq!(whole[0].range, 0..text.len());
+        assert_eq!(whole[0].break_suffix, None);
+        for breaker in [
+            LineBreaker::new().with_hyphenation(HyphenationOptions::new(None, 5)),
+            LineBreaker::new().with_hyphenation(HyphenationOptions::new(Some(Lang::English), 5)),
+        ] {
+            let cuts = breaker.line_segments(text);
+            let pieces = cuts
+                .iter()
+                .filter(|s| s.break_suffix.is_some())
+                .map(|s| &text[..s.next_offset])
+                .collect::<Vec<_>>();
+            assert_eq!(pieces, ["«GwAAA"]);
+        }
     }
 
     #[test]

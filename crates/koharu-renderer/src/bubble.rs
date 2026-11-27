@@ -16,6 +16,18 @@ pub(crate) struct LayoutBox {
     pub height: f32,
 }
 
+impl LayoutBox {
+    pub(crate) fn corners(self) -> [Point; 4] {
+        let (right, bottom) = (self.x + self.width, self.y + self.height);
+        [
+            (self.x, self.y),
+            (right, self.y),
+            (right, bottom),
+            (self.x, bottom),
+        ]
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct GeometryFrame {
     pub bounds: LayoutBox,
@@ -79,6 +91,67 @@ pub(crate) fn flow_cells(
         .collect::<Vec<_>>();
     topological_flow_cells(contour, &anchors)
         .unwrap_or_else(|| anchor_flow_cells(width, height, contour, &anchors))
+}
+
+/// Move the internal cuts outwards, keeping the physical balloon as the
+/// clipping polygon. A reflex lobe may wrap around a chord's extension; in
+/// that case retaining its original room preserves the lobe.
+pub(crate) fn expanded_cell(outline: &[Point], cell: &[Point], reach: f32) -> Polygon {
+    if outline.len() < 3 || cell.len() < 3 || reach <= 0.0 {
+        return cell.to_vec();
+    }
+    let sign = polygon_area(cell).signum();
+    let mut result = outline.to_vec();
+    for (&a, &b) in cell.iter().zip(cell.iter().cycle().skip(1)) {
+        let middle = ((a.0 + b.0) * 0.5, (a.1 + b.1) * 0.5);
+        if distance_to_polygon_boundary(middle, outline) < 0.001 {
+            continue;
+        }
+        let normal = (sign * (b.1 - a.1), sign * (a.0 - b.0));
+        let offset = a.0 * normal.0 + a.1 * normal.1 + reach * normal.0.hypot(normal.1);
+        if cell
+            .iter()
+            .any(|p| p.0 * normal.0 + p.1 * normal.1 > offset + 0.001)
+        {
+            return cell.to_vec();
+        }
+        result = clip_half_plane(&result, normal, offset);
+    }
+    // Clipping a concave polygon can bridge disconnected pieces. A bridge
+    // outside the outline is never a valid edge of a lettering room.
+    if result.len() < 3
+        || polygon_area(&result).abs() < polygon_area(cell).abs()
+        || result
+            .iter()
+            .zip(result.iter().cycle().skip(1))
+            .any(|(a, b)| !point_in_polygon(outline, ((a.0 + b.0) * 0.5, (a.1 + b.1) * 0.5), 0.01))
+    {
+        return cell.to_vec();
+    }
+    result
+}
+
+pub(crate) fn page_polygon(
+    frame: GeometryFrame,
+    points: &[Point],
+    origin: koharu_scene::Origin,
+) -> Geometry {
+    let (sin, cos) = f64::from(frame.angle_degrees).to_radians().sin_cos();
+    let hw = f64::from(frame.bounds.width) * 0.5;
+    let hh = f64::from(frame.bounds.height) * 0.5;
+    Geometry {
+        origin,
+        points: points
+            .iter()
+            .map(|&(x, y)| {
+                let (x, y) = (f64::from(x) - hw, f64::from(y) - hh);
+                koharu_scene::Point {
+                    x: f64::from(frame.bounds.x) + hw + x * cos - y * sin,
+                    y: f64::from(frame.bounds.y) + hh + x * sin + y * cos,
+                }
+            })
+            .collect(),
+    }
 }
 
 fn topological_flow_cells(
@@ -874,6 +947,10 @@ mod tests {
         assert!(contains_edge(&cells[1], (50.0, 30.0), (50.0, 70.0)));
         assert!(point_in_polygon(&cells[0], (15.0, 50.0), 0.001));
         assert!(point_in_polygon(&cells[1], (65.0, 50.0), 0.001));
+        let share = expanded_cell(&contour, &cells[0], 6.0);
+        assert!(point_in_polygon(&share, (55.0, 50.0), 0.001));
+        assert!(!point_in_polygon(&share, (58.0, 50.0), 0.001));
+        assert!(!point_in_polygon(&share, (50.0, 25.0), 0.001));
         // The anchor bisector is x=40; x=50 proves that the physical neck won.
         assert!(!contains_edge(&cells[0], (40.0, 0.0), (40.0, 100.0)));
     }
