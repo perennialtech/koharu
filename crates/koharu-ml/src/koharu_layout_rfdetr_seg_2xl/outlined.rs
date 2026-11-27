@@ -1,12 +1,9 @@
-//! The glyphs of outlined lettering. Lettering over art is set in an outline,
-//! such as white around black, and the ink split only tells two tones apart:
-//! where the art is nearer the glyphs' tone it takes the outline for the ink,
-//! and elsewhere the art between the lines for glyphs.
+//! Recover glyphs from both sides of the tone split when lettering lies on art.
 
 use image::{GrayImage, Luma, RgbImage};
 use imageproc::{
     distance_transform::{Norm, euclidean_squared_distance_transform},
-    morphology::{dilate, open},
+    morphology::open,
     region_labelling::{Connectivity, connected_components},
 };
 
@@ -15,17 +12,7 @@ use super::{
     measure::{Outline, fill_holes, outline, scaled},
 };
 
-/// The least share of a tone, inside lettering, within an outline's width of
-/// what it encloses for it to be the outline. On 28 pages of four works, the
-/// outlines' was at least 0.65, and the share of plain lettering's ink around
-/// its counters at most 0.48.
-const AROUND: f32 = 0.6;
-/// How far around a glyph's part its outline must be solid, in pixels, and
-/// the least share of it that must: art's specks lie too close together.
-const NEAR: u8 = 3;
-const SOLID: f32 = 0.7;
-const NEAR_THIN: u8 = 1;
-const SOLID_THIN: f32 = 0.70;
+const MIN_GLYPH_AREA: u32 = 16;
 
 /// Outlined lettering, by its glyphs.
 pub(super) struct Outlined {
@@ -34,87 +21,259 @@ pub(super) struct Outlined {
     pub outline: Outline,
 }
 
-/// The lettering in `block` by its glyphs, when its `ink`, both at `corner` on
-/// `page`, is outlined or is its outline; `size` measures a lettering's lines.
+/// Recover the fill and outline of the lettering in `block` from a provisional
+/// `ink` split. Segmented cleanup can recover fills beside a cut outline.
 pub(super) fn outlined(
     page: &RgbImage,
     block: &Mask,
     pre_closed: &Mask,
     ink: &GrayImage,
-    corner: [u32; 2],
+    recover_clipped: bool,
     size: impl Fn(&GrayImage) -> f32,
 ) -> Option<Outlined> {
-    let inside = |x: u32, y: u32| block.pixels[(y * block.width + x) as usize] != 0;
-    // What the ink encloses first: an outline encloses its glyphs, and glyphs
-    // only their counters.
-    [true, false].into_iter().find_map(|enclosed| {
-        let tone = |x: u32, y: u32| (ink.get_pixel(x, y).0[0] == 0) == enclosed;
-        let parts = Parts::within(
-            block,
-            pre_closed,
-            corner,
-            &tone,
-            scaled(3.0, page.width(), page.height()),
-        );
-        let whole = parts.shape(|_| true);
-        let glyphs = parts.banded(block, &tone);
-        if count(&glyphs) < 16 || !enclosed && 2 * count(&glyphs) < count(ink) {
+    let corner = [block.x, block.y];
+    let color_at = |x, y| page[(corner[0] + x, corner[1] + y)].0;
+    let least = scaled(3.0, page.width(), page.height());
+    let ink_area = count(ink) as u32;
+    let pad = scaled(4.0, page.width(), page.height());
+    let [left, top] = corner;
+    let x0 = left.saturating_sub(pad);
+    let y0 = top.saturating_sub(pad);
+    let x1 = (left + block.width + pad).min(page.width());
+    let y1 = (top + block.height + pad).min(page.height());
+    let exterior: Vec<_> = (y0..y1)
+        .flat_map(|y| (x0..x1).map(move |x| (x, y)))
+        .filter(|&(x, y)| !pre_closed.contains(x, y))
+        .map(|(x, y)| page[(x, y)].0)
+        .collect();
+    let exterior_share = |color: [u8; 3], tolerance| {
+        exterior
+            .iter()
+            .filter(|pixel| (0..3).all(|c| pixel[c].abs_diff(color[c]) <= tolerance))
+            .count() as f32
+            / exterior.len().max(1) as f32
+    };
+    let recover = |parts: Parts, band: &GrayImage, enclosed: bool, seeded: bool| {
+        let all: Vec<bool> = parts.parts.iter().map(Option::is_some).collect();
+        let all_area = parts.area(&all);
+        if all_area < MIN_GLYPH_AREA {
             return None;
         }
-        let found = outline(page, &glyphs, corner, size(&glyphs), None);
-        if found.is_none() && !enclosed {
-            return None;
-        }
-        // The other tone, and how far it lies from the parts.
-        let distance = euclidean_squared_distance_transform(&whole);
-        let mut around: Vec<(f64, [u8; 3])> = distance
-            .enumerate_pixels()
-            .filter(|&(x, y, _)| inside(x, y) && !tone(x, y))
-            .map(|(x, y, squared)| {
-                let pixel = page.get_pixel(corner[0] + x, corner[1] + y).0;
-                (squared.0[0].sqrt(), pixel)
-            })
-            .collect();
-        let width = found.map_or(2.0, |found| f64::from(found.width));
-        let total = around.len();
-        around.retain(|(distance, _)| *distance <= width + 1.5);
-        // When `enclosed` is true, `AROUND` separates an outline around glyphs
-        // from plain lettering's ink around its counters. When `enclosed` is
-        // false, `glyphs` is already the ink and `outline()` has verified a
-        // sharp band around it, so textured art inside `block` must not veto it.
-        if around.is_empty()
-            || ((enclosed || found.is_none()) && (around.len() as f32) < AROUND * total as f32)
+        let whole = parts.shape(&all);
+        let opened = open(band, Norm::LInf, 1);
+        let thick = parts.banded(&opened, 0, 3, 0.70);
+        let thick_area = parts.area(&thick);
+        let thin = (2 * thick_area < all_area).then(|| parts.banded(band, 0, 1, 0.70));
+        let mut candidates: Vec<&[bool]> = [&thick[..], &all[..]].into();
+        if let Some(thin) = &thin
+            && thin != &thick
+            && thin != &all
         {
-            return None;
+            candidates.insert(0, thin);
         }
-        let strokes: Vec<[u8; 3]> = glyphs
-            .enumerate_pixels()
-            .filter(|(_, _, pixel)| pixel.0[0] != 0)
-            .map(|(x, y, _)| page.get_pixel(corner[0] + x, corner[1] + y).0)
-            .collect();
-        let outline = found.unwrap_or_else(|| {
-            // Too thin to be told from the art by its rings: the distances
-            // into a band run up to its width.
-            around.sort_unstable_by(|left, right| left.0.total_cmp(&right.0));
-            let width = 2.0 * around[around.len() / 2].0 as f32;
-            let band = around.into_iter().map(|(_, pixel)| pixel).collect();
-            Outline {
-                color: unlike(band, median(&strokes)),
-                width,
+        candidates.dedup();
+        for candidate in candidates {
+            if parts.area(candidate) < MIN_GLYPH_AREA {
+                continue;
             }
-        });
-        let shell_ink = unlike(strokes, outline.color);
-        if enclosed
-            && let Some(peeled) =
-                peel_double_outline(page, &glyphs, corner, shell_ink, outline.color, &size)
-        {
-            return Some(peeled);
+            let glyphs = if candidate == all {
+                &whole
+            } else {
+                &parts.shape(candidate)
+            };
+            let colors = |glyphs: &GrayImage| {
+                glyphs
+                    .enumerate_pixels()
+                    .filter(|(_, _, pixel)| pixel[0] != 0)
+                    .map(|(x, y, _)| color_at(x, y))
+                    .collect::<Vec<_>>()
+            };
+            let strokes = colors(glyphs);
+            let Some(found) = outline(page, glyphs, corner, size(glyphs), Some(median(&strokes)))
+            else {
+                continue;
+            };
+            let band_color = GrayImage::from_fn(block.width, block.height, |x, y| {
+                Luma([
+                    u8::from((0..3).all(|c| color_at(x, y)[c].abs_diff(found.color[c]) <= 48))
+                        * 255,
+                ])
+            });
+            let reach = found.width.round().clamp(1.0, 3.0) as u8;
+            // At least one ring beyond the ink's antialias fringe must
+            // agree with the measured band, at the same Euclidean distance.
+            let supported = parts.banded(&band_color, u8::from(reach > 1), reach, 0.60);
+            let area = parts.area(&supported);
+            if area < MIN_GLYPH_AREA || 12 * area < ink_area || 2 * area < parts.area(candidate) {
+                continue;
+            }
+            let supported_glyphs;
+            let (glyphs, found, strokes) = if supported == candidate {
+                (glyphs, found, strokes)
+            } else {
+                let glyphs = if supported == all {
+                    &whole
+                } else {
+                    supported_glyphs = parts.shape(&supported);
+                    &supported_glyphs
+                };
+                let strokes = colors(glyphs);
+                let Some(verified) =
+                    outline(page, glyphs, corner, size(glyphs), Some(median(&strokes)))
+                else {
+                    continue;
+                };
+                if (0..3).any(|c| found.color[c].abs_diff(verified.color[c]) > 16) {
+                    continue;
+                }
+                (glyphs, verified, strokes)
+            };
+            if !enclosed && exterior.len() >= 16 && exterior_share(found.color, 16) >= 0.97 {
+                continue;
+            }
+            // The strokes and their outline must span the lettering block.
+            let [x0, y0, x1, y1] = parts
+                .parts
+                .iter()
+                .zip(&supported)
+                .filter_map(|(part, &keep)| part.filter(|_| keep).map(|(extent, _)| extent))
+                .fold(
+                    [block.width, block.height, 0, 0],
+                    |[x0, y0, x1, y1], [a, b, c, d]| [x0.min(a), y0.min(b), x1.max(c), y1.max(d)],
+                );
+            let diameter = 2 * found.width.ceil() as u32;
+            if 5 * (x1 - x0 + 1 + diameter) < 3 * block.width
+                || 5 * (y1 - y0 + 1 + diameter) < 3 * block.height
+            {
+                continue;
+            }
+            if seeded && size(glyphs) < 0.10 * block.width.min(block.height) as f32 {
+                continue;
+            }
+            // A candidate cannot explain band-color strokes elsewhere in the
+            // detector support. Account for artists using the same color in
+            // the surrounding page.
+            let band_share = exterior_share(found.color, 4);
+            let distance = euclidean_squared_distance_transform(glyphs);
+            let reach_sq = f64::from(found.width + 2.0).powi(2);
+            let (mut near_band, mut far_band, mut far_area) = (0, 0, 0);
+            for (x, y, pixel) in distance.enumerate_pixels() {
+                if !pre_closed.contains(corner[0] + x, corner[1] + y) {
+                    continue;
+                }
+                let same_color = (0..3).all(|c| color_at(x, y)[c].abs_diff(found.color[c]) <= 4);
+                if pixel[0] <= reach_sq {
+                    near_band += u32::from(same_color);
+                } else {
+                    far_band += u32::from(same_color);
+                    far_area += 1;
+                }
+            }
+            let excess = far_band as f32 - band_share * far_area as f32;
+            if excess * 3.0 > 2.0 * near_band as f32 {
+                continue;
+            }
+            let shell_ink = unlike(strokes, found.color);
+            if 4 * area < ink_area {
+                let source_colors = colors(ink);
+                let source_matches = source_colors
+                    .iter()
+                    .filter(|pixel| (0..3).all(|c| pixel[c].abs_diff(shell_ink[c]) <= 48))
+                    .count();
+                if 2 * source_matches > source_colors.len()
+                    && let Some(all_band) = outline(page, ink, corner, size(ink), Some(shell_ink))
+                    && (0..3).all(|c| all_band.color[c].abs_diff(found.color[c]) <= 16)
+                {
+                    return Some(Outlined {
+                        glyphs: ink.clone(),
+                        ink: shell_ink,
+                        outline: all_band,
+                    });
+                }
+            }
+            if let Some(peeled) = peel_double_outline(
+                page,
+                glyphs,
+                corner,
+                [shell_ink, found.color],
+                &size,
+                &parts,
+                &supported,
+            ) {
+                return Some(peeled);
+            }
+            let mut glyphs = glyphs.clone();
+            if recover_clipped {
+                // A cut through the outline can bring a whole fill against
+                // the edge of the block. Only an already verified pair of
+                // colors can identify that fill and the band around it.
+                let cut = Parts::within(
+                    block,
+                    pre_closed,
+                    &|x, y| (0..3).all(|c| color_at(x, y)[c].abs_diff(shell_ink[c]) <= 16),
+                    least,
+                    Some((page, found.color)),
+                );
+                let selected = cut.banded(&band_color, u8::from(reach > 1), reach, 0.85);
+                for (pixel, label) in glyphs.pixels_mut().zip(cut.labels.pixels()) {
+                    if selected[label[0] as usize] {
+                        pixel[0] = 255;
+                    }
+                }
+            }
+            return Some(Outlined {
+                glyphs,
+                ink: shell_ink,
+                outline: found,
+            });
         }
-        Some(Outlined {
-            glyphs,
-            ink: shell_ink,
-            outline,
-        })
+        None
+    };
+
+    let find = |tone: &dyn Fn(u32, u32) -> bool, enclosed, seeded| {
+        let parts = Parts::within(block, pre_closed, tone, least, None);
+        let band = GrayImage::from_fn(block.width, block.height, |x, y| {
+            let inside = block.pixels[(y * block.width + x) as usize] != 0;
+            Luma([u8::from(inside && !tone(x, y)) * 255])
+        });
+        recover(parts, &band, enclosed, seeded)
+    };
+    if let Some(found) = [true, false]
+        .into_iter()
+        .find_map(|enclosed| find(&|x, y| (ink[(x, y)][0] == 0) == enclosed, enclosed, false))
+    {
+        return Some(found);
+    }
+
+    // When the threshold joins a glyph to similarly light or dark art,
+    // use the colors past the detector's support to seed a new split.
+    if exterior.len() < 16 {
+        return None;
+    }
+    let mut colors = std::collections::HashMap::<[u8; 3], u32>::new();
+    for (i, _) in block
+        .pixels
+        .iter()
+        .enumerate()
+        .filter(|&(_, pixel)| *pixel != 0)
+    {
+        let color = color_at(i as u32 % block.width, i as u32 / block.width);
+        *colors.entry(color).or_default() += 1;
+    }
+    let mut seeds: Vec<_> = colors
+        .into_iter()
+        .filter(|&(_, n)| n >= MIN_GLYPH_AREA)
+        .collect();
+    seeds.sort_unstable_by_key(|&(color, n)| std::cmp::Reverse((n, color)));
+    seeds.into_iter().take(5).find_map(|(seed, _)| {
+        if exterior_share(seed, 4) >= 0.85 {
+            return None;
+        }
+        find(
+            &|x, y| (0..3).all(|c| color_at(x, y)[c].abs_diff(seed[c]) <= 4),
+            false,
+            true,
+        )
     })
 }
 
@@ -127,9 +286,10 @@ fn peel_double_outline(
     page: &RgbImage,
     shell: &GrayImage,
     corner: [u32; 2],
-    shell_color: [u8; 3],
-    outer_color: [u8; 3],
+    [shell_color, outer_color]: [[u8; 3]; 2],
     size: &impl Fn(&GrayImage) -> f32,
+    parts: &Parts,
+    selected: &[bool],
 ) -> Option<Outlined> {
     let mut filled = shell.clone();
     fill_holes(&mut filled);
@@ -143,16 +303,7 @@ fn peel_double_outline(
     if inner_area < 16 || inner_area * 5 < shell_area {
         return None;
     }
-    let shell_parts = connected_components(shell, Connectivity::Eight, Luma([0]));
-    let max_label = shell_parts.pixels().map(|p| p.0[0]).max().unwrap_or(0) as usize;
-    let mut part_area = vec![0usize; max_label + 1];
-    for p in shell_parts.pixels() {
-        let l = p.0[0] as usize;
-        if l != 0 {
-            part_area[l] += 1;
-        }
-    }
-    let mut has_hole = vec![0usize; max_label + 1];
+    let mut has_hole = vec![0usize; selected.len()];
     let (w, h) = (shell.width(), shell.height());
     for (x, y, p) in inner.enumerate_pixels() {
         if p.0[0] == 0 {
@@ -167,16 +318,18 @@ fn peel_double_outline(
         .into_iter()
         .flatten()
         {
-            let l = shell_parts.get_pixel(nx, ny).0[0] as usize;
-            if l != 0 {
+            let l = parts.labels[(nx, ny)][0] as usize;
+            if selected[l] {
                 has_hole[l] += 1;
                 break;
             }
         }
     }
-    let enclosing_area: usize = (1..=max_label)
-        .filter(|&l| has_hole[l] >= 4)
-        .map(|l| part_area[l])
+    let enclosing_area: u32 = parts
+        .parts
+        .iter()
+        .zip(has_hole)
+        .filter_map(|(part, holes)| part.filter(|_| holes >= 4).map(|(_, area)| area))
         .sum();
     if (enclosing_area as f32) < 0.65 * shell_area as f32 {
         return None;
@@ -264,124 +417,100 @@ struct Parts {
 }
 
 impl Parts {
-    /// `tone`'s parts inside `block` that don't reach its edge, at least
-    /// `least` pixels long.
+    /// Detector-supported parts at least `least` pixels long. With a verified
+    /// band, select only parts exposed by a cut through that band.
     fn within(
         block: &Mask,
         pre_closed: &Mask,
-        corner: [u32; 2],
-        tone: &impl Fn(u32, u32) -> bool,
+        tone: &dyn Fn(u32, u32) -> bool,
         least: u32,
+        cut_band: Option<(&RgbImage, [u8; 3])>,
     ) -> Self {
         let (width, height) = (block.width, block.height);
         let inside = |x: u32, y: u32| block.pixels[(y * width + x) as usize] != 0;
-        let in_pre_closed = |x: u32, y: u32| pre_closed.contains(corner[0] + x, corner[1] + y);
+        let in_pre_closed = |x: u32, y: u32| pre_closed.contains(block.x + x, block.y + y);
         let shape = GrayImage::from_fn(width, height, |x, y| {
             Luma([u8::from(inside(x, y) && tone(x, y)) * u8::MAX])
         });
         let labels = connected_components(&shape, Connectivity::Eight, Luma([0]));
         let most = labels.pixels().map(|label| label.0[0]).max().unwrap_or(0) as usize;
-        let mut leaves = vec![false; most + 1];
+        let mut touches = vec![false; most + 1];
+        let mut open = vec![false; most + 1];
+        let mut held = vec![0; most + 1];
         let mut parts: Vec<Option<([u32; 4], u32)>> = vec![None; most + 1];
         for (x, y, label) in labels.enumerate_pixels() {
             let label = label.0[0] as usize;
             if label == 0 {
                 continue;
             }
-            leaves[label] |= x == 0
-                || y == 0
-                || x + 1 == width
-                || y + 1 == height
-                || !in_pre_closed(x, y)
-                || (y - 1..=y + 1).any(|y| (x - 1..=x + 1).any(|x| !inside(x, y)));
+            for (nx, ny) in [
+                (x.wrapping_sub(1), y),
+                (x + 1, y),
+                (x, y.wrapping_sub(1)),
+                (x, y + 1),
+            ] {
+                if nx < width && ny < height && inside(nx, ny) {
+                    continue;
+                }
+                touches[label] = true;
+                open[label] |= cut_band.is_none_or(|(page, band)| {
+                    page.get_pixel_checked(block.x.wrapping_add(nx), block.y.wrapping_add(ny))
+                        .is_none_or(|pixel| (0..3).any(|c| pixel[c].abs_diff(band[c]) > 16))
+                });
+            }
+            held[label] += u32::from(in_pre_closed(x, y));
             let ([x0, y0, x1, y1], area) = parts[label].get_or_insert(([x, y, x, y], 0));
             (*x0, *y0) = ((*x0).min(x), (*y0).min(y));
             (*x1, *y1) = ((*x1).max(x), (*y1).max(y));
             *area += 1;
         }
-        for (part, leaves) in parts.iter_mut().zip(leaves) {
-            *part = part.filter(|(extent, _)| !leaves && length(*extent) >= least);
+        for (label, part) in parts.iter_mut().enumerate() {
+            *part = part.filter(|(extent, area)| {
+                !open[label]
+                    && touches[label] == cut_band.is_some()
+                    && held[label] * 4 >= area * 3
+                    && length(*extent) >= least
+            });
         }
         Self { labels, parts }
     }
 
-    /// The parts `keep` keeps, by label.
-    fn shape(&self, keep: impl Fn(usize) -> bool) -> GrayImage {
-        let kept: Vec<bool> = (0..self.parts.len())
-            .map(|label| self.parts[label].is_some() && keep(label))
-            .collect();
+    fn area(&self, selected: &[bool]) -> u32 {
+        self.parts
+            .iter()
+            .zip(selected)
+            .filter_map(|(part, &keep)| part.filter(|_| keep).map(|(_, area)| area))
+            .sum()
+    }
+
+    fn shape(&self, selected: &[bool]) -> GrayImage {
         GrayImage::from_fn(self.labels.width(), self.labels.height(), |x, y| {
-            let label = self.labels.get_pixel(x, y).0[0] as usize;
-            Luma([u8::from(kept[label]) * u8::MAX])
+            let label = self.labels[(x, y)][0] as usize;
+            Luma([u8::from(selected[label]) * 255])
         })
     }
 
-    /// The parts with a solid band of the other tone around them, but those
-    /// much shorter than the long ones; all of them when none has.
-    fn banded(&self, block: &Mask, tone: &impl Fn(u32, u32) -> bool) -> GrayImage {
-        let band = GrayImage::from_fn(block.width, block.height, |x, y| {
-            let inside = block.pixels[(y * block.width + x) as usize] != 0;
-            Luma([u8::from(inside && !tone(x, y)) * u8::MAX])
-        });
-        // An outline is at least three pixels wide, and the paper between a
-        // screentone's dots narrower.
-        let solid = open(&band, Norm::LInf, 1);
-        let mut kept: Vec<(u32, u32, usize)> = self
-            .parts
+    /// Select whole components so the outline evidence and glyph geometry
+    /// refer to the same strokes.
+    fn banded(&self, band: &GrayImage, fringe: u8, near: u8, solid: f32) -> Vec<bool> {
+        self.parts
             .iter()
             .enumerate()
-            .filter_map(|(label, part)| {
-                let (extent, area) = (*part)?;
-                self.surrounded(label, extent, &solid, Norm::LInf, NEAR, SOLID)
-                    .then_some((length(extent), area, label))
-            })
-            .collect();
-        if kept.iter().map(|(_, area, _)| *area).sum::<u32>() < 16 {
-            // Fall back to a tighter immediate-ring check for 2 px outlines
-            // that `open(..., 1)` erases, ignoring tiny screentone specks.
-            let thin: Vec<(u32, u32, usize)> = self
-                .parts
-                .iter()
-                .enumerate()
-                .filter_map(|(label, part)| {
-                    let (extent, area) = (*part)?;
-                    (length(extent) >= 6
-                        && self.surrounded(label, extent, &band, Norm::LInf, NEAR_THIN, SOLID_THIN))
-                    .then_some((length(extent), area, label))
+            .map(|(label, part)| {
+                part.is_some_and(|(extent, _)| {
+                    self.surrounded(label, extent, band, [fringe, near], solid)
                 })
-                .collect();
-            let all_area: u32 = self.parts.iter().filter_map(|p| p.map(|(_, a)| a)).sum();
-            let thin_area: u32 = thin.iter().map(|(_, a, _)| *a).sum();
-            if thin_area >= 16 && thin_area * 2 >= all_area {
-                kept = thin;
-            }
-        }
-        kept.sort_unstable();
-        let total: u32 = kept.iter().map(|(_, area, _)| area).sum();
-        let mut seen = 0;
-        let long = kept
-            .iter()
-            .find(|(_, area, _)| {
-                seen += area;
-                4 * seen >= 3 * total
             })
-            .map_or(0, |(length, ..)| *length);
-        kept.retain(|(length, ..)| 3 * length >= long);
-        let shape = self.shape(|at| kept.iter().any(|(_, _, label)| *label == at));
-        match count(&shape) < 16 {
-            true => self.shape(|_| true),
-            false => shape,
-        }
+            .collect()
     }
 
-    /// Whether what's within `near` of part `label` is mostly `solid`.
+    /// Whether the rings around part `label` are mostly `solid`.
     fn surrounded(
         &self,
         label: usize,
         [x0, y0, x1, y1]: [u32; 4],
         solid: &GrayImage,
-        norm: Norm,
-        near: u8,
+        [fringe, near]: [u8; 2],
         min_solid: f32,
     ) -> bool {
         let pad = u32::from(near);
@@ -393,8 +522,9 @@ impl Parts {
             Luma([u8::from(at == label) * u8::MAX])
         });
         let (mut around, mut held) = (0u32, 0u32);
-        for (x, y, pixel) in dilate(&part, norm, near).enumerate_pixels() {
-            if pixel.0[0] != 0 && part.get_pixel(x, y).0[0] == 0 {
+        let (inner, outer) = (f64::from(fringe).powi(2), f64::from(near).powi(2));
+        for (x, y, squared) in euclidean_squared_distance_transform(&part).enumerate_pixels() {
+            if squared[0] > inner && squared[0] <= outer {
                 around += 1;
                 held += u32::from(solid.get_pixel(left + x, top + y).0[0] != 0);
             }
@@ -413,7 +543,7 @@ fn count(shape: &GrayImage) -> usize {
 }
 
 /// Each channel's median.
-fn median(pixels: &[[u8; 3]]) -> [u8; 3] {
+pub(super) fn median(pixels: &[[u8; 3]]) -> [u8; 3] {
     std::array::from_fn(|at| {
         let mut channel: Vec<u8> = pixels.iter().map(|pixel| pixel[at]).collect();
         channel.sort_unstable();
@@ -424,6 +554,7 @@ fn median(pixels: &[[u8; 3]]) -> [u8; 3] {
 #[cfg(test)]
 mod tests {
     use image::Rgb;
+    use imageproc::morphology::dilate;
 
     use super::super::Typography;
     use super::*;
@@ -477,6 +608,47 @@ mod tests {
     }
 
     #[test]
+    fn an_outline_band_recovers_blue_glyphs_inside_a_dark_checker() {
+        let ink_color = [24, 82, 215];
+        let page = RgbImage::from_fn(144, 104, |x, y| {
+            let dx = (x + 8) % 32;
+            let inner_y = (40..66).contains(&y);
+            let glyph = (30..115).contains(&x) && (9..15).contains(&dx);
+            let band = (27..118).contains(&x) && (6..18).contains(&dx);
+            Rgb(if glyph && inner_y {
+                ink_color
+            } else if band && (37..69).contains(&y) {
+                WHITE
+            } else if (x / 9 + y / 11).is_multiple_of(2) {
+                [14, 18, 20]
+            } else {
+                [46, 50, 55]
+            })
+        });
+        let block = Mask {
+            x: 25,
+            y: 34,
+            width: 90,
+            height: 39,
+            pixels: vec![255; 90 * 39],
+        };
+        let ink = GrayImage::from_fn(block.width, block.height, |x, y| {
+            Luma([u8::from(page[(x + block.x, y + block.y)].0 != WHITE) * 255])
+        });
+        let found = outlined(&page, &block, &block, &ink, false, |_| 26.0)
+            .expect("white band around the blue glyphs");
+        assert_eq!(found.ink, ink_color);
+        assert_eq!(found.outline.color, WHITE);
+        assert!(
+            found
+                .glyphs
+                .enumerate_pixels()
+                .all(|(x, y, p)| { p[0] == 0 || page[(x + block.x, y + block.y)].0 == ink_color })
+        );
+        assert!(count(&found.glyphs) >= 3 * 25 * 5);
+    }
+
+    #[test]
     fn an_outline_isn_t_taken_for_the_ink_it_encloses() {
         // On black, on black and white art, and on a screentone.
         let grid = |x: u32, y: u32| {
@@ -514,6 +686,32 @@ mod tests {
         assert_eq!(band.color, WHITE);
         assert!((3.0..=5.0).contains(&band.width), "{band:?}");
         assert!((18.0..=22.0).contains(&found.size));
+    }
+
+    #[test]
+    fn three_small_outlined_ellipsis_dots_keep_their_fill() {
+        let dots = GrayImage::from_fn(30, 9, |x, y| {
+            Luma([u8::from(
+                (3..6).contains(&y) && [3, 14, 25].iter().any(|&dot| (dot..dot + 2).contains(&x)),
+            ) * 255])
+        });
+        let shell = dilate(&dots, Norm::LInf, 3);
+        let mut page = RgbImage::from_pixel(80, 64, Rgb([13, 25, 62]));
+        for (x, y, _) in shell.enumerate_pixels().filter(|(_, _, p)| p[0] != 0) {
+            page[(20 + x, 20 + y)] = Rgb(if dots[(x, y)][0] != 0 { BLACK } else { WHITE });
+        }
+        let mask = Mask {
+            x: 20,
+            y: 20,
+            width: shell.width(),
+            height: shell.height(),
+            pixels: shell.into_raw(),
+        };
+
+        let found = mask.typography(&page).expect("outlined ellipsis");
+        assert_eq!(found.ink, Some(BLACK), "{found:?}");
+        assert_eq!(found.outline.expect("white outline").color, WHITE);
+        assert_eq!(found.size, 3.0);
     }
 
     #[test]
