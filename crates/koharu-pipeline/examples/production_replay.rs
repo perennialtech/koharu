@@ -264,7 +264,11 @@ async fn run(args: Args) -> Result<()> {
     let mut batch = Vec::new();
     let (mut seen, mut written, mut missing) = (0, 0, 0);
     let limit = args.max_pages.unwrap_or(usize::MAX);
-    let batch_size = args.batch_size as usize;
+    let batch_size = if auditor.is_some() {
+        (args.batch_size as usize).min(8)
+    } else {
+        args.batch_size as usize
+    };
     for dump in dumps {
         let mut lines = dump_reader(&dump)?.lines().enumerate();
         while seen < limit {
