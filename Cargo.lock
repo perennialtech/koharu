@@ -2625,6 +2625,7 @@ dependencies = [
  "anyhow",
  "arc-swap",
  "async-trait",
+ "clap",
  "flate2",
  "futures",
  "image",
@@ -2639,14 +2640,17 @@ dependencies = [
  "rayon",
  "serde",
  "serde_json",
+ "sha2",
  "specta",
  "strum",
  "sysinfo 0.40.1",
+ "tempfile",
  "tokio",
  "tokio-rayon",
  "toml",
  "tracing",
  "tracing-subscriber",
+ "webp",
 ]
 
 [[package]]

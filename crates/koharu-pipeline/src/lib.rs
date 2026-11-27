@@ -29,8 +29,9 @@ pub use resources::{DeviceResources, ResourceSnapshot};
 pub use scope::{Bounds, Scope};
 pub use stage::Stage;
 pub use stages::{
-    DetectionFusionConfig, FusedDetectionLayout, KoharuLayoutRFDetrSeg2XLConfig, LayoutItem,
-    fuse_detections,
+    DetectionFusionConfig, FusedDetectionLayout, GlyphClaimCounts, InferredTypography,
+    KoharuLayoutRFDetrSeg2XLConfig, LayoutItem, ReplayedDetectionPage, fuse_detections,
+    replay_detection_page,
 };
 
 use images::ImageCache;

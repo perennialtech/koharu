@@ -22,7 +22,7 @@ use koharu_ml::{
         ComicTextBubbleDetection, ComicTextBubbleDetector, ComicTextBubbleLabel,
     },
     koharu_layout_rfdetr_seg_2xl::{
-        GlyphProposal, KoharuLayoutDetection, KoharuLayoutDetections, KoharuLayoutMask,
+        GlyphClaim, GlyphProposal, KoharuLayoutDetection, KoharuLayoutDetections, KoharuLayoutMask,
         KoharuLayoutRFDetrSeg2XL, KoharuLayoutThresholds, Typography as GlyphTypography,
         fit_glyph_masks,
     },
@@ -176,10 +176,79 @@ pub fn fuse_detections(
     let mut candidates = with_comic_detections(layout, comic, bubble_threshold, config);
     non_maximum_suppression(&mut candidates, config.duplicate_iou);
     let mut detections: Vec<_> = candidates.into_iter().map(|c| c.detection).collect();
-    merge_text_blocks(&mut detections, config);
-    join_split_bubbles(&mut detections, config);
+    merge_text_blocks(&mut detections, config, None);
+    join_split_bubbles(&mut detections, config, None);
     let order = layout_order(&detections, config);
     FusedDetectionLayout { detections, order }
+}
+
+/// A fully processed detection page in production scene order. Layout items
+/// index `detections`, and `inferred` is parallel to `layout`.
+pub struct ReplayedDetectionPage {
+    pub detections: Vec<KoharuLayoutDetection>,
+    pub layout: Vec<LayoutItem>,
+    pub inferred: Vec<Option<InferredTypography>>,
+    pub page_text_mask: GrayImage,
+    /// Indexed by detection, with zero counts for non-lettering regions.
+    pub glyph_claims: Vec<GlyphClaimCounts>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct GlyphClaimCounts {
+    /// Pixels in the region's box claimed by one of its proposals and another proposal.
+    pub competing_claim_px: u32,
+    /// Owned cleanup pixels in another region's ink or outside the owning
+    /// balloon and inside another balloon.
+    pub cross_owner_cleanup_px: u32,
+}
+
+impl ReplayedDetectionPage {
+    /// Materialize the replay's regions and lettering layers using the stage's
+    /// scene writer. The caller provides the page and commits the returned patch.
+    pub fn region_patch(
+        &self,
+        scene: koharu_scene::Snapshot,
+        page: EntityId,
+    ) -> Result<koharu_scene::Patch> {
+        let input = StageInput::new(scene, page, None, None, Default::default(), None);
+        let generation = generation(PRODUCER, MODEL_ID)?;
+        let mut edit = input.scene.edit_as(generation.clone());
+        edit.observe_subtree(page)?;
+        write_regions(&input, &mut edit, self, &generation)?;
+        finish(edit)
+    }
+}
+
+/// Replay the production detection stage from detector outputs for this RGB page.
+/// The layout predictions should already have the detector's class thresholds applied.
+pub fn replay_detection_page(
+    image: &RgbImage,
+    layout: KoharuLayoutDetections,
+    comic: &[ComicTextBubbleDetection],
+    bubble_threshold: f32,
+    config: &DetectionFusionConfig,
+) -> ReplayedDetectionPage {
+    let candidates = with_comic_detections(layout, comic, bubble_threshold, config);
+    let mut replay = postprocess_page(image, candidates, None, config, true);
+    let mut indices = vec![0; replay.layout.len()];
+    for (position, item) in replay.layout.iter().enumerate() {
+        indices[item.index] = position;
+    }
+    replay.detections = replay
+        .layout
+        .iter()
+        .map(|item| replay.detections[item.index].clone())
+        .collect();
+    replay.glyph_claims = replay
+        .layout
+        .iter()
+        .map(|item| replay.glyph_claims[item.index])
+        .collect();
+    for item in &mut replay.layout {
+        item.index = indices[item.index];
+        item.bubble = item.bubble.map(|index| indices[index]);
+    }
+    replay
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, Type)]
@@ -833,12 +902,6 @@ async fn write_page(
     generation: &Generation,
     config: &DetectionFusionConfig,
 ) -> Result<()> {
-    let size = ImageSize {
-        width: image.width(),
-        height: image.height(),
-    };
-    let mut candidates = output;
-    non_maximum_suppression(&mut candidates, config.duplicate_iou);
     let converted;
     let image = match image {
         DynamicImage::ImageRgb8(image) => image,
@@ -847,40 +910,47 @@ async fn write_page(
             &converted
         }
     };
+    let mut replay = postprocess_page(image, output, input.region, config, false);
+    write_regions(input, edit, &replay, generation).context("failed to write detected regions")?;
+    let mask = &mut replay.page_text_mask;
+    if let Some(bounds) = input.region {
+        preserve_mask_outside_region(input, page, "text-mask", bounds, mask).await?;
+    }
+    edit.set_asset(
+        page,
+        &AssetRole::new("text-mask")?,
+        mask_asset(mask.as_raw(), mask.width(), mask.height(), None)?,
+    )?;
+    edit.remove_asset(page, &AssetRole::new("bubble-mask")?)?;
+    Ok(())
+}
+
+fn postprocess_page(
+    image: &RgbImage,
+    mut candidates: Vec<Candidate>,
+    selection: Option<crate::Bounds>,
+    config: &DetectionFusionConfig,
+    audit_claims: bool,
+) -> ReplayedDetectionPage {
+    non_maximum_suppression(&mut candidates, config.duplicate_iou);
+    let mut claims = audit_claims.then(Vec::new);
     fit_glyph_masks(
         candidates
             .iter_mut()
             .map(|c| (c.proposal, &mut c.detection)),
         image,
+        claims.as_mut(),
     );
     let mut detections: Vec<_> = candidates.into_iter().map(|c| c.detection).collect();
+    let mut sources = audit_claims.then(|| (0..detections.len()).map(|i| vec![i]).collect());
     // A text block can join two balloon lobes even when only one lobe is in scope.
-    merge_text_blocks(&mut detections, config);
-    join_split_bubbles(&mut detections, config);
-    if let Some(region) = input.region {
+    merge_text_blocks(&mut detections, config, sources.as_mut());
+    join_split_bubbles(&mut detections, config, sources.as_mut());
+    if let Some(region) = selection {
         detections.retain(|detection| intersects(detection.bbox, region));
     }
-    write_regions(input, edit, image, &detections, generation, config)
-        .context("failed to write detected regions")?;
-    write_masks(input, edit, page, &detections, size)
-        .await
-        .context("failed to write detection masks")
-}
-
-fn write_regions(
-    input: &StageInput,
-    edit: &mut koharu_scene::Edit,
-    image: &RgbImage,
-    detections: &[KoharuLayoutDetection],
-    generation: &Generation,
-    config: &DetectionFusionConfig,
-) -> Result<()> {
-    let mut preserved_balloons = remove_previous_regions(input, edit, generation)
-        .context("failed to replace the previous detection regions")?;
-    let snapshot = &input.scene;
-    let page = input.page;
-    let order = layout_order(detections, config);
-    let inferred = order
+    let layout = layout_order(&detections, config);
+    let inferred = layout
         .par_iter()
         .map(|item| {
             let detection = &detections[item.index];
@@ -888,7 +958,146 @@ fn write_regions(
                 .then(|| infer_typography(image, detection))
                 .flatten()
         })
-        .collect::<Vec<_>>();
+        .collect();
+    let size = ImageSize {
+        width: image.width(),
+        height: image.height(),
+    };
+    let page_text_mask = mask_for(&detections, "text", size);
+    let glyph_claims = match (claims, sources) {
+        (Some(claims), Some(sources)) => {
+            measure_glyph_claims(&detections, &layout, claims, sources, size)
+        }
+        _ => Vec::new(),
+    };
+    ReplayedDetectionPage {
+        detections,
+        layout,
+        inferred,
+        page_text_mask,
+        glyph_claims,
+    }
+}
+
+fn measure_glyph_claims(
+    detections: &[KoharuLayoutDetection],
+    layout: &[LayoutItem],
+    claims: Vec<GlyphClaim>,
+    sources: Vec<Vec<usize>>,
+    size: ImageSize,
+) -> Vec<GlyphClaimCounts> {
+    let mut result = vec![GlyphClaimCounts::default(); detections.len()];
+    if claims.is_empty() {
+        return result;
+    }
+    let mut owners = vec![0; sources.iter().map(Vec::len).sum()];
+    for (index, sources) in sources.iter().enumerate() {
+        for &source in sources {
+            owners[source] = index;
+        }
+    }
+    let mut coverage = GrayImage::new(size.width, size.height);
+    for claim in &claims {
+        for (offset, _) in claim
+            .mask
+            .pixels
+            .iter()
+            .enumerate()
+            .filter(|&(_, &p)| p != 0)
+        {
+            let (x, y) = (
+                claim.mask.x + offset as u32 % claim.mask.width,
+                claim.mask.y + offset as u32 / claim.mask.width,
+            );
+            if let Some(pixel) = coverage.get_pixel_mut_checked(x, y) {
+                pixel[0] = pixel[0].saturating_add(1);
+            }
+        }
+    }
+    let overlaps = |a: &KoharuLayoutMask, b: &KoharuLayoutMask| {
+        a.x < b.x + b.width && b.x < a.x + a.width && a.y < b.y + b.height && b.y < a.y + a.height
+    };
+    for item in layout {
+        let detection = &detections[item.index];
+        if !matches!(detection.label.as_str(), "text" | "onomatopoeia") {
+            continue;
+        }
+        let mut counts = GlyphClaimCounts::default();
+        let mut own_claims = Vec::new();
+        let mut other_cores = Vec::new();
+        for claim in &claims {
+            if owners[claim.index] == item.index {
+                own_claims.push(claim.mask.as_ref());
+            } else if overlaps(&detection.mask, &claim.core) {
+                other_cores.push(&claim.core);
+            }
+        }
+        if let Some([left, top, right, bottom]) =
+            mask_window(detection.bbox, size.width, size.height)
+        {
+            for y in top..bottom {
+                for x in left..right {
+                    if coverage[(x, y)][0] > 1 && own_claims.iter().any(|mask| mask.contains(x, y))
+                    {
+                        counts.competing_claim_px += 1;
+                    }
+                }
+            }
+        }
+        let mask = &detection.mask;
+        let neighbours: Vec<_> = detections
+            .iter()
+            .enumerate()
+            .filter(|&(index, other)| {
+                index != item.index
+                    && overlaps(mask, &other.mask)
+                    && matches!(other.label.as_str(), "text" | "onomatopoeia")
+            })
+            .map(|(_, other)| &other.mask)
+            .collect();
+        let other_bubbles: Vec<_> = item
+            .bubble
+            .into_iter()
+            .flat_map(|own| {
+                detections
+                    .iter()
+                    .enumerate()
+                    .filter(move |&(index, other)| {
+                        index != own && other.label == "bubble" && overlaps(mask, &other.mask)
+                    })
+                    .map(|(_, other)| &other.mask)
+            })
+            .collect();
+        let own_bubble = item.bubble.map(|index| &detections[index].mask);
+        for (offset, _) in mask.pixels.iter().enumerate().filter(|&(_, &p)| p != 0) {
+            let (x, y) = (
+                mask.x + offset as u32 % mask.width,
+                mask.y + offset as u32 / mask.width,
+            );
+            if other_cores.iter().any(|other| other.contains(x, y))
+                || neighbours.iter().any(|other| other.contains(x, y))
+                || (own_bubble.is_some_and(|own| !own.contains(x, y))
+                    && other_bubbles.iter().any(|other| other.contains(x, y)))
+            {
+                counts.cross_owner_cleanup_px += 1;
+            }
+        }
+        result[item.index] = counts;
+    }
+    result
+}
+
+fn write_regions(
+    input: &StageInput,
+    edit: &mut koharu_scene::Edit,
+    replay: &ReplayedDetectionPage,
+    generation: &Generation,
+) -> Result<()> {
+    let mut preserved_balloons = remove_previous_regions(input, edit, generation)
+        .context("failed to replace the previous detection regions")?;
+    let snapshot = &input.scene;
+    let page = input.page;
+    let detections = &replay.detections;
     let text_group = snapshot.page(page)?.text_group()?;
     let managed_text_group = if let Some(group) = text_group {
         snapshot
@@ -899,7 +1108,7 @@ fn write_regions(
         None
     };
     let mut bubble_entities = vec![None; detections.len()];
-    for (item, inferred) in order.into_iter().zip(inferred) {
+    for (item, &inferred) in replay.layout.iter().zip(&replay.inferred) {
         let detection = &detections[item.index];
         let bubble = item
             .bubble
@@ -1092,13 +1301,14 @@ fn write_region(
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
-struct InferredTypography {
-    size: f32,
-    color: [u8; 3],
-    stroke_color: Option<[u8; 3]>,
-    stroke_width: Option<f32>,
-    angle_degrees: f32,
-    writing_mode: WritingMode,
+pub struct InferredTypography {
+    pub size: f32,
+    pub color: [u8; 3],
+    pub paper_color: [u8; 3],
+    pub stroke_color: Option<[u8; 3]>,
+    pub stroke_width: Option<f32>,
+    pub angle_degrees: f32,
+    pub writing_mode: WritingMode,
 }
 
 #[derive(Clone, Copy)]
@@ -1179,6 +1389,7 @@ fn infer_typography(
     Some(InferredTypography {
         size: measured.size,
         color,
+        paper_color: background,
         stroke_color,
         stroke_width,
         angle_degrees: measured.tilt,
@@ -2079,37 +2290,6 @@ fn mask_geometry(mask: &KoharuLayoutMask) -> Option<Geometry> {
     })
 }
 
-async fn write_masks(
-    input: &StageInput,
-    edit: &mut koharu_scene::Edit,
-    page: EntityId,
-    detections: &[KoharuLayoutDetection],
-    size: ImageSize,
-) -> Result<()> {
-    write_mask(input, edit, page, detections, size).await?;
-    edit.remove_asset(page, &AssetRole::new("bubble-mask")?)?;
-    Ok(())
-}
-
-async fn write_mask(
-    input: &StageInput,
-    edit: &mut koharu_scene::Edit,
-    page: EntityId,
-    detections: &[KoharuLayoutDetection],
-    size: ImageSize,
-) -> Result<()> {
-    let mut mask = mask_for(detections, "text", size);
-    if let Some(bounds) = input.region {
-        preserve_mask_outside_region(input, page, "text-mask", bounds, &mut mask).await?;
-    }
-    edit.set_asset(
-        page,
-        &AssetRole::new("text-mask")?,
-        mask_asset(mask.as_raw(), size.width, size.height, None)?,
-    )?;
-    Ok(())
-}
-
 fn mask_asset(
     pixels: &[u8],
     width: u32,
@@ -2275,7 +2455,11 @@ fn non_maximum_suppression(detections: &mut Vec<Candidate>, threshold: f32) {
 /// that mostly overlap, and neighbouring lines of one paragraph (separated by
 /// less than a line's thickness and running mostly side by side), become one
 /// block. Neighbouring lines in different bubbles stay apart.
-fn merge_text_blocks(detections: &mut Vec<KoharuLayoutDetection>, config: &DetectionFusionConfig) {
+fn merge_text_blocks(
+    detections: &mut Vec<KoharuLayoutDetection>,
+    config: &DetectionFusionConfig,
+    sources: Option<&mut Vec<Vec<usize>>>,
+) {
     let texts = indices_with_label(detections, "text");
     let bubbles = indices_with_label(detections, "bubble");
     let container = if config.use_mask_containment_for_merge {
@@ -2370,14 +2554,18 @@ fn merge_text_blocks(detections: &mut Vec<KoharuLayoutDetection>, config: &Detec
         .into_values()
         .filter(|group| group.len() > 1)
         .collect::<Vec<_>>();
-    replace_with_unions(detections, &groups);
+    replace_with_unions(detections, &groups, sources);
 }
 
 /// The bubble detector splits some balloons in two, and `same_text` then
 /// joins their text into one block that neither half contains, so the block
 /// would be set as free text over the balloon's edge. Bubbles that each hold
 /// part of such a block, and together hold all of it, become one bubble.
-fn join_split_bubbles(detections: &mut Vec<KoharuLayoutDetection>, config: &DetectionFusionConfig) {
+fn join_split_bubbles(
+    detections: &mut Vec<KoharuLayoutDetection>,
+    config: &DetectionFusionConfig,
+    sources: Option<&mut Vec<Vec<usize>>>,
+) {
     let bubbles = indices_with_label(detections, "bubble");
     let bubble_masks = bubbles
         .iter()
@@ -2417,19 +2605,37 @@ fn join_split_bubbles(detections: &mut Vec<KoharuLayoutDetection>, config: &Dete
         }
         groups.push(parts);
     }
-    replace_with_unions(detections, &groups);
+    replace_with_unions(detections, &groups, sources);
 }
 
 /// Replaces each group of same-label detections with one detection covering
 /// their union.
-fn replace_with_unions(detections: &mut Vec<KoharuLayoutDetection>, groups: &[Vec<usize>]) {
+fn replace_with_unions(
+    detections: &mut Vec<KoharuLayoutDetection>,
+    groups: &[Vec<usize>],
+    mut sources: Option<&mut Vec<Vec<usize>>>,
+) {
     let mut absorbed = vec![false; detections.len()];
     let mut merged = Vec::new();
+    let mut merged_sources = Vec::new();
     for group in groups {
         merged.push(union_detection(detections, group));
         for &index in group {
             absorbed[index] = true;
         }
+        if let Some(sources) = sources.as_mut() {
+            merged_sources.push(
+                group
+                    .iter()
+                    .flat_map(|&index| std::mem::take(&mut sources[index]))
+                    .collect(),
+            );
+        }
+    }
+    if let Some(sources) = sources {
+        let mut keep = absorbed.iter().map(|&value| !value);
+        sources.retain(|_| keep.next().expect("each detection has sources"));
+        sources.extend(merged_sources);
     }
     let mut index = 0;
     detections.retain(|_| {
@@ -3066,6 +3272,124 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn production_replay_matches_written_scene_and_page_mask() -> anyhow::Result<()> {
+        let (image, text) = outlined_text(3, [0, 0, 0], [255, 255, 255]);
+        let mut duplicate = text.clone();
+        duplicate.score = 0.8;
+        let panel = boxed_detection("panel", 0.9, [1., 1., 95., 95.]);
+        let raw = KoharuLayoutDetections {
+            image_width: image.width(),
+            image_height: image.height(),
+            detections: vec![text, duplicate, panel],
+        };
+        let comic = [comic(ComicTextBubbleLabel::Bubble, [5., 8., 91., 88.])];
+        let config = DetectionFusionConfig::default();
+        let replay = super::replay_detection_page(&image, raw.clone(), &comic, 0.4, &config);
+        assert_eq!(replay.layout.len(), 3);
+        let dialogue = replay
+            .layout
+            .iter()
+            .find(|item| item.bubble.is_some())
+            .unwrap();
+        assert!(replay.glyph_claims[dialogue.index].competing_claim_px > 0);
+        assert_eq!(
+            replay.glyph_claims[dialogue.index].cross_owner_cleanup_px,
+            0
+        );
+
+        let mut session = Session::memory().await?;
+        let mut edit = session.snapshot().edit();
+        let page = edit.add_page(PageDraft::new("page", 96., 96.), At::End)?;
+        let snapshot = session.commit(edit.finish()?).await?.snapshot;
+        let input = StageInput::new(snapshot, page, None, None, Default::default(), None);
+        let patch = super::build_patch(
+            &input,
+            &image::DynamicImage::from(image),
+            super::with_comic_detections(raw, &comic, 0.4, &config),
+            &generation(super::PRODUCER, super::MODEL_ID)?,
+            &config,
+        )
+        .await?;
+        let scene = session.commit(patch).await?.snapshot;
+        let regions: Vec<_> = scene
+            .children(page)?
+            .filter_map(|id| scene.analysis_region(id).ok())
+            .collect();
+        assert_eq!(regions.len(), replay.layout.len());
+        let mut ids = vec![None; regions.len()];
+        for (region, (item, inferred)) in regions
+            .iter()
+            .zip(replay.layout.iter().zip(&replay.inferred))
+        {
+            let detected = &replay.detections[item.index];
+            ids[item.index] = Some(region.id());
+            assert_eq!(
+                region.region()?.label.as_deref(),
+                Some(detected.label.as_str())
+            );
+            assert_eq!(
+                region.detection()?.unwrap().labels[0].confidence,
+                detected.score
+            );
+            let geometry = match detected.label.as_str() {
+                "bubble" => mask_geometry(&detected.mask).unwrap(),
+                "text" => {
+                    super::text_geometry(detected, inferred.map(|typo| typo.angle_degrees), None)
+                        .unwrap()
+                }
+                _ => super::rectangle_geometry(detected.bbox),
+            };
+            assert_eq!(region.geometry()?.points, geometry.points);
+            if detected.label != "text" {
+                continue;
+            }
+            let layer = scene
+                .page(page)?
+                .text_group()?
+                .unwrap()
+                .text_layers()?
+                .next()
+                .unwrap();
+            assert_eq!(layer.content()?.source_region()?.unwrap().id(), region.id());
+            assert_eq!(
+                layer.balloon_target()?.map(|target| target.id()),
+                item.bubble.and_then(|id| ids[id])
+            );
+            let style = layer.typography()?.unwrap();
+            let inferred = inferred.expect("source paint");
+            assert_eq!(style.size, Some(inferred.size));
+            let [r, g, b] = inferred.color;
+            assert_eq!(style.color, Some([r, g, b, 255]));
+            assert_eq!(style.writing_mode, Some(inferred.writing_mode));
+            assert_eq!(
+                style.stroke_color,
+                inferred.stroke_color.map(|[r, g, b]| [r, g, b, 255])
+            );
+            assert_eq!(style.stroke_width, inferred.stroke_width);
+
+            let asset = scene
+                .asset(
+                    region.id(),
+                    &koharu_scene::AssetRole::new(super::GLYPH_MASK)?,
+                )?
+                .unwrap();
+            let written =
+                image::load_from_memory(&scene.read_blob(asset.blob).await?)?.into_luma8();
+            assert_eq!(
+                written.dimensions(),
+                (detected.mask.width, detected.mask.height)
+            );
+            assert_eq!(written.as_raw(), &detected.mask.pixels);
+            assert_eq!(asset.metadata.attributes["x"], detected.mask.x.to_string());
+            assert_eq!(asset.metadata.attributes["y"], detected.mask.y.to_string());
+        }
+        let written = input.images.get(&scene, page, "text-mask").await?.unwrap();
+        assert_eq!(written.to_luma8(), replay.page_text_mask);
+        assert!(replay.page_text_mask.pixels().any(|pixel| pixel[0] != 0));
+        Ok(())
+    }
+
     fn detection(label: &str, score: f32, bbox: [f32; 4]) -> KoharuLayoutDetection {
         KoharuLayoutDetection {
             label_id: 0,
@@ -3306,11 +3630,12 @@ mod tests {
             0.5,
             &DetectionFusionConfig::default(),
         );
-        super::fit_glyph_masks(
+        koharu_ml::koharu_layout_rfdetr_seg_2xl::fit_glyph_masks(
             candidates
                 .iter_mut()
                 .map(|c| (c.proposal, &mut c.detection)),
             &page,
+            None,
         );
         let [segmented, comic] = candidates.as_slice() else {
             panic!("expected both text regions")
@@ -4079,7 +4404,7 @@ mod tests {
             detection("bubble", 0.9, [860.0, 3281.0, 1289.0, 4894.0]),
         ];
 
-        super::merge_text_blocks(&mut detections, &DetectionFusionConfig::default());
+        super::merge_text_blocks(&mut detections, &DetectionFusionConfig::default(), None);
 
         let mut texts = detections
             .iter()
@@ -4125,7 +4450,7 @@ mod tests {
             masked("text", [100.0, 100.0, 300.0, 300.0]),
         ];
 
-        super::join_split_bubbles(&mut detections, &DetectionFusionConfig::default());
+        super::join_split_bubbles(&mut detections, &DetectionFusionConfig::default(), None);
 
         let mut bubbles = detections
             .iter()
@@ -4168,7 +4493,7 @@ mod tests {
             .collect();
         non_maximum_suppression(&mut candidates, 0.5);
         let mut detections = candidates.into_iter().map(|c| c.detection).collect();
-        super::merge_text_blocks(&mut detections, &DetectionFusionConfig::default());
+        super::merge_text_blocks(&mut detections, &DetectionFusionConfig::default(), None);
 
         let text = detections
             .iter()
@@ -4198,13 +4523,13 @@ mod tests {
         ];
         let config = DetectionFusionConfig::default();
         let mut detections = lines.clone();
-        super::merge_text_blocks(&mut detections, &config);
+        super::merge_text_blocks(&mut detections, &config, None);
         assert_eq!(detections.len(), 1);
         assert_eq!(detections[0].bbox, [20.0, 20.0, 60.0, 42.0]);
 
         detections = lines;
         detections.push(boxed_detection("bubble", 0.9, [10.0, 10.0, 70.0, 52.0]));
-        super::merge_text_blocks(&mut detections, &config);
+        super::merge_text_blocks(&mut detections, &config, None);
         assert_eq!(detections.len(), 2);
         let paragraph = detections.iter().find(|d| d.label == "text").unwrap();
         assert_eq!(paragraph.bbox, [20.0, 20.0, 60.0, 42.0]);
@@ -4223,7 +4548,7 @@ mod tests {
             },
         ];
 
-        super::merge_text_blocks(&mut detections, &DetectionFusionConfig::default());
+        super::merge_text_blocks(&mut detections, &DetectionFusionConfig::default(), None);
 
         let [paragraph] = detections.as_slice() else {
             panic!("expected one paragraph");
@@ -4837,9 +5162,10 @@ mod tests {
             pixels: mask.into_raw(),
         }
         .into();
-        super::fit_glyph_masks(
+        koharu_ml::koharu_layout_rfdetr_seg_2xl::fit_glyph_masks(
             [(super::GlyphProposal::Segmented(text.bbox), &mut text)],
             &source,
+            None,
         );
         let found = infer_typography(&source, &text).unwrap();
         assert_eq!(found.color, [0; 3]);
@@ -4965,7 +5291,7 @@ mod tests {
             ..detection("bubble", 0.9, b2_box)
         };
         let mut detections = vec![b1, b2, t1, t2];
-        super::merge_text_blocks(&mut detections, &DetectionFusionConfig::default());
+        super::merge_text_blocks(&mut detections, &DetectionFusionConfig::default(), None);
         let texts: Vec<_> = detections.iter().filter(|d| d.label == "text").collect();
         assert_eq!(
             texts.len(),
@@ -4995,7 +5321,7 @@ mod tests {
             ..detection("text", 0.9, [156.0, 80.0, 180.0, 140.0])
         };
         let mut detections = vec![b1, b2, t1, t2];
-        super::merge_text_blocks(&mut detections, &DetectionFusionConfig::default());
+        super::merge_text_blocks(&mut detections, &DetectionFusionConfig::default(), None);
         let texts: Vec<_> = detections.iter().filter(|d| d.label == "text").collect();
         assert_eq!(
             texts.len(),
