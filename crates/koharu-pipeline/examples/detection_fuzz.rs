@@ -2,13 +2,14 @@ use std::{
     collections::{HashMap, HashSet},
     env,
     fs::File,
-    io::BufReader,
+    io::{BufRead, BufReader},
     path::{Path, PathBuf},
     sync::Arc,
     time::Instant,
 };
 
 use anyhow::{Context, Result};
+use flate2::read::GzDecoder;
 use koharu_ml::{
     comic_text_bubble_detector::{ComicTextBubbleDetection, ComicTextBubbleLabel},
     koharu_layout_rfdetr_seg_2xl::{
@@ -1419,6 +1420,494 @@ fn candidate_configs() -> Vec<(String, DetectionFusionConfig)> {
     list
 }
 
+// ---------------------------------------------------------------------------
+// Real RTX 3080 Raw Detector Dump Loading (.jsonl / .jsonl.gz)
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct RawRleMask {
+    x: u32,
+    y: u32,
+    width: u32,
+    height: u32,
+    counts: Vec<u32>,
+}
+
+#[derive(Deserialize)]
+struct RawRfdetrDet {
+    label_id: usize,
+    label: String,
+    score: f32,
+    bbox: [f32; 4],
+    area: u32,
+    mask: RawRleMask,
+}
+
+#[derive(Deserialize)]
+struct RawOgkaluDet {
+    label: String,
+    score: f32,
+    bbox: [f32; 4],
+}
+
+#[derive(Deserialize)]
+struct RawDumpLine {
+    image_id: u64,
+    file_name: String,
+    image_width: u32,
+    image_height: u32,
+    rfdetr: Vec<RawRfdetrDet>,
+    ogkalu: Vec<RawOgkaluDet>,
+}
+
+struct LoadedRawPage {
+    image_id: u64,
+    file_name: String,
+    image_width: u32,
+    image_height: u32,
+    corrupted: CorruptedPage,
+}
+
+fn decode_raw_rle(mask: &RawRleMask) -> KoharuLayoutMask {
+    let total = (mask.width as usize).saturating_mul(mask.height as usize);
+    let mut pixels = vec![0u8; total];
+    let mut pos = 0usize;
+    for (run_idx, &run) in mask.counts.iter().enumerate() {
+        let end = (pos + run as usize).min(total);
+        if run_idx % 2 == 1 {
+            pixels[pos..end].fill(u8::MAX);
+        }
+        pos = end;
+        if pos >= total {
+            break;
+        }
+    }
+    KoharuLayoutMask {
+        x: mask.x,
+        y: mask.y,
+        width: mask.width,
+        height: mask.height,
+        pixels,
+    }
+}
+
+fn parse_ogkalu_label(label: &str) -> Option<ComicTextBubbleLabel> {
+    match label {
+        "bubble" => Some(ComicTextBubbleLabel::Bubble),
+        "text_bubble" => Some(ComicTextBubbleLabel::TextBubble),
+        "text_free" => Some(ComicTextBubbleLabel::TextFree),
+        _ => None,
+    }
+}
+
+fn load_raw_dumps(path: &Path, max_pages: Option<usize>) -> Result<Vec<LoadedRawPage>> {
+    let file = File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
+    let is_gz = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("gz"));
+
+    let mut raw_lines: Vec<String> = Vec::new();
+    if is_gz {
+        let reader = BufReader::new(GzDecoder::new(file));
+        for line in reader.lines() {
+            let line = line.context("failed to read gzipped raw dump line")?;
+            if !line.trim().is_empty() {
+                raw_lines.push(line);
+                if max_pages.is_some_and(|limit| raw_lines.len() >= limit) {
+                    break;
+                }
+            }
+        }
+    } else {
+        let reader = BufReader::new(file);
+        for line in reader.lines() {
+            let line = line.context("failed to read raw dump line")?;
+            if !line.trim().is_empty() {
+                raw_lines.push(line);
+                if max_pages.is_some_and(|limit| raw_lines.len() >= limit) {
+                    break;
+                }
+            }
+        }
+    }
+
+    raw_lines
+        .par_iter()
+        .map(|line| {
+            let parsed: RawDumpLine =
+                serde_json::from_str(line).context("failed to parse raw dump JSONL line")?;
+            let detections = parsed
+                .rfdetr
+                .into_iter()
+                .map(|d| KoharuLayoutDetection {
+                    label_id: d.label_id,
+                    label: d.label,
+                    score: d.score,
+                    bbox: d.bbox,
+                    area: d.area,
+                    mask: Arc::new(decode_raw_rle(&d.mask)),
+                })
+                .collect();
+            let comic = parsed
+                .ogkalu
+                .into_iter()
+                .filter_map(|d| {
+                    parse_ogkalu_label(&d.label).map(|label| ComicTextBubbleDetection {
+                        label,
+                        score: d.score,
+                        bbox: d.bbox,
+                    })
+                })
+                .collect();
+            Ok(LoadedRawPage {
+                image_id: parsed.image_id,
+                file_name: parsed.file_name,
+                image_width: parsed.image_width,
+                image_height: parsed.image_height,
+                corrupted: CorruptedPage {
+                    layout: KoharuLayoutDetections {
+                        image_width: parsed.image_width,
+                        image_height: parsed.image_height,
+                        detections,
+                    },
+                    comic,
+                    split_gt_bubbles: HashSet::new(),
+                },
+            })
+        })
+        .collect()
+}
+
+#[derive(Deserialize)]
+struct HardGtEntry {
+    gt: Vec<Vec<usize>>,
+    ignore: Vec<usize>,
+}
+
+#[derive(Default, Clone, Debug)]
+struct RawSummaryStats {
+    bubbles: usize,
+    texts: usize,
+    assoc_texts: usize,
+    free_texts: usize,
+    sfx: usize,
+    panels: usize,
+    hi_res_pages: usize,
+    hi_res_bubbles: usize,
+    hi_res_texts: usize,
+    hi_res_free_texts: usize,
+    hard_gt_tp: usize,
+    hard_gt_total: usize,
+    hard_gt_fp: usize,
+}
+
+impl RawSummaryStats {
+    fn hard_gt_f1(&self) -> f64 {
+        let fn_ = self.hard_gt_total.saturating_sub(self.hard_gt_tp);
+        Scorecard::f1(self.hard_gt_tp, self.hard_gt_fp, fn_)
+    }
+}
+
+fn evaluate_raw_summary(
+    raw_pages: &[LoadedRawPage],
+    config: &DetectionFusionConfig,
+    hard_gt: Option<&(HashMap<String, HardGtEntry>, HashMap<String, Vec<[f32; 4]>>)>,
+) -> RawSummaryStats {
+    let mut stats = RawSummaryStats::default();
+
+    for page in raw_pages {
+        let fused = fuse_detections(
+            page.corrupted.layout.clone(),
+            &page.corrupted.comic,
+            DEFAULT_BUBBLE_THRESHOLD,
+            config,
+        );
+        let mut det_to_bubble: HashMap<usize, Option<usize>> = HashMap::new();
+        for item in &fused.order {
+            det_to_bubble.insert(item.index, item.bubble);
+        }
+
+        let mut page_bubbles: Vec<[f32; 4]> = Vec::new();
+        let mut page_texts = 0usize;
+        let mut page_assoc = 0usize;
+        let mut page_free = 0usize;
+
+        for (idx, det) in fused.detections.iter().enumerate() {
+            match det.label.as_str() {
+                "bubble" => {
+                    stats.bubbles += 1;
+                    page_bubbles.push(det.bbox);
+                }
+                "text" => {
+                    stats.texts += 1;
+                    page_texts += 1;
+                    if det_to_bubble.get(&idx).copied().flatten().is_some() {
+                        stats.assoc_texts += 1;
+                        page_assoc += 1;
+                    } else {
+                        stats.free_texts += 1;
+                        page_free += 1;
+                    }
+                }
+                "onomatopoeia" => stats.sfx += 1,
+                "panel" => stats.panels += 1,
+                _ => {}
+            }
+        }
+        let _ = page_assoc;
+
+        if page.image_width >= 4000 || page.image_height >= 4000 {
+            stats.hi_res_pages += 1;
+            stats.hi_res_bubbles += page_bubbles.len();
+            stats.hi_res_texts += page_texts;
+            stats.hi_res_free_texts += page_free;
+        }
+
+        if let Some((gt_map, cand_map)) = hard_gt {
+            if let (Some(entry), Some(cands)) =
+                (gt_map.get(&page.file_name), cand_map.get(&page.file_name))
+            {
+                let groups: Vec<Vec<[f32; 4]>> = entry
+                    .gt
+                    .iter()
+                    .map(|grp| grp.iter().filter_map(|&idx| cands.get(idx).copied()).collect())
+                    .collect();
+                let ign: Vec<[f32; 4]> = entry
+                    .ignore
+                    .iter()
+                    .filter_map(|&idx| cands.get(idx).copied())
+                    .collect();
+                let mut hit = vec![false; groups.len()];
+                for &b in &page_bubbles {
+                    let matched: Vec<usize> = groups
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(k, grp)| {
+                            grp.iter().any(|&c| iou(b, c) >= 0.5).then_some(k)
+                        })
+                        .collect();
+                    if !matched.is_empty() {
+                        for k in matched {
+                            hit[k] = true;
+                        }
+                    } else if !ign.iter().any(|&c| iou(b, c) >= 0.5) {
+                        stats.hard_gt_fp += 1;
+                    }
+                }
+                stats.hard_gt_total += groups.len();
+                stats.hard_gt_tp += hit.into_iter().filter(|&h| h).count();
+            }
+        }
+    }
+
+    stats
+}
+
+fn real_dump_candidates() -> Vec<(String, DetectionFusionConfig)> {
+    let base = DetectionFusionConfig::legacy();
+    let prod = DetectionFusionConfig::default();
+    let mut list = vec![
+        ("baseline (origin/master)".to_owned(), base.clone()),
+        ("default (5 pure logic fixes)".to_owned(), prod.clone()),
+    ];
+
+    for fb in [0.65f32, 0.75, 0.85] {
+        let mut c = prod.clone();
+        c.fallback_rfdetr_bubble_threshold = Some(fb);
+        list.push((format!("default + fb={fb:.2}"), c));
+    }
+
+    for gap in [0.40f32, 0.45, 0.60] {
+        let mut c = prod.clone();
+        c.text_block_gap = gap;
+        list.push((format!("default + gap={gap:.2}"), c));
+    }
+
+    for gap in [0.40f32, 0.45, 0.60] {
+        for fb in [0.65f32, 0.75, 0.85] {
+            let mut c = prod.clone();
+            c.text_block_gap = gap;
+            c.fallback_rfdetr_bubble_threshold = Some(fb);
+            list.push((format!("default + gap={gap:.2} + fb={fb:.2}"), c));
+        }
+    }
+
+    // Individual ablations of the 5 pure logic fixes on real data
+    let mut c = base.clone();
+    c.fit_to_mask_min_overlap = prod.fit_to_mask_min_overlap;
+    list.push((
+        format!("ablation: fit_overlap={:.2}", prod.fit_to_mask_min_overlap),
+        c,
+    ));
+
+    let mut c = base.clone();
+    c.use_mask_containment_for_merge = true;
+    list.push(("ablation: mask_merge".to_owned(), c));
+
+    let mut c = base.clone();
+    c.prevent_cross_bubble_same_text = true;
+    list.push(("ablation: no_xbubble_same_text".to_owned(), c));
+
+    let mut c = base.clone();
+    c.dedup_added_text_coverage = true;
+    list.push(("ablation: dedup_added_cov".to_owned(), c));
+
+    let mut c = base.clone();
+    c.prefer_higher_bubble_containment = true;
+    list.push(("ablation: prefer_high_bub_cont".to_owned(), c));
+
+    list
+}
+
+fn run_raw_dumps_mode(
+    raw_path: &Path,
+    coco_path: Option<&Path>,
+    hard_gt_path: Option<&Path>,
+    hard_cand_path: Option<&Path>,
+    max_pages: Option<usize>,
+) -> Result<()> {
+    let t0 = Instant::now();
+    println!("Loading raw detector dumps from {} ...", raw_path.display());
+    let raw_pages = load_raw_dumps(raw_path, max_pages)?;
+    println!(
+        "Loaded {} raw detector pages in {:.2}s",
+        raw_pages.len(),
+        t0.elapsed().as_secs_f64()
+    );
+
+    let candidates = real_dump_candidates();
+
+    if let Some(coco_path) = coco_path {
+        let t_coco = Instant::now();
+        println!("Loading COCO ground truth from {} ...", coco_path.display());
+        let gt_pages = load_coco_split(coco_path, None)?;
+        let gt_by_id: HashMap<u64, GtPage> = gt_pages.into_iter().map(|p| (p.id, p)).collect();
+
+        let mut matched_gt: Vec<GtPage> = Vec::new();
+        let mut matched_corrupted: Vec<CorruptedPage> = Vec::new();
+        for raw in raw_pages {
+            if let Some(gt) = gt_by_id.get(&raw.image_id) {
+                matched_gt.push(gt.clone());
+                matched_corrupted.push(raw.corrupted);
+            }
+        }
+        println!(
+            "Matched {}/{} raw dump pages against COCO GT in {:.2}s",
+            matched_gt.len(),
+            gt_by_id.len(),
+            t_coco.elapsed().as_secs_f64()
+        );
+        anyhow::ensure!(
+            !matched_gt.is_empty(),
+            "no raw dump image_ids matched COCO GT {}",
+            coco_path.display()
+        );
+
+        let t_sweep = Instant::now();
+        println!(
+            "\n=== REAL DETECTOR DUMP SWEEP ({} pages, {} configs) ===",
+            matched_gt.len(),
+            candidates.len()
+        );
+        print_header();
+        let mut results: Vec<(String, DetectionFusionConfig, Scorecard)> =
+            Vec::with_capacity(candidates.len());
+        for (name, cfg) in candidates {
+            let sc = evaluate_suite(&matched_gt, &matched_corrupted, &cfg);
+            print_row(&name, &sc);
+            results.push((name, cfg, sc));
+        }
+        println!("\nSweep completed in {:.2}s", t_sweep.elapsed().as_secs_f64());
+
+        let baseline_sc = &results[0].2;
+        let default_sc = &results[1].2;
+        println!("\n--- Dominance Check vs baseline & default ---");
+        for (name, _, sc) in &results[1..] {
+            let dom_base = sc.pareto_dominates(baseline_sc);
+            let dom_def = sc.pareto_dominates(default_sc);
+            if dom_base || dom_def {
+                println!(
+                    "  {:<36} dom_base={:<5} dom_def={:<5} XMerge={:+} Drop={:+.2}% MisAs={:+.2}% TxtF1={:+.4} BubF1={:+.4} AscF1={:+.4}",
+                    name,
+                    dom_base,
+                    dom_def,
+                    sc.cross_bubble_merges as isize - baseline_sc.cross_bubble_merges as isize,
+                    (sc.dropped_dialogue_rate() - baseline_sc.dropped_dialogue_rate()) * 100.0,
+                    (sc.misassignment_rate() - baseline_sc.misassignment_rate()) * 100.0,
+                    sc.text_f1() - baseline_sc.text_f1(),
+                    sc.bubble_f1() - baseline_sc.bubble_f1(),
+                    sc.assoc_f1() - baseline_sc.assoc_f1(),
+                );
+            }
+        }
+    } else {
+        let hard_gt = match (hard_gt_path, hard_cand_path) {
+            (Some(gt_p), Some(cand_p)) => {
+                let gt_map: HashMap<String, HardGtEntry> =
+                    serde_json::from_reader(BufReader::new(File::open(gt_p)?))
+                        .with_context(|| format!("failed to parse {}", gt_p.display()))?;
+                let cand_map: HashMap<String, Vec<[f32; 4]>> =
+                    serde_json::from_reader(BufReader::new(File::open(cand_p)?))
+                        .with_context(|| format!("failed to parse {}", cand_p.display()))?;
+                Some((gt_map, cand_map))
+            }
+            _ => None,
+        };
+
+        println!(
+            "\n=== REAL RAW DUMP SUMMARY ({} pages, {} configs) ===",
+            raw_pages.len(),
+            candidates.len()
+        );
+        println!(
+            "{:<36} | {:>5} | {:>5} | {:>5} | {:>5} | {:>4} | {:>5} | {:>12} | {:>14}",
+            "Candidate",
+            "Bub",
+            "Txt",
+            "Assoc",
+            "Free",
+            "SFX",
+            "Panel",
+            "HiRes(B/T/F)",
+            "HardGT(TP/FP/F1)"
+        );
+        println!("{}", "-".repeat(120));
+        for (name, cfg) in candidates {
+            let st = evaluate_raw_summary(&raw_pages, &cfg, hard_gt.as_ref());
+            let hires = format!(
+                "{}/{}/{}",
+                st.hi_res_bubbles, st.hi_res_texts, st.hi_res_free_texts
+            );
+            let hgt = if st.hard_gt_total > 0 {
+                format!(
+                    "{}/{} fp{} {:.3}",
+                    st.hard_gt_tp,
+                    st.hard_gt_total,
+                    st.hard_gt_fp,
+                    st.hard_gt_f1()
+                )
+            } else {
+                "-".to_owned()
+            };
+            println!(
+                "{:<36} | {:>5} | {:>5} | {:>5} | {:>5} | {:>4} | {:>5} | {:>12} | {:>14}",
+                name,
+                st.bubbles,
+                st.texts,
+                st.assoc_texts,
+                st.free_texts,
+                st.sfx,
+                st.panels,
+                hires,
+                hgt
+            );
+        }
+    }
+
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let args: Vec<String> = env::args().collect();
     let default_dir = env::var("HOME")
@@ -1427,6 +1916,11 @@ fn main() -> Result<()> {
 
     let mut val_path = default_dir.join("validation.coco.json");
     let mut test_path = default_dir.join("test.coco.json");
+    let mut raw_dumps_path: Option<PathBuf> = None;
+    let mut coco_path: Option<PathBuf> = None;
+    let mut hard_gt_path: Option<PathBuf> = None;
+    let mut hard_cand_path: Option<PathBuf> = None;
+    let mut summary_only = false;
     let mut seed: u64 = 20261127;
     let mut max_pages: Option<usize> = None;
 
@@ -1441,6 +1935,26 @@ fn main() -> Result<()> {
                 test_path = PathBuf::from(&args[i + 1]);
                 i += 2;
             }
+            "--raw-dumps" if i + 1 < args.len() => {
+                raw_dumps_path = Some(PathBuf::from(&args[i + 1]));
+                i += 2;
+            }
+            "--coco" if i + 1 < args.len() => {
+                coco_path = Some(PathBuf::from(&args[i + 1]));
+                i += 2;
+            }
+            "--hard-gt" if i + 1 < args.len() => {
+                hard_gt_path = Some(PathBuf::from(&args[i + 1]));
+                i += 2;
+            }
+            "--hard-cand" if i + 1 < args.len() => {
+                hard_cand_path = Some(PathBuf::from(&args[i + 1]));
+                i += 2;
+            }
+            "--summary-only" => {
+                summary_only = true;
+                i += 1;
+            }
             "--seed" if i + 1 < args.len() => {
                 seed = args[i + 1].parse().context("invalid --seed")?;
                 i += 2;
@@ -1451,6 +1965,21 @@ fn main() -> Result<()> {
             }
             _ => i += 1,
         }
+    }
+
+    if let Some(raw_path) = raw_dumps_path {
+        let gt_coco = if summary_only {
+            None
+        } else {
+            coco_path.as_deref().or(Some(val_path.as_path()))
+        };
+        return run_raw_dumps_mode(
+            &raw_path,
+            gt_coco,
+            hard_gt_path.as_deref(),
+            hard_cand_path.as_deref(),
+            max_pages,
+        );
     }
 
     let t0 = Instant::now();

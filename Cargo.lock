@@ -2625,6 +2625,7 @@ dependencies = [
  "anyhow",
  "arc-swap",
  "async-trait",
+ "flate2",
  "futures",
  "image",
  "imageproc",
