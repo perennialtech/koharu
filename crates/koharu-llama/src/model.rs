@@ -5,9 +5,11 @@ use std::os::raw::c_int;
 use std::path::Path;
 use std::ptr::NonNull;
 use std::str::Utf8Error;
+use std::sync::Arc;
 
-use crate::context::LlamaContext;
 use crate::context::params::LlamaContextParams;
+use crate::context::{LlamaContext, ModelContext, OwnedLlamaContext};
+use crate::gguf::{GgufKvLayer, model_kv_layers};
 use crate::llama_backend::LlamaBackend;
 use crate::model::params::LlamaModelParams;
 use crate::sampling::LlamaSampler;
@@ -25,6 +27,86 @@ pub mod params;
 #[allow(clippy::module_name_repetitions)]
 pub struct LlamaModel {
     pub(crate) model: NonNull<koharu_llama_sys::llama_model>,
+    mtp_geometry: Option<Box<MtpGeometry>>,
+}
+
+struct MtpGeometry {
+    architecture: String,
+    vocab: i32,
+    embedding: i32,
+    input: i32,
+    output: i32,
+    n_swa: i32,
+    trunk_layers: usize,
+    kv_layers: Vec<GgufKvLayer>,
+}
+
+impl MtpGeometry {
+    fn read(model: &LlamaModel, path: &Path, params: &LlamaModelParams) -> Option<Self> {
+        let architecture = model.meta_val_str("general.architecture").ok()?;
+        if !matches!(architecture.as_str(), "gemma4" | "gemma4-assistant")
+            || params.vocab_only()
+            || params.no_alloc()
+        {
+            return None;
+        }
+        // An architecture or geometry override can invalidate the file's KV metadata.
+        if params.kv_overrides().into_iter().any(|(key, _)| {
+            let Ok(key) = key.to_str() else { return false };
+            key == "general.architecture"
+                || matches!(
+                    key.strip_prefix(&architecture),
+                    Some(
+                        ".embedding_length"
+                            | ".attention.sliding_window_pattern"
+                            | ".attention.shared_kv_layers"
+                            | ".attention.head_count"
+                            | ".attention.head_count_kv"
+                            | ".attention.key_length"
+                            | ".attention.value_length"
+                            | ".attention.key_length_swa"
+                            | ".attention.value_length_swa"
+                    )
+                )
+        }) {
+            return None;
+        }
+        let trunk = model.n_layer();
+        let blocks = trunk.checked_add(u32::try_from(model.n_layer_nextn()).ok()?)?;
+        let kv_layers = model_kv_layers(path, &architecture, blocks)?;
+        Some(Self {
+            architecture,
+            vocab: model.n_vocab(),
+            embedding: model.n_embd(),
+            input: model.n_embd_inp(),
+            output: model.n_embd_out(),
+            n_swa: model.n_swa(),
+            trunk_layers: trunk as usize,
+            kv_layers,
+        })
+    }
+
+    fn supports_draft(&self, draft: &Self) -> bool {
+        // b12755 uses the target's penultimate KV layer for sliding attention,
+        // and the final layer for full attention, regardless of draft layer index.
+        let Some([.., sliding, full]) = self.kv_layers.get(..self.trunk_layers) else {
+            return false;
+        };
+        self.architecture == "gemma4"
+            && self.n_swa > 0
+            && sliding.sliding
+            && !full.sliding
+            && draft.architecture == "gemma4-assistant"
+            && draft.trunk_layers == 0
+            && self.vocab == draft.vocab
+            && self.embedding == draft.input
+            && self.output == draft.input
+            && draft.kv_layers.iter().any(|layer| layer.sliding)
+            && draft
+                .kv_layers
+                .iter()
+                .all(|layer| layer == if layer.sliding { sliding } else { full })
+    }
 }
 
 impl std::fmt::Debug for LlamaModel {
@@ -654,6 +736,15 @@ impl LlamaModel {
         unsafe { koharu_llama_sys::llama_model_n_swa(self.model.as_ptr()) }
     }
 
+    /// Whether the draft can use this target's token embeddings, hidden state and KV layers.
+    #[must_use]
+    pub fn supports_mtp_draft(&self, draft: &Self) -> bool {
+        self.mtp_geometry
+            .as_ref()
+            .zip(draft.mtp_geometry.as_ref())
+            .is_some_and(|(target, draft)| target.supports_draft(draft))
+    }
+
     /// Returns the number of extra next-token prediction layers in the model.
     #[must_use]
     pub fn n_layer_nextn(&self) -> i32 {
@@ -809,7 +900,12 @@ impl LlamaModel {
         })?;
 
         tracing::debug!(?path, "Loaded model");
-        Ok(LlamaModel { model })
+        let mut model = LlamaModel {
+            model,
+            mtp_geometry: None,
+        };
+        model.mtp_geometry = MtpGeometry::read(&model, Path::new(path), params).map(Box::new);
+        Ok(model)
     }
 
     /// Initializes a lora adapter from a file.
@@ -854,7 +950,7 @@ impl LlamaModel {
         &'a self,
         _: &LlamaBackend,
         params: LlamaContextParams,
-    ) -> Result<LlamaContext<'a>, LlamaContextLoadError> {
+    ) -> Result<Box<LlamaContext<'a>>, LlamaContextLoadError> {
         let context_params = params.context_params;
         crate::clear_allocation_failure();
         let context =
@@ -867,25 +963,26 @@ impl LlamaModel {
             }
         })?;
 
-        Ok(LlamaContext::new(self, context, params.embeddings()))
+        Ok(Box::new(ModelContext::new(
+            self,
+            context,
+            &params,
+            Vec::new(),
+        )))
     }
 
-    /// Create a new context bound to another context via llama.cpp's `ctx_other` field.
-    ///
-    /// This is required for MTP speculative decoding when the draft context shares target state.
+    /// Create an owned context backed by an [`Arc<LlamaModel>`].
     ///
     /// # Errors
     ///
     /// See [`LlamaContextLoadError`].
     #[allow(clippy::needless_pass_by_value)]
-    pub fn new_context_with_ctx_other<'a>(
-        &'a self,
+    pub fn new_context_owned(
+        self: &Arc<Self>,
         _: &LlamaBackend,
         params: LlamaContextParams,
-        ctx_other: &LlamaContext<'_>,
-    ) -> Result<LlamaContext<'a>, LlamaContextLoadError> {
-        let mut context_params = params.context_params;
-        context_params.ctx_other = ctx_other.context.as_ptr();
+    ) -> Result<OwnedLlamaContext, LlamaContextLoadError> {
+        let context_params = params.context_params;
         crate::clear_allocation_failure();
         let context =
             unsafe { koharu_llama_sys::llama_init_from_model(self.model.as_ptr(), context_params) };
@@ -896,7 +993,10 @@ impl LlamaModel {
                 LlamaContextLoadError::NullReturn
             }
         })?;
-        Ok(LlamaContext::new(self, context, params.embeddings()))
+
+        Ok(OwnedLlamaContext {
+            context: ModelContext::new(Arc::clone(self), context, &params, Vec::new()),
+        })
     }
 
     /// Creates a context with backend sampler chains attached to specific sequences.
@@ -913,7 +1013,7 @@ impl LlamaModel {
         _: &LlamaBackend,
         params: LlamaContextParams,
         samplers: impl IntoIterator<Item = (i32, LlamaSampler)>,
-    ) -> Result<LlamaContext<'a>, LlamaContextLoadError> {
+    ) -> Result<Box<LlamaContext<'a>>, LlamaContextLoadError> {
         let samplers = samplers.into_iter().collect::<Vec<_>>();
         let mut context_params = params.context_params;
         let mut sampler_configs = samplers
@@ -939,12 +1039,9 @@ impl LlamaModel {
                 LlamaContextLoadError::NullReturn
             }
         })?;
-        Ok(LlamaContext::with_samplers(
-            self,
-            context,
-            params.embeddings(),
-            samplers,
-        ))
+        Ok(Box::new(ModelContext::new(
+            self, context, &params, samplers,
+        )))
     }
 
     /// Apply the models chat template to some messages.
@@ -1116,7 +1213,104 @@ impl TryFrom<koharu_llama_sys::llama_vocab_type> for VocabType {
 
 #[cfg(test)]
 mod tests {
-    use super::decode_piece;
+    use super::{GgufKvLayer, MtpGeometry, decode_piece};
+
+    #[test]
+    fn mtp_pair_requires_a_compatible_target_and_shared_kv_layers() {
+        let sliding = GgufKvLayer {
+            sliding: true,
+            heads: 8,
+            key_length: 256,
+            value_length: 256,
+        };
+        let full = GgufKvLayer {
+            sliding: false,
+            heads: 2,
+            key_length: 512,
+            value_length: 512,
+        };
+        let target_layers = [sliding, sliding, full];
+        let draft_layers = [sliding, full];
+        let target = || MtpGeometry {
+            architecture: "gemma4".into(),
+            vocab: 262144,
+            embedding: 2816,
+            input: 2816,
+            output: 2816,
+            n_swa: 1024,
+            trunk_layers: target_layers.len(),
+            kv_layers: target_layers.to_vec(),
+        };
+        let draft = || MtpGeometry {
+            architecture: "gemma4-assistant".into(),
+            embedding: 1024,
+            trunk_layers: 0,
+            kv_layers: draft_layers.to_vec(),
+            ..target()
+        };
+        assert!(target().supports_draft(&draft()));
+        for invalid in [
+            MtpGeometry {
+                architecture: "llama".into(),
+                ..target()
+            },
+            MtpGeometry {
+                n_swa: 0,
+                ..target()
+            },
+            MtpGeometry {
+                trunk_layers: 1,
+                ..target()
+            },
+            MtpGeometry {
+                trunk_layers: 2,
+                ..target()
+            },
+            MtpGeometry {
+                output: 5376,
+                ..target()
+            },
+        ] {
+            assert!(!invalid.supports_draft(&draft()));
+        }
+        let mismatched_heads = [sliding, GgufKvLayer { heads: 4, ..full }];
+        let mismatched_width = [
+            GgufKvLayer {
+                key_length: 128,
+                ..sliding
+            },
+            full,
+        ];
+        for invalid in [
+            MtpGeometry {
+                architecture: "gemma4".into(),
+                ..draft()
+            },
+            MtpGeometry {
+                trunk_layers: 1,
+                ..draft()
+            },
+            MtpGeometry {
+                vocab: 32000,
+                ..draft()
+            },
+            MtpGeometry {
+                input: 5376,
+                output: 5376,
+                ..draft()
+            },
+            MtpGeometry {
+                kv_layers: mismatched_heads.to_vec(),
+                ..draft()
+            },
+            MtpGeometry {
+                kv_layers: mismatched_width.to_vec(),
+                ..draft()
+            },
+        ] {
+            assert!(!target().supports_draft(&invalid));
+        }
+    }
 
     #[test]
     fn token_decoder_preserves_utf8_split_across_pieces() {
