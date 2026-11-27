@@ -11,8 +11,9 @@ use image::DynamicImage;
 use koharu_scene::{Edit, EntityId, Generation, Patch, ProducerId, Snapshot};
 
 pub use detection::{
-    DetectionFusionConfig, FusedDetectionLayout, KoharuLayoutRFDetrSeg2XLConfig, LayoutItem,
-    fuse_detections,
+    DetectionFusionConfig, FusedDetectionLayout, GlyphClaimCounts, InferredTypography,
+    KoharuLayoutRFDetrSeg2XLConfig, LayoutItem, ReplayedDetectionPage, fuse_detections,
+    replay_detection_page,
 };
 
 use crate::{Bounds, ImageCache, InpaintingMask, PipelineConfig, RequestTranslation, Stage};

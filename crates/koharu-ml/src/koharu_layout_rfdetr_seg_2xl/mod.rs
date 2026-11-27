@@ -18,7 +18,10 @@ use koharu_runtime::Backend;
 
 pub use self::{
     config::{KoharuLayoutRFDetrSeg2XLConfig, KoharuLayoutThresholds},
-    measure::{GlyphProposal, Outline, Typography, fit_glyph_masks},
+    measure::{
+        GlyphClaim, GlyphProposal, Outline, Typography, fit_glyph_masks,
+        fit_glyph_masks_with_claims,
+    },
     processor::{
         KoharuLayoutDetection, KoharuLayoutDetections, KoharuLayoutMask,
         KoharuLayoutRFDetrImageProcessor,

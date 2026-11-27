@@ -216,3 +216,35 @@ cargo run --release --example detection_fuzz -p koharu-pipeline -- \
   --raw-dumps /path/to/hard_pages.raw.jsonl.gz \
   --summary-only
 ```
+
+### Production detection replay
+
+`production_replay` runs recorded RF-DETR and ogkalu predictions through the
+same glyph fitting, fusion, reading order, paint inference, and page text-mask
+assembly used by the detection stage. The raw dumps supply RF-DETR proposals
+at the thresholds to evaluate. The CLI applies the configured ogkalu bubble
+threshold during fusion.
+
+```bash
+cargo run -p koharu-pipeline --example production_replay -- \
+  --raw-dumps /data/dumps --images-dir /data/pages \
+  --out /data/replay.jsonl.gz --batch-size 64 --build-sha "$(git rev-parse HEAD)"
+```
+
+Dump directories are read in filename order. Image names are resolved under
+`--images-dir`, trying shorter nested suffixes when a dump retains its original
+dataset path and then looking for a unique basename under nested directories.
+Use `--allow-missing-images` to skip missing pages and count them
+in the final summary. `--max-pages` limits input records, including skips.
+`--emit-mask-rle` includes crop-local, row-major runs starting with background
+for text and onomatopoeia. `--perturb` changes the image presented to replay
+while preserving the on-disk digest and codec in each record.
+
+`--render-audit` typesets three fixed English profiles through the production
+renderer and rasterizer. It requires an installed font that covers English and
+a WGPU adapter. Font fallback uses the local system, so use matching fonts and
+graphics backends when comparing runs. The audit measures alpha above 16 on
+isolated text layers, including outline paint. Contrast compares composited
+ink with the local source page, using the inferred paper color where the
+source glyph mask covers the sample. Font size and contrast are null for
+profiles without measurements.

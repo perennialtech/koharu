@@ -815,6 +815,13 @@ impl GlyphProposal {
     }
 }
 
+/// A lettering proposal's mask and anchored ink before shared pixels are assigned.
+pub struct GlyphClaim {
+    pub index: usize,
+    pub mask: Arc<Mask>,
+    pub core: Mask,
+}
+
 /// Fit the fused lettering proposals to the page. Keep their original boxes
 /// until every shared pixel has an owner: growing one box over a cut glyph
 /// must not give it priority over a neighbouring text.
@@ -822,20 +829,39 @@ pub fn fit_glyph_masks<'a>(
     proposals: impl IntoIterator<Item = (GlyphProposal, &'a mut KoharuLayoutDetection)>,
     page: &RgbImage,
 ) {
+    fit_glyph_masks_inner(proposals, page, None);
+}
+
+/// Same as [`fit_glyph_masks`], while also retaining each proposal's
+/// pre-ownership mask and core ink for evaluation diagnostics.
+pub fn fit_glyph_masks_with_claims<'a>(
+    proposals: impl IntoIterator<Item = (GlyphProposal, &'a mut KoharuLayoutDetection)>,
+    page: &RgbImage,
+    claims: &mut Vec<GlyphClaim>,
+) {
+    fit_glyph_masks_inner(proposals, page, Some(claims));
+}
+
+fn fit_glyph_masks_inner<'a>(
+    proposals: impl IntoIterator<Item = (GlyphProposal, &'a mut KoharuLayoutDetection)>,
+    page: &RgbImage,
+    claims: Option<&mut Vec<GlyphClaim>>,
+) {
     let mut letters: Vec<_> = proposals
         .into_iter()
-        .filter(|(_, detection)| matches!(detection.label.as_str(), "text" | "onomatopoeia"))
-        .map(|(proposal, detection)| {
+        .enumerate()
+        .filter(|(_, (_, detection))| matches!(detection.label.as_str(), "text" | "onomatopoeia"))
+        .map(|(index, (proposal, detection))| {
             let original = match proposal {
                 GlyphProposal::Segmented(original) => original,
                 GlyphProposal::Box => detection.bbox,
             };
-            (original, proposal, Mask::default(), detection)
+            (original, proposal, Mask::default(), detection, index)
         })
         .collect();
     letters
         .par_iter_mut()
-        .for_each(|(_, proposal, core, detection)| {
+        .for_each(|(_, proposal, core, detection, _)| {
             let input_mask = Arc::clone(&detection.mask);
             let (mask, core_mask, grown) = glyph_mask(&input_mask, detection.bbox, page, *proposal);
             // For segmented proposals, anchor ownership tie-breaking to core
@@ -867,6 +893,17 @@ pub fn fit_glyph_masks<'a>(
             detection.mask = Arc::new(mask);
             detection.bbox = grown;
         });
+    if let Some(claims) = claims {
+        claims.extend(
+            letters
+                .iter()
+                .map(|(_, _, core, detection, index)| GlyphClaim {
+                    index: *index,
+                    mask: Arc::clone(&detection.mask),
+                    core: core.clone(),
+                }),
+        );
+    }
     let area = |[left, top, right, bottom]: [f32; 4]| (right - left) * (bottom - top);
     letters.sort_by(|(a, ..), (b, ..)| area(*a).total_cmp(&area(*b)));
     // Resolve shared pixels by Euclidean distance to each region's uncontested
@@ -874,8 +911,8 @@ pub fn fit_glyph_masks<'a>(
     // smaller-box tie-breaking.
     for i in 0..letters.len() {
         let (earlier, later) = letters.split_at_mut(i + 1);
-        let (bbox, _, core_a, first) = &mut earlier[i];
-        for (other, _, core_b, second) in later {
+        let (bbox, _, core_a, first, _) = &mut earlier[i];
+        for (other, _, core_b, second, _) in later {
             let (a, b) = (&first.mask, &second.mask);
             let (x0, y0) = (a.x.max(b.x), a.y.max(b.y));
             let (x1, y1) = (

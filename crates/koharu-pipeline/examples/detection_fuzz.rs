@@ -1,3 +1,6 @@
+#[path = "support/raw_detections.rs"]
+mod raw_detections;
+
 use std::{
     collections::{HashMap, HashSet},
     env,
@@ -9,7 +12,6 @@ use std::{
 };
 
 use anyhow::{Context, Result};
-use flate2::read::GzDecoder;
 use koharu_ml::{
     comic_text_bubble_detector::{
         ComicTextBubbleDetection, ComicTextBubbleDetector, ComicTextBubbleLabel,
@@ -1494,42 +1496,6 @@ fn candidate_configs() -> Vec<(String, DetectionFusionConfig)> {
 // Real RTX 3080 Raw Detector Dump Loading (.jsonl / .jsonl.gz)
 // ---------------------------------------------------------------------------
 
-#[derive(Deserialize)]
-struct RawRleMask {
-    x: u32,
-    y: u32,
-    width: u32,
-    height: u32,
-    counts: Vec<u32>,
-}
-
-#[derive(Deserialize)]
-struct RawRfdetrDet {
-    label_id: usize,
-    label: String,
-    score: f32,
-    bbox: [f32; 4],
-    area: u32,
-    mask: RawRleMask,
-}
-
-#[derive(Deserialize)]
-struct RawOgkaluDet {
-    label: String,
-    score: f32,
-    bbox: [f32; 4],
-}
-
-#[derive(Deserialize)]
-struct RawDumpLine {
-    image_id: u64,
-    file_name: String,
-    image_width: u32,
-    image_height: u32,
-    rfdetr: Vec<RawRfdetrDet>,
-    ogkalu: Vec<RawOgkaluDet>,
-}
-
 struct LoadedRawPage {
     image_id: u64,
     file_name: String,
@@ -1538,109 +1504,29 @@ struct LoadedRawPage {
     corrupted: CorruptedPage,
 }
 
-fn decode_raw_rle(mask: &RawRleMask) -> KoharuLayoutMask {
-    let total = (mask.width as usize).saturating_mul(mask.height as usize);
-    let mut pixels = vec![0u8; total];
-    let mut pos = 0usize;
-    for (run_idx, &run) in mask.counts.iter().enumerate() {
-        let end = (pos + run as usize).min(total);
-        if run_idx % 2 == 1 {
-            pixels[pos..end].fill(u8::MAX);
-        }
-        pos = end;
-        if pos >= total {
-            break;
-        }
-    }
-    KoharuLayoutMask {
-        x: mask.x,
-        y: mask.y,
-        width: mask.width,
-        height: mask.height,
-        pixels,
-    }
-}
-
-fn parse_ogkalu_label(label: &str) -> Option<ComicTextBubbleLabel> {
-    match label {
-        "bubble" => Some(ComicTextBubbleLabel::Bubble),
-        "text_bubble" => Some(ComicTextBubbleLabel::TextBubble),
-        "text_free" => Some(ComicTextBubbleLabel::TextFree),
-        _ => None,
-    }
-}
-
 fn load_raw_dumps(path: &Path, max_pages: Option<usize>) -> Result<Vec<LoadedRawPage>> {
-    let file = File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
-    let is_gz = path
-        .extension()
-        .and_then(|e| e.to_str())
-        .is_some_and(|e| e.eq_ignore_ascii_case("gz"));
+    use raw_detections::{RawDumpLine, dump_reader};
 
-    let mut raw_lines: Vec<String> = Vec::new();
-    if is_gz {
-        let reader = BufReader::new(GzDecoder::new(file));
-        for line in reader.lines() {
-            let line = line.context("failed to read gzipped raw dump line")?;
-            if !line.trim().is_empty() {
-                raw_lines.push(line);
-                if max_pages.is_some_and(|limit| raw_lines.len() >= limit) {
-                    break;
-                }
-            }
-        }
-    } else {
-        let reader = BufReader::new(file);
-        for line in reader.lines() {
-            let line = line.context("failed to read raw dump line")?;
-            if !line.trim().is_empty() {
-                raw_lines.push(line);
-                if max_pages.is_some_and(|limit| raw_lines.len() >= limit) {
-                    break;
-                }
-            }
-        }
-    }
-
-    raw_lines
-        .par_iter()
+    dump_reader(path)?
+        .lines()
+        .filter(|line| line.as_ref().map_or(true, |line| !line.trim().is_empty()))
+        .take(max_pages.unwrap_or(usize::MAX))
+        .collect::<std::io::Result<Vec<_>>>()?
+        .into_par_iter()
         .map(|line| {
             let parsed: RawDumpLine =
-                serde_json::from_str(line).context("failed to parse raw dump JSONL line")?;
-            let detections = parsed
-                .rfdetr
-                .into_iter()
-                .map(|d| KoharuLayoutDetection {
-                    label_id: d.label_id,
-                    label: d.label,
-                    score: d.score,
-                    bbox: d.bbox,
-                    area: d.area,
-                    mask: Arc::new(decode_raw_rle(&d.mask)),
-                })
-                .collect();
-            let comic = parsed
-                .ogkalu
-                .into_iter()
-                .filter_map(|d| {
-                    parse_ogkalu_label(&d.label).map(|label| ComicTextBubbleDetection {
-                        label,
-                        score: d.score,
-                        bbox: d.bbox,
-                    })
-                })
-                .collect();
+                serde_json::from_str(&line).context("failed to parse raw dump JSONL line")?;
+            let image_id = parsed.image_id;
+            let file_name = parsed.file_name.clone();
+            let (image_width, image_height) = (parsed.image_width, parsed.image_height);
+            let (layout, comic) = parsed.into_detections(1.0, (image_width, image_height))?;
             Ok(LoadedRawPage {
-                image_id: parsed.image_id,
-                file_name: parsed.file_name,
-                image_width: parsed.image_width,
-                image_height: parsed.image_height,
+                image_id,
+                file_name,
+                image_width,
+                image_height,
                 corrupted: CorruptedPage {
-                    layout: KoharuLayoutDetections {
-                        image_width: parsed.image_width,
-                        image_height: parsed.image_height,
-                        detections,
-                    },
+                    layout,
                     comic,
                     split_gt_bubbles: HashSet::new(),
                 },

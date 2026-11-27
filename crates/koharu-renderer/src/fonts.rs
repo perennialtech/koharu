@@ -783,10 +783,10 @@ impl Fonts {
     }
 
     pub(crate) async fn prepare(&self, requests: &[FontRequest]) -> Result<()> {
+        let system = self.ensure_system().await;
         if requests.is_empty() {
             return Ok(());
         }
-        let system = self.ensure_system().await;
         let missing = {
             let mut system = system.lock();
             requests
