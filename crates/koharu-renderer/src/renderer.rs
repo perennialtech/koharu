@@ -10,6 +10,10 @@ use std::{
 use anyhow::{Context, anyhow};
 use arc_swap::ArcSwap;
 use futures::future::try_join_all;
+use icu_properties::{
+    CodePointMapData,
+    props::{GeneralCategory, GeneralCategoryGroup},
+};
 use koharu_rasterizer::{RasterOptions, Rasterizer};
 use koharu_scene::{
     Asset, AssetRole, BlobId, BubbleRegion, Change, Component, ComponentOwner, EntityChange,
@@ -846,7 +850,7 @@ impl Traversal<'_> {
         }
         let typography = self.snapshot.component::<Typography>(entity)?;
         let mut analysis = None;
-        let mut source_font_size = None;
+        let mut source = None;
         let mut source_bounds = None;
         let mut sound_region = None;
         if let Some(recognized) = self.snapshot.relation_from::<RecognizedFrom>(content)? {
@@ -870,17 +874,32 @@ impl Traversal<'_> {
                 .component::<Geometry>(region)?
                 .and_then(|geometry| geometry_frame(&geometry, None))
                 .map(|frame| frame.bounds);
-            source_font_size = self
-                .snapshot
-                .component::<SourceText>(content)?
-                .zip(source_bounds)
-                .and_then(|(source, bounds)| source_glyph_size(&source.text.value, bounds));
+            source = self.snapshot.component::<SourceText>(content)?;
         }
         let minimum_font_size = readable_font_size(self.width, self.height);
-        let source_font_size = typography
+        let source = source.as_ref().zip(source_bounds);
+        let user = typography
             .as_ref()
-            .and_then(|t| t.size)
-            .or(source_font_size);
+            .is_some_and(|t| matches!(t.origin, Origin::User));
+        let font_size = typography.as_ref().and_then(|t| t.size);
+        let punctuation_em =
+            source
+                .filter(|_| !user || font_size.is_none())
+                .and_then(|(source, bounds)| {
+                    punctuation_source_em(
+                        &source.text.value,
+                        bounds,
+                        analysis
+                            .as_ref()
+                            .map_or(TextDirection::Auto, |a| a.direction),
+                        minimum_font_size,
+                        font_size,
+                    )
+                });
+        let font_size = font_size.map(|size| punctuation_em.unwrap_or(size));
+        let source_font_size = font_size.or(punctuation_em).or_else(|| {
+            source.and_then(|(source, bounds)| source_glyph_size(&source.text.value, bounds))
+        });
         let authored = self.snapshot.component::<Geometry>(entity)?;
         let is_authored = authored.is_some();
         let placement = if sound_region.is_some() {
@@ -958,9 +977,6 @@ impl Traversal<'_> {
             .and_then(|value| value.color)
             .unwrap_or([0, 0, 0, 255]);
         let foreground_color = neutral_fill(foreground_color);
-        let user = typography
-            .as_ref()
-            .is_some_and(|t| matches!(t.origin, Origin::User));
         let source_em = source_font_size.unwrap_or(minimum_font_size);
         let stroke = resolve_stroke(typography.as_ref(), foreground_color).or_else(|| {
             (!user).then(|| StrokeOptions {
@@ -982,7 +998,7 @@ impl Traversal<'_> {
                 .as_ref()
                 .and_then(|value| value.font_style)
                 .map(Into::into),
-            font_size: typography.as_ref().and_then(|value| value.size),
+            font_size,
             source_font_size,
             source_area,
             minimum_font_size,
@@ -1771,10 +1787,8 @@ fn readable_font_size(width: u32, height: u32) -> f32 {
     (width.min(height) as f32 * MINIMUM_FONT_SIZE_PER_PAGE_SIDE).max(MINIMUM_FONT_SIZE)
 }
 
-/// Estimates the em size of the source lettering from how many glyph cells
-/// fill its region. CJK glyphs, punctuation included, each occupy a square
-/// cell, so a region of `n` glyphs has an area near `n` cells. Whitespace and
-/// line-break characters take no cell.
+/// Estimates the em size of ordinary source lettering from the glyph cells
+/// that fill its region. Whitespace and line breaks take no cell.
 fn source_glyph_size(text: &str, bounds: LayoutBox) -> Option<f32> {
     let glyphs = text.chars().filter(|value| !value.is_whitespace()).count();
     if glyphs == 0 || bounds.width <= 0.0 || bounds.height <= 0.0 {
@@ -1785,6 +1799,65 @@ fn source_glyph_size(text: &str, bounds: LayoutBox) -> Option<f32> {
             .sqrt()
             .min(bounds.width.min(bounds.height)),
     )
+}
+
+/// A run of punctuation can span glyph advances while its ink is only a few
+/// pixels wide. An isolated dot has no measurable advance.
+fn punctuation_source_em(
+    text: &str,
+    bounds: LayoutBox,
+    direction: TextDirection,
+    page_minimum: f32,
+    measured: Option<f32>,
+) -> Option<f32> {
+    let vertical = match direction {
+        TextDirection::Horizontal => false,
+        TextDirection::Vertical => true,
+        TextDirection::Auto => bounds.height > bounds.width,
+    };
+    let length = if vertical {
+        bounds.height
+    } else {
+        bounds.width
+    };
+    let categories = CodePointMapData::<GeneralCategory>::new();
+    let mut longest_advance = 0.0_f32;
+    let mut count = 0;
+    let mut has_dot = false;
+    let mut has_narrow_mark = false;
+    for line in text.lines() {
+        let mut advance = 0.0;
+        for ch in line.chars().filter(|ch| !ch.is_whitespace()) {
+            let category = categories.get(ch);
+            if !GeneralCategoryGroup::Punctuation.contains(category) {
+                return None;
+            }
+            count += 1;
+            let dot = matches!(ch, '.' | '・' | '･' | '·' | '。' | '．');
+            has_dot |= dot;
+            has_narrow_mark |=
+                dot || matches!(ch, '…' | '‥') || category == GeneralCategory::DashPunctuation;
+            advance += match ch {
+                _ if vertical => 1.0,
+                '.' => 0.25,
+                ch if ch.is_ascii() || ch == '･' => 0.5,
+                _ => 1.0,
+            };
+        }
+        longest_advance = longest_advance.max(advance);
+    }
+    if count == 0 {
+        return None;
+    }
+    let inferred = if count == 1 && has_dot {
+        page_minimum
+    } else {
+        (length / longest_advance).max(page_minimum)
+    };
+    // The measured ink can be substantially narrower than the inferred em.
+    measured
+        .is_none_or(|size| has_narrow_mark && size < 0.5 * inferred)
+        .then_some(inferred)
 }
 
 fn resolve_writing_mode(

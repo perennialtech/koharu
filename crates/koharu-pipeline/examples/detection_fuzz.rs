@@ -11,7 +11,9 @@ use std::{
 use anyhow::{Context, Result};
 use flate2::read::GzDecoder;
 use koharu_ml::{
-    comic_text_bubble_detector::{ComicTextBubbleDetection, ComicTextBubbleLabel},
+    comic_text_bubble_detector::{
+        ComicTextBubbleDetection, ComicTextBubbleDetector, ComicTextBubbleLabel,
+    },
     koharu_layout_rfdetr_seg_2xl::{
         KoharuLayoutDetection, KoharuLayoutDetections, KoharuLayoutMask,
     },
@@ -24,7 +26,7 @@ const RFDETR_TEXT_LABEL_ID: usize = 0;
 const RFDETR_ONOMATOPOEIA_LABEL_ID: usize = 1;
 const RFDETR_BUBBLE_LABEL_ID: usize = 2;
 const RFDETR_PANEL_LABEL_ID: usize = 3;
-const DEFAULT_BUBBLE_THRESHOLD: f32 = 0.25;
+const SYNTHETIC_BUBBLE_THRESHOLD: f32 = 0.25;
 
 // ---------------------------------------------------------------------------
 // Deterministic PRNG (SplitMix64)
@@ -832,9 +834,8 @@ fn generate_corrupted_proposals(page: &GtPage, seed: u64, stress_multiplier: f32
 
         // Leaking RF-DETR mask into a nearby text box (different bubble or free text)
         let mut rmask = text.mask.clone();
-        if rng.chance((0.16 * stress_multiplier).min(0.45)) {
-            // Find nearest other text
-            if let Some(neighbor) = page
+        if rng.chance((0.16 * stress_multiplier).min(0.45))
+            && let Some(neighbor) = page
                 .texts
                 .iter()
                 .enumerate()
@@ -843,18 +844,15 @@ fn generate_corrupted_proposals(page: &GtPage, seed: u64, stress_multiplier: f32
                     box_distance(text.bbox, a.bbox).total_cmp(&box_distance(text.bbox, b.bbox))
                 })
                 .map(|(_, n)| n)
-            {
-                if box_distance(text.bbox, neighbor.bbox) < 80.0 {
-                    let leaked = mask_union_with_rect(&rmask, neighbor.bbox);
-                    rmask = Arc::new(leaked);
-                    // Also occasionally graze the neighbor box with rbox
-                    if rng.chance(0.40) {
-                        rbox[0] = rbox[0]
-                            .min(neighbor.bbox[0] + (neighbor.bbox[2] - neighbor.bbox[0]) * 0.85);
-                        rbox[2] = rbox[2]
-                            .max(neighbor.bbox[0] + (neighbor.bbox[2] - neighbor.bbox[0]) * 0.15);
-                    }
-                }
+            && box_distance(text.bbox, neighbor.bbox) < 80.0
+        {
+            rmask = Arc::new(mask_union_with_rect(&rmask, neighbor.bbox));
+            // Also occasionally graze the neighbor box with rbox
+            if rng.chance(0.40) {
+                rbox[0] =
+                    rbox[0].min(neighbor.bbox[0] + (neighbor.bbox[2] - neighbor.bbox[0]) * 0.85);
+                rbox[2] =
+                    rbox[2].max(neighbor.bbox[0] + (neighbor.bbox[2] - neighbor.bbox[0]) * 0.15);
             }
         }
 
@@ -1167,12 +1165,13 @@ fn greedy_match(
 fn evaluate_page(
     page: &GtPage,
     corrupted: &CorruptedPage,
+    bubble_threshold: f32,
     config: &DetectionFusionConfig,
 ) -> Scorecard {
     let fused = fuse_detections(
         corrupted.layout.clone(),
         &corrupted.comic,
-        DEFAULT_BUBBLE_THRESHOLD,
+        bubble_threshold,
         config,
     );
 
@@ -1339,12 +1338,13 @@ fn evaluate_page(
 fn evaluate_suite(
     pages: &[GtPage],
     corrupted: &[CorruptedPage],
+    bubble_threshold: f32,
     config: &DetectionFusionConfig,
 ) -> Scorecard {
     pages
         .par_iter()
         .zip(corrupted.par_iter())
-        .map(|(p, c)| evaluate_page(p, c, config))
+        .map(|(p, c)| evaluate_page(p, c, bubble_threshold, config))
         .reduce(Scorecard::default, |mut acc, item| {
             acc.merge(&item);
             acc
@@ -1655,6 +1655,11 @@ struct HardGtEntry {
     ignore: Vec<usize>,
 }
 
+struct HardPageAnnotations {
+    ground_truth: HashMap<String, HardGtEntry>,
+    candidates: HashMap<String, Vec<[f32; 4]>>,
+}
+
 #[derive(Default, Clone, Debug)]
 struct RawSummaryStats {
     bubbles: usize,
@@ -1681,8 +1686,9 @@ impl RawSummaryStats {
 
 fn evaluate_raw_summary(
     raw_pages: &[LoadedRawPage],
+    bubble_threshold: f32,
     config: &DetectionFusionConfig,
-    hard_gt: Option<&(HashMap<String, HardGtEntry>, HashMap<String, Vec<[f32; 4]>>)>,
+    hard_gt: Option<&HardPageAnnotations>,
 ) -> RawSummaryStats {
     let mut stats = RawSummaryStats::default();
 
@@ -1690,7 +1696,7 @@ fn evaluate_raw_summary(
         let fused = fuse_detections(
             page.corrupted.layout.clone(),
             &page.corrupted.comic,
-            DEFAULT_BUBBLE_THRESHOLD,
+            bubble_threshold,
             config,
         );
         let mut det_to_bubble: HashMap<usize, Option<usize>> = HashMap::new();
@@ -1734,42 +1740,41 @@ fn evaluate_raw_summary(
             stats.hi_res_free_texts += page_free;
         }
 
-        if let Some((gt_map, cand_map)) = hard_gt {
-            if let (Some(entry), Some(cands)) =
-                (gt_map.get(&page.file_name), cand_map.get(&page.file_name))
-            {
-                let groups: Vec<Vec<[f32; 4]>> = entry
-                    .gt
+        if let Some(annotations) = hard_gt
+            && let Some(entry) = annotations.ground_truth.get(&page.file_name)
+            && let Some(cands) = annotations.candidates.get(&page.file_name)
+        {
+            let groups: Vec<Vec<[f32; 4]>> = entry
+                .gt
+                .iter()
+                .map(|grp| {
+                    grp.iter()
+                        .filter_map(|&idx| cands.get(idx).copied())
+                        .collect()
+                })
+                .collect();
+            let ign: Vec<[f32; 4]> = entry
+                .ignore
+                .iter()
+                .filter_map(|&idx| cands.get(idx).copied())
+                .collect();
+            let mut hit = vec![false; groups.len()];
+            for &b in &page_bubbles {
+                let matched: Vec<usize> = groups
                     .iter()
-                    .map(|grp| {
-                        grp.iter()
-                            .filter_map(|&idx| cands.get(idx).copied())
-                            .collect()
-                    })
+                    .enumerate()
+                    .filter_map(|(k, grp)| grp.iter().any(|&c| iou(b, c) >= 0.5).then_some(k))
                     .collect();
-                let ign: Vec<[f32; 4]> = entry
-                    .ignore
-                    .iter()
-                    .filter_map(|&idx| cands.get(idx).copied())
-                    .collect();
-                let mut hit = vec![false; groups.len()];
-                for &b in &page_bubbles {
-                    let matched: Vec<usize> = groups
-                        .iter()
-                        .enumerate()
-                        .filter_map(|(k, grp)| grp.iter().any(|&c| iou(b, c) >= 0.5).then_some(k))
-                        .collect();
-                    if !matched.is_empty() {
-                        for k in matched {
-                            hit[k] = true;
-                        }
-                    } else if !ign.iter().any(|&c| iou(b, c) >= 0.5) {
-                        stats.hard_gt_fp += 1;
+                if !matched.is_empty() {
+                    for k in matched {
+                        hit[k] = true;
                     }
+                } else if !ign.iter().any(|&c| iou(b, c) >= 0.5) {
+                    stats.hard_gt_fp += 1;
                 }
-                stats.hard_gt_total += groups.len();
-                stats.hard_gt_tp += hit.into_iter().filter(|&h| h).count();
             }
+            stats.hard_gt_total += groups.len();
+            stats.hard_gt_tp += hit.into_iter().filter(|&h| h).count();
         }
     }
 
@@ -1780,8 +1785,8 @@ fn real_dump_candidates() -> Vec<(String, DetectionFusionConfig)> {
     let base = DetectionFusionConfig::legacy();
     let prod = DetectionFusionConfig::default();
     let mut list = vec![
-        ("baseline (origin/master)".to_owned(), base.clone()),
-        ("default (5 pure logic fixes)".to_owned(), prod.clone()),
+        ("legacy fusion config".to_owned(), base.clone()),
+        ("default fusion config".to_owned(), prod.clone()),
     ];
 
     for fb in [0.65f32, 0.75, 0.85] {
@@ -1837,6 +1842,7 @@ fn run_raw_dumps_mode(
     coco_path: Option<&Path>,
     hard_gt_path: Option<&Path>,
     hard_cand_path: Option<&Path>,
+    bubble_threshold: f32,
     max_pages: Option<usize>,
 ) -> Result<()> {
     let t0 = Instant::now();
@@ -1848,6 +1854,9 @@ fn run_raw_dumps_mode(
         t0.elapsed().as_secs_f64()
     );
 
+    println!(
+        "Proposal-level fusion without source-image glyph refitting (bubble cutoff {bubble_threshold:.3})"
+    );
     let candidates = real_dump_candidates();
 
     if let Some(coco_path) = coco_path {
@@ -1886,7 +1895,7 @@ fn run_raw_dumps_mode(
         let mut results: Vec<(String, DetectionFusionConfig, Scorecard)> =
             Vec::with_capacity(candidates.len());
         for (name, cfg) in candidates {
-            let sc = evaluate_suite(&matched_gt, &matched_corrupted, &cfg);
+            let sc = evaluate_suite(&matched_gt, &matched_corrupted, bubble_threshold, &cfg);
             print_row(&name, &sc);
             results.push((name, cfg, sc));
         }
@@ -1918,15 +1927,12 @@ fn run_raw_dumps_mode(
         }
     } else {
         let hard_gt = match (hard_gt_path, hard_cand_path) {
-            (Some(gt_p), Some(cand_p)) => {
-                let gt_map: HashMap<String, HardGtEntry> =
-                    serde_json::from_reader(BufReader::new(File::open(gt_p)?))
-                        .with_context(|| format!("failed to parse {}", gt_p.display()))?;
-                let cand_map: HashMap<String, Vec<[f32; 4]>> =
-                    serde_json::from_reader(BufReader::new(File::open(cand_p)?))
-                        .with_context(|| format!("failed to parse {}", cand_p.display()))?;
-                Some((gt_map, cand_map))
-            }
+            (Some(gt_p), Some(cand_p)) => Some(HardPageAnnotations {
+                ground_truth: serde_json::from_reader(BufReader::new(File::open(gt_p)?))
+                    .with_context(|| format!("failed to parse {}", gt_p.display()))?,
+                candidates: serde_json::from_reader(BufReader::new(File::open(cand_p)?))
+                    .with_context(|| format!("failed to parse {}", cand_p.display()))?,
+            }),
             _ => None,
         };
 
@@ -1949,7 +1955,7 @@ fn run_raw_dumps_mode(
         );
         println!("{}", "-".repeat(120));
         for (name, cfg) in candidates {
-            let st = evaluate_raw_summary(&raw_pages, &cfg, hard_gt.as_ref());
+            let st = evaluate_raw_summary(&raw_pages, bubble_threshold, &cfg, hard_gt.as_ref());
             let hires = format!(
                 "{}/{}/{}",
                 st.hi_res_bubbles, st.hi_res_texts, st.hi_res_free_texts
@@ -1996,6 +2002,7 @@ fn main() -> Result<()> {
     let mut hard_gt_path: Option<PathBuf> = None;
     let mut hard_cand_path: Option<PathBuf> = None;
     let mut summary_only = false;
+    let mut bubble_threshold = None;
     let mut seed: u64 = 20261127;
     let mut max_pages: Option<usize> = None;
 
@@ -2026,6 +2033,19 @@ fn main() -> Result<()> {
                 hard_cand_path = Some(PathBuf::from(&args[i + 1]));
                 i += 2;
             }
+            "--bubble-threshold" => {
+                let threshold = args
+                    .get(i + 1)
+                    .context("missing --bubble-threshold value")?
+                    .parse()
+                    .context("invalid --bubble-threshold")?;
+                anyhow::ensure!(
+                    (0.0..=1.0).contains(&threshold),
+                    "--bubble-threshold must be between zero and one"
+                );
+                bubble_threshold = Some(threshold);
+                i += 2;
+            }
             "--summary-only" => {
                 summary_only = true;
                 i += 1;
@@ -2053,10 +2073,12 @@ fn main() -> Result<()> {
             gt_coco,
             hard_gt_path.as_deref(),
             hard_cand_path.as_deref(),
+            bubble_threshold.unwrap_or(ComicTextBubbleDetector::RECOMMENDED_BUBBLE_THRESHOLD),
             max_pages,
         );
     }
 
+    let bubble_threshold = bubble_threshold.unwrap_or(SYNTHETIC_BUBBLE_THRESHOLD);
     let t0 = Instant::now();
     println!("Loading validation split from {} ...", val_path.display());
     let val_real = load_coco_split(&val_path, max_pages)?;
@@ -2087,14 +2109,14 @@ fn main() -> Result<()> {
 
     let candidates = candidate_configs();
     println!(
-        "\n=== VALIDATION + SYNTHETIC ADVERSARIAL SWEEP ({} configs) ===",
+        "\n=== VALIDATION + SYNTHETIC ADVERSARIAL SWEEP ({} configs, bubble cutoff {bubble_threshold:.3}) ===",
         candidates.len()
     );
     let t_sweep = Instant::now();
     let mut results: Vec<(String, DetectionFusionConfig, Scorecard)> =
         Vec::with_capacity(candidates.len());
     for (name, cfg) in candidates {
-        let sc = evaluate_suite(&val_pages, &val_corrupted, &cfg);
+        let sc = evaluate_suite(&val_pages, &val_corrupted, bubble_threshold, &cfg);
         results.push((name, cfg, sc));
     }
     println!(
@@ -2172,18 +2194,28 @@ fn main() -> Result<()> {
         .map(|p| generate_corrupted_proposals(p, seed, 2.0))
         .collect();
     println!(
-        "\n=== SYNTHETIC ADVERSARIAL STRESS SUITE ONLY ({} layouts) ===",
+        "\n=== SYNTHETIC ADVERSARIAL STRESS SUITE ONLY ({} layouts, bubble cutoff {bubble_threshold:.3}) ===",
         synth_pages.len()
     );
     print_header();
     print_row(
         "baseline (synth)",
-        &evaluate_suite(&synth_pages, &synth_corrupted, &results[0].1),
+        &evaluate_suite(
+            &synth_pages,
+            &synth_corrupted,
+            bubble_threshold,
+            &results[0].1,
+        ),
     );
     if best_idx != 0 {
         print_row(
             &format!("best ({})", results[best_idx].0),
-            &evaluate_suite(&synth_pages, &synth_corrupted, &results[best_idx].1),
+            &evaluate_suite(
+                &synth_pages,
+                &synth_corrupted,
+                bubble_threshold,
+                &results[best_idx].1,
+            ),
         );
     }
 
@@ -2232,7 +2264,12 @@ fn main() -> Result<()> {
             }
         }
         for idx in eval_order {
-            let sc = evaluate_suite(&test_pages, &test_corrupted, &results[idx].1);
+            let sc = evaluate_suite(
+                &test_pages,
+                &test_corrupted,
+                bubble_threshold,
+                &results[idx].1,
+            );
             print_row(&results[idx].0, &sc);
         }
     }

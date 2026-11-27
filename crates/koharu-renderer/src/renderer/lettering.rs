@@ -1255,6 +1255,140 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn source_punctuation_uses_its_run_extent_or_the_page_minimum() -> anyhow::Result<()> {
+        use TextDirection::{Horizontal, Vertical};
+        use koharu_scene::{Generation, ProducerId};
+
+        let mut session = Session::memory().await?;
+        let mut edit = session.snapshot().edit();
+        let page = edit.add_page(PageDraft::new("sheet", 3240.0, 3240.0), At::End)?;
+        let snapshot = session.commit(edit.finish()?).await?.snapshot;
+        let generation = Generation::new(ProducerId::new("dev.koharu.test")?);
+        let mut edit = snapshot.edit_as(generation);
+        let mut expected = Vec::new();
+        let mut user_sized_layer = None;
+        for (index, (source, direction, width, height, measured, em, user_size)) in [
+            ("…", Vertical, 3.0, 26.0, 3.0, 26.0, false),
+            ("……", Vertical, 4.0, 48.0, 4.0, 24.0, false),
+            ("・・・", Vertical, 5.0, 66.0, 5.0, 22.0, false),
+            ("・", Vertical, 5.0, 5.0, 5.0, 18.0, false),
+            ("...", Horizontal, 18.0, 3.0, 3.0, 24.0, false),
+            ("…！", Vertical, 8.0, 60.0, 8.0, 30.0, false),
+            ("！", Vertical, 65.0, 130.0, 65.0, 65.0, false),
+            ("!", Vertical, 65.0, 130.0, 65.0, 65.0, false),
+            ("!!\n!!", Horizontal, 60.0, 100.0, 50.0, 50.0, false),
+            ("待って…", Vertical, 24.0, 100.0, 22.0, 22.0, false),
+            ("Hey!", Horizontal, 92.0, 34.0, 28.0, 28.0, false),
+            ("小声", Vertical, 8.0, 16.0, 6.0, 6.0, false),
+            ("……", Vertical, 4.0, 48.0, 4.0, 4.0, true),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let x = 12.0 + 150.0 * index as f64;
+            let (layer, content) = text_layer(
+                &mut edit,
+                page,
+                "Ah",
+                measured,
+                false,
+                Geometry::rectangle(x, 12.0, 130.0, 110.0),
+                true,
+            )?;
+            edit.set(
+                content,
+                &SourceText {
+                    text: Authored::user(source.into()),
+                    language: None,
+                },
+            )?;
+            let region = edit.add_analysis_region::<TextRegion>(
+                page,
+                At::End,
+                &Geometry::rectangle(x + 15.0, 27.0, width, height),
+                None,
+            )?;
+            edit.set(
+                region,
+                &OcrAnalysis {
+                    origin: Origin::User,
+                    direction,
+                    confidence: None,
+                    line_boundaries: Vec::new(),
+                },
+            )?;
+            edit.relate::<RecognizedFrom>(content, region)?;
+            if user_size {
+                user_sized_layer = Some(layer);
+            }
+            expected.push((layer, source, em));
+        }
+        let snapshot = session.commit(edit.finish()?).await?.snapshot;
+        let user_sized_layer = user_sized_layer.unwrap();
+        let mut edit = snapshot.edit();
+        edit.set(
+            user_sized_layer,
+            &snapshot.component::<Typography>(user_sized_layer)?.unwrap(),
+        )?;
+        let snapshot = session.commit(edit.finish()?).await?.snapshot;
+        let frame = renderer().render(&snapshot, page).await?;
+        for (layer, source, em) in expected {
+            let prepared = frame.layer(layer).unwrap();
+            let NodeDescriptor::Text(text) = &prepared.0.node.descriptor else {
+                panic!("expected text layer");
+            };
+            assert_eq!(text.source_font_size, Some(em), "{source}");
+            assert!(
+                (metadata(&frame, layer).font_size - em).abs() < 0.001,
+                "{source}"
+            );
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn padded_vertical_ellipsis_recovers_its_source_em() {
+        let bounds = LayoutBox {
+            x: 0.0,
+            y: 0.0,
+            width: 17.0,
+            height: 33.0,
+        };
+        let page_minimum = readable_font_size(1800, 3240);
+
+        assert_eq!(
+            punctuation_source_em(
+                "…",
+                bounds,
+                TextDirection::Vertical,
+                page_minimum,
+                Some(5.0)
+            ),
+            Some(33.0)
+        );
+    }
+
+    #[test]
+    fn punctuation_advance_uses_the_longest_line_in_each_direction() {
+        for (source, direction, width, height, em) in [
+            ("!?\n!", TextDirection::Vertical, 65.0, 130.0, 65.0),
+            ("!!\n!!", TextDirection::Horizontal, 60.0, 100.0, 60.0),
+        ] {
+            let bounds = LayoutBox {
+                x: 0.0,
+                y: 0.0,
+                width,
+                height,
+            };
+            assert_eq!(
+                punctuation_source_em(source, bounds, direction, 18.0, None),
+                Some(em)
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn a_free_sound_uses_only_the_extra_room_its_measured_source_em_needs()
     -> anyhow::Result<()> {
         let mut session = Session::memory().await?;
