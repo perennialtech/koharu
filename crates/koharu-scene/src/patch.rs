@@ -3,7 +3,8 @@ use std::sync::Arc;
 use revision::revisioned;
 
 use crate::{
-    BlobId, ComponentOwner, EntityId, Error, ProjectId, Relation, RelationId, Result, Snapshot,
+    BlobId, ComponentOwner, EntityId, Error, ProjectId, Relation, RelationId, RelationKind, Result,
+    Snapshot,
     component::{ComponentKey, StoredComponent},
     state::{State, StoredComponentEntry, load_components, store_components},
 };
@@ -345,10 +346,21 @@ pub(crate) enum Observation {
         key: ComponentKey,
         fingerprint: Option<[u8; 32]>,
     },
+    PageEntitiesWith {
+        page: EntityId,
+        key: ComponentKey,
+        entities: Vec<EntityId>,
+    },
+    RelationSources {
+        target: EntityId,
+        kind: RelationKind,
+        sources: Vec<EntityId>,
+    },
 }
 
 impl Observation {
-    fn validate(&self, state: &State) -> Result<()> {
+    fn validate(&self, snapshot: &Snapshot) -> Result<()> {
+        let state = &snapshot.state;
         match self {
             Self::ProjectHierarchy { epoch } => {
                 if state.page_order_epoch != *epoch {
@@ -368,6 +380,39 @@ impl Observation {
                 if !state.contains_entity(*parent) || state.child_ids(*parent)? != *children {
                     return Err(Error::PatchConflict(format!(
                         "children of entity {parent} changed"
+                    )));
+                }
+            }
+            Self::PageEntitiesWith {
+                page,
+                key,
+                entities,
+            } => {
+                if state
+                    .pages
+                    .get(page)
+                    .is_none_or(|page| page.entities_with(key) != *entities)
+                {
+                    return Err(Error::PatchConflict(format!(
+                        "entities with component {} changed on page {page}",
+                        key.kind
+                    )));
+                }
+            }
+            Self::RelationSources {
+                target,
+                kind,
+                sources,
+            } => {
+                if !state.contains_entity(*target)
+                    || snapshot
+                        .relations_to(*target, Some(kind))
+                        .map(|relation| relation.value().source)
+                        .ne(sources.iter().copied())
+                {
+                    return Err(Error::PatchConflict(format!(
+                        "sources of {} relations to {target} changed",
+                        kind.as_str()
                     )));
                 }
             }
@@ -483,7 +528,7 @@ impl Patch {
             return Ok(self.clone());
         }
         for observation in self.observations.iter() {
-            observation.validate(&snapshot.state)?;
+            observation.validate(snapshot)?;
         }
         let mut state = (*snapshot.state).clone();
         for operation in self.operations.iter() {

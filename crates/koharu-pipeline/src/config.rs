@@ -20,7 +20,7 @@ pub struct PipelineConfig {
 #[serde(default)]
 struct PipelineFile {
     detection: ModelSelection,
-    ocr: ModelSelection,
+    ocr: OcrModel,
     translation: TranslationConfig,
     inpainting: ModelSelection,
     #[serde(default)]
@@ -33,9 +33,7 @@ impl Default for PipelineFile {
             detection: ModelSelection {
                 model: "koharu-layout-rfdetr-seg-2xl".to_owned(),
             },
-            ocr: ModelSelection {
-                model: "paddleocr-vl-1.6".to_owned(),
-            },
+            ocr: OcrModel::HayaiOcr,
             translation: TranslationConfig::default(),
             inpainting: ModelSelection {
                 model: "lama".to_owned(),
@@ -59,9 +57,6 @@ impl Serialize for PipelineConfig {
         let detection = match &self.detection {
             DetectionModel::KoharuLayoutRFDetrSeg2XL(_) => "koharu-layout-rfdetr-seg-2xl",
         };
-        let ocr = match &self.ocr {
-            OcrModel::PaddleOcrVl1_6 => "paddleocr-vl-1.6",
-        };
         let inpainting = match &self.inpainting {
             InpaintingModel::LaMa {} => "lama",
         };
@@ -74,9 +69,7 @@ impl Serialize for PipelineConfig {
             detection: ModelSelection {
                 model: detection.to_owned(),
             },
-            ocr: ModelSelection {
-                model: ocr.to_owned(),
-            },
+            ocr: self.ocr.clone(),
             translation: self.translation.clone(),
             inpainting: ModelSelection {
                 model: inpainting.to_owned(),
@@ -106,14 +99,6 @@ impl<'de> Deserialize<'de> for PipelineConfig {
                 )));
             }
         };
-        let ocr = match file.ocr.model.as_str() {
-            "paddleocr-vl-1.6" => OcrModel::PaddleOcrVl1_6,
-            model => {
-                return Err(serde::de::Error::custom(format!(
-                    "unsupported OCR model {model}"
-                )));
-            }
-        };
         let inpainting = match file.inpainting.model.as_str() {
             "lama" => InpaintingModel::LaMa {},
             model => {
@@ -124,7 +109,7 @@ impl<'de> Deserialize<'de> for PipelineConfig {
         };
         Ok(Self {
             detection,
-            ocr,
+            ocr: file.ocr,
             translation: file.translation,
             inpainting,
             processor: file.processor,
@@ -138,7 +123,7 @@ impl Default for PipelineConfig {
             detection: DetectionModel::KoharuLayoutRFDetrSeg2XL(
                 KoharuLayoutRFDetrSeg2XLConfig::default(),
             ),
-            ocr: OcrModel::PaddleOcrVl1_6,
+            ocr: OcrModel::HayaiOcr,
             translation: TranslationConfig::default(),
             inpainting: InpaintingModel::LaMa {},
             processor: ProcessorConfig::default(),
@@ -213,8 +198,8 @@ pub enum DetectionModel {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Type)]
 #[serde(tag = "model")]
 pub enum OcrModel {
-    #[serde(rename = "paddleocr-vl-1.6")]
-    PaddleOcrVl1_6,
+    #[serde(rename = "hayai-ocr")]
+    HayaiOcr,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Type)]
@@ -236,7 +221,7 @@ mod tests {
             config.detection,
             DetectionModel::KoharuLayoutRFDetrSeg2XL(_)
         ));
-        assert!(matches!(config.ocr, OcrModel::PaddleOcrVl1_6));
+        assert!(matches!(config.ocr, OcrModel::HayaiOcr));
         assert!(matches!(config.inpainting, InpaintingModel::LaMa {}));
     }
 
@@ -248,7 +233,7 @@ mod tests {
                 model = "koharu-layout-rfdetr-seg-2xl"
 
                 [ocr]
-                model = "paddleocr-vl-1.6"
+                model = "hayai-ocr"
 
                 [inpainting]
                 model = "lama"
@@ -260,7 +245,7 @@ mod tests {
             config.detection,
             DetectionModel::KoharuLayoutRFDetrSeg2XL(_)
         ));
-        assert!(matches!(config.ocr, OcrModel::PaddleOcrVl1_6));
+        assert!(matches!(config.ocr, OcrModel::HayaiOcr));
         assert!(matches!(config.inpainting(), Ok(InpaintingModel::LaMa {})));
     }
 
@@ -280,7 +265,7 @@ mod tests {
                 legacy_threshold = 0.5
 
                 [ocr]
-                model = "paddleocr-vl-1.6"
+                model = "hayai-ocr"
                 legacy_language = "ja"
 
                 [inpainting]
@@ -294,7 +279,7 @@ mod tests {
             config.detection,
             DetectionModel::KoharuLayoutRFDetrSeg2XL(_)
         ));
-        assert!(matches!(config.ocr, OcrModel::PaddleOcrVl1_6));
+        assert!(matches!(config.ocr, OcrModel::HayaiOcr));
         assert!(matches!(config.inpainting(), Ok(InpaintingModel::LaMa {})));
     }
 
@@ -330,7 +315,7 @@ mod tests {
                 text_threshold: Some(0.25),
                 ..Default::default()
             }),
-            ocr: OcrModel::PaddleOcrVl1_6,
+            ocr: OcrModel::HayaiOcr,
             translation: TranslationConfig::default(),
             inpainting: InpaintingModel::LaMa {},
             processor: ProcessorConfig::default(),
@@ -338,9 +323,11 @@ mod tests {
         let document = toml::to_string(&config).unwrap();
         assert!(document.contains("[detection]\nmodel = \"koharu-layout-rfdetr-seg-2xl\""));
         assert!(document.contains("[processor.koharu-layout-rfdetr-seg-2xl]"));
+        assert!(document.contains("[ocr]\nmodel = \"hayai-ocr\""));
         assert!(document.contains("[translation]"));
 
         let restored = toml::from_str::<PipelineConfig>(&document).unwrap();
+        assert_eq!(restored.ocr, config.ocr);
         assert_eq!(restored.detection().unwrap(), config.detection().unwrap());
     }
 }
