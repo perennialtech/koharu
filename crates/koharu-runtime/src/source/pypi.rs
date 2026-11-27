@@ -1,39 +1,25 @@
-use anyhow::{Context, Result};
-use serde::Deserialize;
-
-use crate::network;
-
-#[derive(Deserialize)]
-struct Metadata {
-    urls: Vec<Distribution>,
+pub(crate) struct Wheel {
+    pub(crate) project: &'static str,
+    pub(crate) version: &'static str,
+    pub(crate) platform: &'static str,
 }
 
-#[derive(Deserialize)]
-struct Distribution {
-    filename: String,
-    url: String,
-}
+impl Wheel {
+    pub(crate) fn directory(&self) -> String {
+        format!("{}--{}", self.project, self.version)
+    }
 
-pub(crate) async fn wheel(project: &str) -> Result<String> {
-    let url = format!("https://pypi.org/pypi/{project}/json");
-    let client = network::http()?;
-    let metadata: Metadata = client
-        .get(&url)
-        .send()
-        .await
-        .with_context(|| format!("failed to query {project}"))?
-        .error_for_status()?
-        .json()
-        .await
-        .with_context(|| format!("invalid PyPI metadata for {project}"))?;
-    metadata
-        .urls
-        .into_iter()
-        .find(|file| {
-            file.filename.ends_with(".whl")
-                && file.filename.contains("manylinux")
-                && file.filename.contains("x86_64")
-        })
-        .map(|file| file.url)
-        .with_context(|| format!("{project} has no compatible wheel"))
+    /// PyPI redirects this filename-based URL to the wheel's storage location.
+    pub(crate) fn url(&self) -> String {
+        let Self {
+            project,
+            version,
+            platform,
+        } = self;
+        let distribution = project.replace('-', "_");
+        let first = &project[..1];
+        format!(
+            "https://files.pythonhosted.org/packages/py3/{first}/{project}/{distribution}-{version}-py3-none-{platform}.whl"
+        )
+    }
 }

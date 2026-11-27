@@ -27,6 +27,7 @@ const CHUNK_SIZE: u64 = 64 * 1024 * 1024;
 const PROGRESS_INTERVAL: Duration = Duration::from_millis(50);
 const RETRY_MAX_DELAY: Duration = Duration::from_secs(5);
 const RETRY_MIN_DELAY: Duration = Duration::from_millis(250);
+const MAX_RETRY_AFTER: Duration = Duration::from_secs(120);
 const WRITE_BUFFER_SIZE: usize = 256 * 1024;
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
@@ -161,28 +162,52 @@ pub(crate) async fn fetch(url: &str, destination: &Path) -> Result<()> {
     activity.finish(destination, result).await
 }
 
-pub(crate) async fn receive<F, S, B, E>(name: &str, destination: &Path, source: F) -> Result<()>
+/// For a retryable stream error, `retry_after` supplies the minimum delay
+/// (zero when the server did not specify one).
+pub(crate) async fn receive<F, S, B, E>(
+    name: &str,
+    destination: &Path,
+    config: network::Config,
+    open: impl Fn() -> F,
+    retry_after: impl Fn(&E) -> Option<Duration>,
+) -> Result<()>
 where
-    F: Future<Output = Result<(Option<u64>, S)>>,
-    S: futures::Stream<Item = std::result::Result<B, E>> + Unpin,
+    F: Future<Output = Result<(Option<u64>, S), E>>,
+    S: futures::Stream<Item = Result<B, E>> + Unpin,
     B: AsRef<[u8]>,
     E: std::error::Error + Send + Sync + 'static,
 {
-    let read_timeout = Duration::from_secs(network::config()?.read_timeout.max(1));
+    let read_timeout = Duration::from_secs(config.read_timeout.max(1));
     let activity = Activity::start(name.to_owned());
-    let result = async {
-        let (total, stream) = source.await?;
-        write_stream(
-            &activity,
-            destination,
-            total.unwrap_or(0),
-            read_timeout,
-            stream,
-        )
-        .await
-    }
+    let result = (|| async {
+        let file = tokio::fs::File::create(destination).await?;
+        let (total, stream) = tokio::time::timeout(read_timeout, open())
+            .await
+            .context("opening download stream timed out")??;
+        let total = total.unwrap_or(0);
+        activity.progress(0, total);
+        write_stream(&activity, file, total, read_timeout, stream).await
+    })
+    .retry(backoff(config.max_retries as usize))
+    .adjust(|error, backoff| {
+        let backoff = backoff?;
+        if error.is::<tokio::time::error::Elapsed>()
+            || error
+                .downcast_ref::<LengthMismatch>()
+                .is_some_and(|length| length.completed < length.total)
+        {
+            return Some(backoff);
+        }
+        let minimum = retry_after(error.downcast_ref::<E>()?)?;
+        Some(stream_retry_delay(backoff, minimum))
+    })
+    .notify(|error, delay| tracing::warn!(?delay, %error, "restarting {name}"))
     .await;
     activity.finish(destination, result).await
+}
+
+fn stream_retry_delay(backoff: Duration, retry_after: Duration) -> Duration {
+    backoff.max(retry_after).min(MAX_RETRY_AFTER)
 }
 
 async fn fetch_http(
@@ -266,7 +291,7 @@ async fn fetch_stream(
     let total = response.content_length().unwrap_or(0);
     write_stream(
         activity,
-        destination,
+        tokio::fs::File::create(destination).await?,
         total,
         read_timeout,
         response.bytes_stream(),
@@ -372,7 +397,7 @@ async fn fetch_range(
 
 async fn write_stream<S, B, E>(
     activity: &Activity,
-    destination: &Path,
+    file: tokio::fs::File,
     total: u64,
     read_timeout: Duration,
     mut body: S,
@@ -382,37 +407,53 @@ where
     B: AsRef<[u8]>,
     E: std::error::Error + Send + Sync + 'static,
 {
-    let mut output = BufWriter::with_capacity(
-        WRITE_BUFFER_SIZE,
-        tokio::fs::File::create(destination).await?,
-    );
+    let mut output = BufWriter::with_capacity(WRITE_BUFFER_SIZE, file);
     let mut completed = 0;
     let mut reported = 0;
     let mut last_report = Instant::now();
-    while let Some(bytes) = tokio::time::timeout(read_timeout, body.next())
-        .await
-        .context("download read timed out")?
-    {
-        let bytes = bytes?;
-        output.write_all(bytes.as_ref()).await?;
-        completed += bytes.as_ref().len() as u64;
-        if last_report.elapsed() >= PROGRESS_INTERVAL {
-            activity.progress(completed, total);
-            reported = completed;
-            last_report = Instant::now();
+    let transfer = async {
+        while let Some(bytes) = tokio::time::timeout(read_timeout, body.next())
+            .await
+            .context("download read timed out")?
+        {
+            let bytes = bytes?;
+            output.write_all(bytes.as_ref()).await?;
+            completed += bytes.as_ref().len() as u64;
+            if last_report.elapsed() >= PROGRESS_INTERVAL {
+                activity.progress(completed, total);
+                reported = completed;
+                last_report = Instant::now();
+            }
         }
+        Ok::<_, anyhow::Error>(())
     }
+    .await;
+    // A Tokio file may still have a blocking write in flight when the body fails.
     output.flush().await?;
+    transfer?;
     if reported != completed {
         activity.progress(completed, total);
     }
-    if total > 0 {
-        ensure!(
-            completed == total,
-            "download ended after {completed} of {total} bytes"
-        );
+    if total > 0 && completed != total {
+        return Err(anyhow::Error::msg(LengthMismatch { completed, total }));
     }
     Ok(())
+}
+
+#[derive(Debug)]
+struct LengthMismatch {
+    completed: u64,
+    total: u64,
+}
+
+impl std::fmt::Display for LengthMismatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "download ended after {} of {} bytes",
+            self.completed, self.total
+        )
+    }
 }
 
 fn backoff(max_retries: usize) -> ExponentialBuilder {
@@ -437,4 +478,24 @@ fn retryable(error: &anyhow::Error) -> bool {
         .find_map(|cause| cause.downcast_ref::<reqwest::Error>())
         .map(|error| error.is_body() || error.is_decode())
         .unwrap_or(true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stream_retries_honor_the_server_delay_up_to_two_minutes() {
+        let backoff = Duration::from_millis(250);
+        for (server_seconds, expected) in [
+            (0, backoff),
+            (60, Duration::from_secs(60)),
+            (3600, Duration::from_secs(120)),
+        ] {
+            assert_eq!(
+                stream_retry_delay(backoff, Duration::from_secs(server_seconds)),
+                expected
+            );
+        }
+    }
 }
