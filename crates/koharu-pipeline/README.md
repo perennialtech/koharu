@@ -200,3 +200,19 @@ cargo test -p koharu-pipeline --all-targets
 cargo clippy -p koharu-pipeline --all-targets --no-deps -- -D warnings
 cargo bench --profile dev -p koharu-ml --bench pipeline_overlap
 ```
+
+### Detection post-processing replay (`examples/detection_fuzz.rs`)
+
+`examples/detection_fuzz.rs` replays detection post-processing and fusion configs on CPU against either COCO annotations or pre-computed raw detector dumps (`--raw-dumps`), without re-running GPU detector inference:
+
+```bash
+# Score against COCO ground truth using pre-computed raw detector dumps
+cargo run --release --example detection_fuzz -p koharu-pipeline -- \
+  --raw-dumps /path/to/validation.raw.jsonl.gz \
+  --coco /path/to/validation.coco.json
+
+# Summary-only sweep on raw detector dumps without COCO annotations
+cargo run --release --example detection_fuzz -p koharu-pipeline -- \
+  --raw-dumps /path/to/hard_pages.raw.jsonl.gz \
+  --summary-only
+```
