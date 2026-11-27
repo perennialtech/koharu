@@ -13,7 +13,7 @@ use crate::{
     Error, FontStyle, HyphenationPolicy, LayoutRun, RenderBounds, RenderDiagnostic,
     Result as RenderResult, TextAlign, TextLayout, WritingMode,
     bubble::LayoutBox,
-    fonts::{Fonts, font_key},
+    fonts::{Font, Fonts, font_key},
     layout::largest_fitting_font_size,
     script::is_chinese_or_japanese_text,
 };
@@ -47,7 +47,39 @@ pub(crate) struct TextNodeDescriptor {
     pub(crate) letter_spacing: f32,
     pub(crate) word_spacing: f32,
     pub(crate) text_inset: [f32; 4],
+    pub(crate) setting: TextSetting,
     pub(crate) point_text: bool,
+}
+
+/// All page-dependent choices that affect a retained glyph node.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct TextSetting {
+    pub(crate) size: Option<f32>,
+    pub(crate) exact: bool,
+    pub(crate) margin: f32,
+    pub(crate) breaking: HyphenationPolicy,
+    pub(crate) room: Option<LayoutBox>,
+    pub(crate) wrap_width: Option<f32>,
+}
+
+impl Default for TextSetting {
+    fn default() -> Self {
+        Self {
+            size: None,
+            exact: false,
+            margin: 1.0,
+            breaking: HyphenationPolicy::LastResort,
+            room: None,
+            wrap_width: None,
+        }
+    }
+}
+
+pub(crate) struct PositionedText<'a> {
+    pub(crate) run: LayoutRun<'a>,
+    pub(crate) bounds: LayoutBox,
+    pub(crate) x: f32,
+    pub(crate) y: f32,
 }
 
 pub(crate) struct RenderedTextNode {
@@ -157,150 +189,22 @@ impl TextRenderer {
         descriptor: &TextNodeDescriptor,
         fonts: &Fonts,
     ) -> RenderResult<RenderedTextNode> {
-        let is_bubble_text = descriptor.balloon_contour.is_some();
-        let frame = LayoutBox {
-            x: 0.0,
-            y: 0.0,
-            width: descriptor.width,
-            height: descriptor.height,
-        };
-        // Free text has no balloon to keep its outline off neighbouring
-        // artwork and text, so the outline stays inside the frame.
-        let bounds = if is_bubble_text {
-            inset(frame, descriptor.text_inset)
-        } else {
-            let outline = descriptor.stroke.map_or(0.0, |stroke| stroke.width_px);
-            inset(
-                frame,
-                [outline.min(frame.width.min(frame.height) * 0.25); 4],
-            )
-        };
-        if bounds.width <= 0.0 || bounds.height <= 0.0 {
-            return Err(Error::invalid(format!(
-                "text inset leaves no layout area for entity {}",
-                descriptor.entity
-            )));
-        }
-        let fonts = fonts
-            .resolve(
-                descriptor.preferred_font.as_deref(),
-                descriptor.font_weight,
-                descriptor.font_style,
-                &descriptor.font_families,
-                &descriptor.text,
-                descriptor
-                    .language
-                    .as_ref()
-                    .map(koharu_scene::LanguageTag::as_str),
-            )
-            .map_err(|source| Error::Font {
-                entity: descriptor.entity,
-                source,
-            })?;
-        let automatic_maximum = || automatic_maximum(descriptor, bounds, is_bubble_text);
-        let maximum = if descriptor.auto_fit {
-            automatic_maximum()
-        } else {
-            descriptor.font_size.unwrap_or_else(automatic_maximum)
-        };
-        let minimum = descriptor.minimum_font_size.min(maximum);
-        let mut layout = TextLayout::new(&fonts[0])
-            .with_fallback_fonts(&fonts[1..])
-            .with_writing_mode(descriptor.writing_mode)
-            .with_alignment(descriptor.alignment)
-            .with_hyphenation_policy(HyphenationPolicy::LastResort)
-            .with_line_height(descriptor.line_height)
-            .with_spacing(descriptor.letter_spacing, descriptor.word_spacing)
-            .with_cjk_punctuation_layout(
-                is_chinese_or_japanese_text(&descriptor.text)
-                    || descriptor
-                        .language
-                        .as_ref()
-                        .is_some_and(|language| is_chinese_or_japanese_language(language.as_str())),
-            );
-        if !descriptor.point_text {
-            layout = layout
-                .with_max_width(bounds.width)
-                .with_max_height(bounds.height);
-        }
-        if let Some(contour) = &descriptor.balloon_contour {
-            let [top, _, _, left] = descriptor.text_inset;
-            let contour = contour.iter().map(|&(x, y)| (x - left, y - top)).collect();
-            layout = layout.with_comic_balloon(
-                bounds.width,
-                bounds.height,
-                contour,
-                descriptor.text_inset.into_iter().fold(0.0, f32::max),
-            );
-        }
-        if let Some(language) = &descriptor.language {
-            layout = layout.with_hyphenation_language_tag(language.as_str());
-        }
-        let layout = if descriptor.auto_fit && !descriptor.point_text {
-            layout
-                .with_max_font_size(maximum)
-                .with_min_font_size(minimum)
-        } else {
-            layout.with_font_size(descriptor.font_size.unwrap_or(maximum))
-        };
-        let fit = || -> Result<_> {
-            if !descriptor.auto_fit || descriptor.point_text {
-                return self.layout(&layout, &descriptor.text);
-            }
-            if let Some(area) = descriptor.source_area.filter(|_| !is_bubble_text)
-                && let Some(run) = self.budgeted_layout(
-                    &layout,
-                    &descriptor.text,
-                    bounds,
-                    area,
-                    [minimum, maximum],
-                )?
-            {
-                return Ok(run);
-            }
-            let run = self.layout(&layout, &descriptor.text)?;
-            if !run.overflowed() {
-                return Ok(run);
-            }
-            // A below-floor setting is a final fallback. The descriptor's
-            // readable size still governs the diagnostic for the chosen run.
-            let low = if is_bubble_text { 0.5 } else { 1.0 };
-            self.layout(
-                &layout.with_max_font_size(minimum).with_min_font_size(low),
-                &descriptor.text,
-            )
-        };
-        let layout = fit().map_err(|source| Error::Layout {
-            entity: descriptor.entity,
-            source,
-        })?;
-        let (mut x, mut y) = if descriptor.point_text {
-            (bounds.x, bounds.y)
-        } else {
-            placement(bounds, layout.width, layout.height)
-        };
-        x += layout.placement_offset_x();
-        y += layout.placement_offset_y();
+        let fonts = descriptor.resolve_fonts(fonts)?;
+        let PositionedText {
+            run: layout,
+            bounds,
+            x,
+            y,
+        } = descriptor.position(&fonts, descriptor.setting)?;
         let transform = Affine::translate((f64::from(x), f64::from(y)));
         let color = descriptor.foreground_color;
-        let mut options = TextRenderOptions {
+        let options = TextRenderOptions {
             color,
-            stroke: None,
+            stroke: descriptor.stroke_at(layout.font_size),
             ..TextRenderOptions::default()
         };
         let mut scene = PreparedScene::default();
         let mut resources = Vec::new();
-        // The outline was measured around the source lettering and keeps its
-        // proportion to the glyphs at the size the translation is set in.
-        if let Some(stroke) = descriptor.stroke {
-            let scale = descriptor
-                .source_font_size
-                .map_or(1.0, |source| (layout.font_size / source).min(1.0));
-            options.stroke = Some(StrokeOptions {
-                width_px: (stroke.width_px * scale).max(1.0),
-                ..stroke
-            });
-        }
         self.render(
             &mut scene,
             &mut resources,
@@ -363,6 +267,180 @@ impl TextRenderer {
     }
 }
 
+impl TextNodeDescriptor {
+    fn stroke_at(&self, em: f32) -> Option<StrokeOptions> {
+        let source = self.source_font_size.unwrap_or(self.minimum_font_size);
+        self.stroke.map(|stroke| StrokeOptions {
+            width_px: (stroke.width_px * (em / source)).min(em / 8.0),
+            ..stroke
+        })
+    }
+
+    pub(crate) fn resolve_fonts(&self, fonts: &Fonts) -> RenderResult<Vec<Font>> {
+        fonts
+            .resolve(
+                self.preferred_font.as_deref(),
+                self.font_weight,
+                self.font_style,
+                &self.font_families,
+                &self.text,
+                self.language
+                    .as_ref()
+                    .map(koharu_scene::LanguageTag::as_str),
+            )
+            .map_err(|source| Error::Font {
+                entity: self.entity,
+                source,
+            })
+    }
+
+    pub(crate) fn position<'a>(
+        &self,
+        fonts: &'a [Font],
+        setting: TextSetting,
+    ) -> RenderResult<PositionedText<'a>> {
+        let is_bubble_text = self.balloon_contour.is_some();
+        let frame = setting.room.unwrap_or(LayoutBox {
+            x: 0.0,
+            y: 0.0,
+            width: self.width,
+            height: self.height,
+        });
+        // Free text has no balloon to keep its outline off neighbouring
+        // artwork and text, so the outline stays inside the frame.
+        let bounds = if is_bubble_text {
+            inset(frame, self.text_inset)
+        } else {
+            let em = self
+                .source_font_size
+                .or(self.font_size)
+                .unwrap_or(self.minimum_font_size);
+            let outline = self
+                .stroke_at(em.min(frame.width.min(frame.height)))
+                .map_or(0.0, |stroke| stroke.width_px);
+            inset(
+                frame,
+                [outline.min(frame.width.min(frame.height) * 0.25); 4],
+            )
+        };
+        if bounds.width <= 0.0 || bounds.height <= 0.0 {
+            return Err(Error::invalid(format!(
+                "text inset leaves no layout area for entity {}",
+                self.entity
+            )));
+        }
+        let automatic_maximum = || automatic_maximum(self, bounds, is_bubble_text);
+        let maximum = if let Some(size) = setting.size {
+            size
+        } else if self.auto_fit {
+            automatic_maximum()
+        } else {
+            self.font_size.unwrap_or_else(automatic_maximum)
+        };
+        let minimum = self.minimum_font_size.min(maximum);
+        let mut layout = TextLayout::new(&fonts[0])
+            .with_fallback_fonts(&fonts[1..])
+            .with_writing_mode(self.writing_mode)
+            .with_alignment(self.alignment)
+            .with_hyphenation_policy(setting.breaking)
+            .with_line_height(self.line_height)
+            .with_spacing(self.letter_spacing, self.word_spacing)
+            .with_cjk_punctuation_layout(
+                is_chinese_or_japanese_text(&self.text)
+                    || self
+                        .language
+                        .as_ref()
+                        .is_some_and(|language| is_chinese_or_japanese_language(language.as_str())),
+            );
+        if !self.point_text {
+            layout = layout
+                .with_max_width(setting.wrap_width.unwrap_or(bounds.width))
+                .with_max_height(bounds.height);
+        }
+        if let Some(contour) = &self.balloon_contour {
+            let [top, _, _, left] = self.text_inset;
+            let contour = contour.iter().map(|&(x, y)| (x - left, y - top)).collect();
+            layout = layout.with_comic_balloon(
+                bounds.width,
+                bounds.height,
+                contour,
+                self.text_inset.into_iter().fold(0.0, f32::max),
+            );
+        }
+        if is_bubble_text {
+            layout = layout.with_balloon_margin(setting.margin);
+        }
+        if let Some(language) = &self.language {
+            layout = layout.with_hyphenation_language_tag(language.as_str());
+        }
+        let layout = if self.auto_fit && !self.point_text && !setting.exact {
+            layout
+                .with_max_font_size(maximum)
+                .with_min_font_size(minimum)
+        } else {
+            layout.with_font_size(setting.size.or(self.font_size).unwrap_or(maximum))
+        };
+        let fit = || -> Result<_> {
+            if !self.auto_fit
+                || self.point_text
+                || (setting.exact && (setting.wrap_width.is_some() || is_bubble_text))
+            {
+                return layout.run(&self.text);
+            }
+            if let Some(area) = self
+                .source_area
+                .filter(|a| *a < bounds.width * bounds.height)
+            {
+                let fit = |low, high| {
+                    TextRenderer::new().budgeted_layout(
+                        &layout,
+                        &self.text,
+                        bounds,
+                        area,
+                        [low, high],
+                    )
+                };
+                if let Some(run) = fit(if setting.exact { maximum } else { minimum }, maximum)? {
+                    return Ok(run);
+                }
+                if !setting.exact
+                    && let Some(run) = fit(1.0_f32.min(minimum), minimum)?
+                {
+                    return Ok(run);
+                }
+            }
+            let run = layout.run(&self.text)?;
+            if setting.exact || !run.overflowed() {
+                return Ok(run);
+            }
+            // A below-floor setting is a final fallback. The descriptor's
+            // readable size still governs the diagnostic for the chosen run.
+            let low = if is_bubble_text { 0.5 } else { 1.0 };
+            layout
+                .with_max_font_size(minimum)
+                .with_min_font_size(low)
+                .run(&self.text)
+        };
+        let layout = fit().map_err(|source| Error::Layout {
+            entity: self.entity,
+            source,
+        })?;
+        let (mut x, mut y) = if self.point_text {
+            (bounds.x, bounds.y)
+        } else {
+            placement(bounds, layout.width, layout.height)
+        };
+        x += layout.placement_offset_x();
+        y += layout.placement_offset_y();
+        Ok(PositionedText {
+            run: layout,
+            bounds,
+            x,
+            y,
+        })
+    }
+}
+
 impl TextRenderer {
     /// Lays free text out so its block covers at most `area` inside `bounds`,
     /// the room it may move into. Wrap widths from the narrowest that
@@ -394,7 +472,7 @@ impl TextRenderer {
             for width in widths.clone() {
                 let wrapped = layout.clone().with_max_width(width);
                 let fits = |run: &LayoutRun<'_>| {
-                    layout.accepts(run)
+                    run.fits()
                         && run.width <= width
                         && run.height <= bounds.height
                         && run.width * run.height <= area
@@ -572,8 +650,22 @@ mod tests {
             letter_spacing: 0.0,
             word_spacing: 0.0,
             text_inset: [0.0; 4],
+            setting: TextSetting::default(),
             point_text: false,
         }
+    }
+
+    #[test]
+    fn small_final_ems_get_subpixel_outlines() {
+        let mut text = descriptor();
+        text.source_font_size = Some(40.0);
+        text.stroke = Some(StrokeOptions {
+            color: [255; 4],
+            width_px: 20.0,
+        });
+        assert_eq!(text.stroke_at(4.0).unwrap().width_px, 0.5);
+        text.stroke.as_mut().unwrap().width_px = 2.0;
+        assert_eq!(text.stroke_at(4.0).unwrap().width_px, 0.2);
     }
 
     #[test]
