@@ -950,16 +950,19 @@ fn fit_glyph_masks_inner<'a>(
                     if a.pixels[ai] != 0 && b.pixels[bi] != 0 {
                         let box_a = box_distance(*bbox, x, y);
                         let box_b = box_distance(*other, x, y);
-                        let distance_a = prior_a
-                            .as_ref()
-                            .map_or(f64::from(box_a), |([l, t], d)| d[(x - l, y - t)][0]);
-                        let distance_b = prior_b
-                            .as_ref()
-                            .map_or(f64::from(box_b), |([l, t], d)| d[(x - l, y - t)][0]);
-                        let second_wins = distance_b
-                            .total_cmp(&distance_a)
-                            .then_with(|| box_b.total_cmp(&box_a))
-                            .is_lt();
+                        let second_wins = match (&prior_a, &prior_b) {
+                            (Some(([la, ta], da)), Some(([lb, tb], db))) => db[(x - lb, y - tb)][0]
+                                .total_cmp(&da[(x - la, y - ta)][0])
+                                .then_with(|| box_b.total_cmp(&box_a))
+                                .is_lt(),
+                            (Some(([la, ta], da)), None) => {
+                                da[(x - la, y - ta)][0] > 0.0 && box_b < box_a
+                            }
+                            (None, Some(([lb, tb], db))) => {
+                                db[(x - lb, y - tb)][0] == 0.0 || box_b < box_a
+                            }
+                            (None, None) => box_b < box_a,
+                        };
                         if second_wins {
                             a.pixels[ai] = 0;
                         } else {
@@ -1168,8 +1171,9 @@ fn glyph_mask(
     });
 
     // Compare the detector's tones with the same tones just outside its
-    // support. A second ink or outline tone can qualify on its own geometry
-    // even when the crop-wide split selected a different tone.
+    // support. A second ink tone can qualify only when it is concentrated
+    // inside the detector footprint and lies on the ink side of the exterior
+    // mean, preventing caption or bubble paper from being promoted to ink.
     let supported_tones = segmented.then(|| {
         let x0 = mask.x.saturating_sub(reach);
         let y0 = mask.y.saturating_sub(reach);
@@ -1189,7 +1193,40 @@ fn glyph_mask(
         let [exterior_area, detector_area] = tones
             .each_ref()
             .map(|hist| f64::from(hist.iter().sum::<u32>()));
+        let exterior_mean = if exterior_area > 0.0 {
+            tones[0]
+                .iter()
+                .enumerate()
+                .map(|(t, &n)| t as f64 * f64::from(n))
+                .sum::<f64>()
+                / exterior_area
+        } else {
+            0.0
+        };
+        let (mut ink_sum, mut ink_count) = (0.0f64, 0u32);
+        for (x, y, pixel) in ink.enumerate_pixels() {
+            if pixel[0] != 0 {
+                ink_sum += f64::from(page[(x + ink_corner[0], y + ink_corner[1])].to_luma()[0]);
+                ink_count += 1;
+            }
+        }
+        let ink_mean = if ink_count > 0 {
+            ink_sum / f64::from(ink_count)
+        } else {
+            exterior_mean
+        };
+        let contrast = exterior_mean - ink_mean;
         std::array::from_fn::<_, 256, _>(|tone| {
+            let on_ink_side = if contrast > 16.0 {
+                exterior_mean - tone as f64 >= 0.35 * contrast
+            } else if contrast < -16.0 {
+                tone as f64 - exterior_mean >= 0.35 * (-contrast)
+            } else {
+                false
+            };
+            if !on_ink_side {
+                return false;
+            }
             let range = tone.saturating_sub(16)..=(tone + 16).min(255);
             let [exterior_count, detector_count] = tones
                 .each_ref()
@@ -1210,6 +1247,7 @@ fn glyph_mask(
         let from_split = pixel[0] != 0;
         let from_detector = supported
             && !on_border
+            && paper.is_none_or(|paper| color_distance(color, paper) > PAPER_TOLERANCE)
             && supported_tones
                 .as_ref()
                 .is_some_and(|tones| tones[usize::from(page[(px, py)].to_luma()[0])]);
@@ -3534,5 +3572,211 @@ mod tests {
         assert!(
             e_fitted.contains(60, 38) && e_fitted.contains(60, 54) && e_fitted.contains(60, 70)
         );
+    }
+
+    #[test]
+    fn detector_tone_recovery_keeps_white_and_tinted_caption_paper_out_of_mask() {
+        for (tinted, oval) in [(false, false), (true, false), (false, true), (true, true)] {
+            let page = RgbImage::from_fn(200, 160, |x, y| {
+                let in_caption = if oval {
+                    let dx = (x as f32 - 100.0) / 60.0;
+                    let dy = (y as f32 - 80.0) / 50.0;
+                    dx * dx + dy * dy <= 1.0
+                } else {
+                    (40..160).contains(&x) && (30..130).contains(&y)
+                };
+                let border = !oval && in_caption && (x == 40 || x == 159 || y == 30 || y == 129);
+                let stroke = ((60..68).contains(&x) && (50..105).contains(&y))
+                    || ((88..96).contains(&x) && (50..105).contains(&y));
+                Rgb(if stroke {
+                    [15, 15, 15]
+                } else if tinted && border {
+                    [160, 160, 160]
+                } else if in_caption && tinted && (75..125).contains(&y) {
+                    [205, 240, 248]
+                } else if in_caption {
+                    [250, 250, 250]
+                } else {
+                    [180, 180, 180]
+                })
+            });
+            let bbox = [40.0, 30.0, 160.0, 130.0];
+            let pixels: Vec<u8> = if oval {
+                (30..130)
+                    .flat_map(|y| (40..160).map(move |x| (x, y)))
+                    .map(|(x, y)| {
+                        let dx = (x as f32 - 100.0) / 60.0;
+                        let dy = (y as f32 - 80.0) / 50.0;
+                        u8::from(dx * dx + dy * dy <= 1.0) * 255
+                    })
+                    .collect()
+            } else {
+                let mut pixels = vec![255u8; 120 * 100];
+                pixels[0] = 0;
+                pixels
+            };
+            let mask = Mask {
+                x: 40,
+                y: 30,
+                width: 120,
+                height: 100,
+                pixels,
+            };
+            let (fitted, _, _, _) = glyph_mask(&mask, bbox, &page, GlyphProposal::Segmented(bbox));
+            assert!(fitted.contains(64, 75) && fitted.contains(92, 75));
+            assert!(
+                !fitted.contains(130, 60) && !fitted.contains(130, 100),
+                "caption paper (tinted={tinted}, oval={oval}) must not be promoted to foreground"
+            );
+        }
+    }
+
+    #[test]
+    fn dense_two_tone_segmented_lettering_preserves_second_ink_tone() {
+        let bbox = [20.0, 20.0, 100.0, 80.0];
+        let tone = |x: u32, y: u32| {
+            if !(24..76).contains(&y) {
+                245
+            } else if (24..40).contains(&x) {
+                20
+            } else if (42..58).contains(&x) || (60..76).contains(&x) || (78..94).contains(&x) {
+                135
+            } else {
+                245
+            }
+        };
+        let page = RgbImage::from_fn(120, 100, |x, y| Rgb([tone(x, y); 3]));
+        let shape = GrayImage::from_fn(page.width(), page.height(), |x, y| {
+            Luma([u8::from(tone(x, y) != 245) * 255])
+        });
+        let mask = crop(&shape, 0, 0, page.width(), page.height());
+        let (fitted, _, _, _) = glyph_mask(&mask, bbox, &page, GlyphProposal::Segmented(bbox));
+        for x in [32, 50, 68, 86] {
+            assert!(fitted.contains(x, 50), "dense stroke at x={x} was dropped");
+        }
+    }
+
+    #[test]
+    fn mixed_box_and_segmented_ownership_respects_detector_support_in_both_orders() {
+        // 1. Smaller segmented SFX vs larger Box dialogue: dialogue must not
+        //    steal the SFX's recovered stroke edge 1 px outside its detector mask.
+        let page = RgbImage::from_fn(220, 160, |x, y| {
+            let sfx_stroke = (60..72).contains(&x) && (50..100).contains(&y);
+            let dialogue_stroke = (120..130).contains(&x) && (50..100).contains(&y);
+            Rgb(if sfx_stroke || dialogue_stroke {
+                [15, 15, 15]
+            } else {
+                [250, 250, 250]
+            })
+        });
+        let sfx_bbox = [52.0, 44.0, 80.0, 108.0];
+        let dialogue_bbox = [48.0, 36.0, 172.0, 124.0];
+        let mut sfx_pixels = vec![0u8; 28 * 64];
+        // Detector mask stops 1 px short of x=71 and keeps a cutout so it stays non-solid after trimming.
+        for y in 6..56 {
+            for x in 8..19 {
+                if !(x == 8 && y == 6) {
+                    sfx_pixels[y * 28 + x] = 255;
+                }
+            }
+        }
+        let sfx_mask = Mask {
+            x: 52,
+            y: 44,
+            width: 28,
+            height: 64,
+            pixels: sfx_pixels,
+        };
+        let dialogue_mask = Mask {
+            x: 48,
+            y: 36,
+            width: 124,
+            height: 88,
+            pixels: vec![255; 124 * 88],
+        };
+        let mut detections = [
+            KoharuLayoutDetection {
+                label_id: 0,
+                label: "onomatopoeia".to_owned(),
+                score: 0.9,
+                bbox: sfx_bbox,
+                area: sfx_mask.pixels.iter().filter(|&&p| p != 0).count() as u32,
+                mask: Arc::new(sfx_mask),
+            },
+            KoharuLayoutDetection {
+                label_id: 0,
+                label: "text".to_owned(),
+                score: 0.9,
+                bbox: dialogue_bbox,
+                area: 124 * 88,
+                mask: Arc::new(dialogue_mask),
+            },
+        ];
+        let [sfx, dialogue] = &mut detections;
+        fit_glyph_masks(
+            [
+                (GlyphProposal::Segmented(sfx_bbox), sfx),
+                (GlyphProposal::Box, dialogue),
+            ],
+            &page,
+        );
+        assert!(detections[0].mask.contains(71, 75));
+        assert!(!detections[1].mask.contains(71, 75));
+
+        // 2. Smaller Box dialogue overlapping a detector-supported stroke of a
+        //    larger segmented SFX: SFX keeps its detector-supported stroke.
+        let small_dialogue_bbox = [52.0, 44.0, 100.0, 108.0];
+        let large_sfx_bbox = [48.0, 36.0, 172.0, 124.0];
+        let mut large_sfx_pixels = vec![0u8; 124 * 88];
+        for y in 14..64 {
+            for x in 12..24 {
+                large_sfx_pixels[y * 124 + x] = 255;
+            }
+            for x in 72..82 {
+                large_sfx_pixels[y * 124 + x] = 255;
+            }
+        }
+        let large_sfx_mask = Mask {
+            x: 48,
+            y: 36,
+            width: 124,
+            height: 88,
+            pixels: large_sfx_pixels,
+        };
+        let small_dialogue_mask = Mask {
+            x: 52,
+            y: 44,
+            width: 48,
+            height: 64,
+            pixels: vec![255; 48 * 64],
+        };
+        let mut reverse = [
+            KoharuLayoutDetection {
+                label_id: 0,
+                label: "text".to_owned(),
+                score: 0.9,
+                bbox: small_dialogue_bbox,
+                area: 48 * 64,
+                mask: Arc::new(small_dialogue_mask),
+            },
+            KoharuLayoutDetection {
+                label_id: 0,
+                label: "onomatopoeia".to_owned(),
+                score: 0.9,
+                bbox: large_sfx_bbox,
+                area: large_sfx_mask.pixels.iter().filter(|&&p| p != 0).count() as u32,
+                mask: Arc::new(large_sfx_mask),
+            },
+        ];
+        let [small_dialogue, large_sfx] = &mut reverse;
+        fit_glyph_masks(
+            [
+                (GlyphProposal::Box, small_dialogue),
+                (GlyphProposal::Segmented(large_sfx_bbox), large_sfx),
+            ],
+            &page,
+        );
+        assert!(reverse[1].mask.contains(65, 75));
+        assert!(!reverse[0].mask.contains(65, 75));
     }
 }

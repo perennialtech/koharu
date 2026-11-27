@@ -895,4 +895,40 @@ mod tests {
         let band = found.outline.expect("a white inner outline");
         assert_eq!(band.color, WHITE);
     }
+
+    #[test]
+    fn framed_white_inset_with_strokes_is_not_recovered_as_outline_fill() {
+        let page = RgbImage::from_fn(140, 140, |x, y| {
+            let inset = (44..96).contains(&x) && (44..96).contains(&y);
+            let frame = (42..98).contains(&x) && (42..98).contains(&y) && !inset;
+            let stroke = ((58..61).contains(&x) && (54..86).contains(&y))
+                || ((78..81).contains(&x) && (54..86).contains(&y));
+            Rgb(if frame || stroke {
+                BLACK
+            } else if inset {
+                WHITE
+            } else {
+                [210, 210, 210]
+            })
+        });
+        let block = Mask {
+            x: 38,
+            y: 38,
+            width: 64,
+            height: 64,
+            pixels: vec![255; 64 * 64],
+        };
+        let ink = GrayImage::from_fn(64, 64, |x, y| {
+            let (px, py) = (38 + x, 38 + y);
+            let inset = (44..96).contains(&px) && (44..96).contains(&py);
+            let frame = (42..98).contains(&px) && (42..98).contains(&py) && !inset;
+            let stroke = ((58..61).contains(&px) && (54..86).contains(&py))
+                || ((78..81).contains(&px) && (54..86).contains(&py));
+            Luma([u8::from(frame || stroke) * 255])
+        });
+        assert!(
+            outlined(&page, &block, &block, &ink, false, |_| 32.0).is_none(),
+            "framed caption paper must not be recovered as a glyph fill"
+        );
+    }
 }
