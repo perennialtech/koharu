@@ -111,8 +111,11 @@ pub struct DetectionFusionConfig {
     pub fallback_rfdetr_bubble_threshold: Option<f32>,
 }
 
-impl Default for DetectionFusionConfig {
-    fn default() -> Self {
+impl DetectionFusionConfig {
+    /// Returns the legacy fusion configuration prior to invariant-gated
+    /// post-processing fixes (useful for A/B benchmarking).
+    #[must_use]
+    pub fn legacy() -> Self {
         Self {
             duplicate_iou: DUPLICATE_IOU,
             dialogue_mask_containment_threshold: DIALOGUE_MASK_CONTAINMENT_THRESHOLD,
@@ -133,6 +136,20 @@ impl Default for DetectionFusionConfig {
             dedup_added_text_coverage: false,
             prefer_higher_bubble_containment: false,
             fallback_rfdetr_bubble_threshold: None,
+        }
+    }
+}
+
+impl Default for DetectionFusionConfig {
+    fn default() -> Self {
+        Self {
+            merge_container_containment_threshold: 0.6,
+            fit_to_mask_min_overlap: 0.4,
+            use_mask_containment_for_merge: true,
+            prevent_cross_bubble_same_text: true,
+            dedup_added_text_coverage: true,
+            prefer_higher_bubble_containment: true,
+            ..Self::legacy()
         }
     }
 }
@@ -2198,20 +2215,29 @@ fn merge_text_blocks_with_config(
                     .iter()
                     .copied()
                     .map(|bubble| {
-                        (
-                            bubble,
+                        let has_fg = |d: &KoharuLayoutDetection| {
+                            valid_mask(&d.mask)
+                                && (d.area > 0 || d.mask.pixels.iter().any(|&value| value != 0))
+                        };
+                        let share = if has_fg(&detections[bubble]) && has_fg(&detections[text]) {
                             mask_containment(
                                 &detections[bubble].mask,
                                 &detections[text].mask,
                                 detections[text].bbox,
-                            ),
-                        )
+                            )
+                        } else {
+                            containment(detections[bubble].bbox, detections[text].bbox)
+                        };
+                        (bubble, share)
                     })
                     .filter(|&(_, share)| share >= config.merge_container_containment_threshold)
                     .max_by(|&(left, left_share), &(right, right_share)| {
                         left_share
                             .total_cmp(&right_share)
-                            .then_with(|| detections[right].area.cmp(&detections[left].area))
+                            .then_with(|| {
+                                area(detections[right].bbox)
+                                    .total_cmp(&area(detections[left].bbox))
+                            })
                     })
                     .map(|(bubble, _)| bubble)
             } else {
@@ -2244,7 +2270,10 @@ fn merge_text_blocks_with_config(
             );
             let same_text_allowed = !config.prevent_cross_bubble_same_text
                 || match (container[first], container[second]) {
-                    (Some(a), Some(b)) => a == b,
+                    (Some(a), Some(b)) if a != b => {
+                        let (ba, bb) = (detections[a].bbox, detections[b].bbox);
+                        containment(ba, bb) >= 0.5 || containment(bb, ba) >= 0.5
+                    }
                     _ => true,
                 };
             if (same_text_allowed
@@ -4616,5 +4645,151 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert!(color_palette(&pixels).len() <= 16 * 16 * 16);
+    }
+
+    #[test]
+    fn fit_to_mask_ignores_grazing_neighbor_comic_text_box() {
+        // An RF-DETR text box in bubble A barely grazes a neighboring comic text box
+        // in bubble B while its mask leaks into bubble B. `fit_to_mask` must not
+        // union bubble B's comic box into the clipping window.
+        let mut leaky = KoharuLayoutDetection {
+            mask: full_mask(100, 100, 160, 100).into(),
+            ..detection("text", 0.9, [100.0, 100.0, 152.0, 200.0])
+        };
+        let comic = vec![
+            comic(ComicTextBubbleLabel::TextBubble, [100.0, 100.0, 150.0, 200.0]),
+            comic(ComicTextBubbleLabel::TextBubble, [150.0, 100.0, 260.0, 200.0]),
+        ];
+        let comic_refs: Vec<_> = comic.iter().collect();
+        super::fit_to_mask_with_config(
+            &mut leaky,
+            &comic_refs,
+            &super::DetectionFusionConfig::default(),
+        );
+        assert!(
+            leaky.bbox[2] <= 155.0,
+            "grazing neighbor comic box should not expand bbox into neighbor: {:?}",
+            leaky.bbox
+        );
+    }
+
+    #[test]
+    fn merge_text_blocks_keeps_diagonal_bubbles_separate_by_mask() {
+        // Two diagonal bubbles have overlapping bounding boxes, but disjoint ellipse masks.
+        // Text inside bubble 1 must not be assigned to bubble 2 or merged with text in bubble 2.
+        let b1_box = [100.0, 100.0, 260.0, 280.0];
+        let b2_box = [180.0, 180.0, 340.0, 360.0];
+        let t1 = KoharuLayoutDetection {
+            mask: full_mask(150, 140, 45, 95).into(),
+            ..detection("text", 0.9, [150.0, 140.0, 195.0, 235.0])
+        };
+        let t2 = KoharuLayoutDetection {
+            mask: full_mask(210, 210, 45, 95).into(),
+            ..detection("text", 0.9, [210.0, 210.0, 255.0, 305.0])
+        };
+        let b1 = KoharuLayoutDetection {
+            mask: super::ellipse_mask_with_threshold(b1_box, &[], 0.9).into(),
+            ..detection("bubble", 0.9, b1_box)
+        };
+        let b2 = KoharuLayoutDetection {
+            mask: super::ellipse_mask_with_threshold(b2_box, &[], 0.9).into(),
+            ..detection("bubble", 0.9, b2_box)
+        };
+        let mut detections = vec![b1, b2, t1, t2];
+        super::merge_text_blocks(&mut detections);
+        let texts: Vec<_> = detections
+            .iter()
+            .filter(|d| d.label == "text")
+            .collect();
+        assert_eq!(texts.len(), 2, "texts in distinct diagonal bubbles must not merge");
+    }
+
+    #[test]
+    fn merge_text_blocks_does_not_merge_same_text_across_distinct_bubbles() {
+        // Two distinct adjacent bubbles contain overlapping text detections (e.g. from a
+        // slightly oversized box). `same_text` must not merge them across separate bubbles.
+        let b1 = KoharuLayoutDetection {
+            mask: full_mask(50, 50, 100, 150).into(),
+            ..detection("bubble", 0.9, [50.0, 50.0, 150.0, 200.0])
+        };
+        let b2 = KoharuLayoutDetection {
+            mask: full_mask(155, 50, 100, 150).into(),
+            ..detection("bubble", 0.9, [155.0, 50.0, 255.0, 200.0])
+        };
+        let t1 = KoharuLayoutDetection {
+            mask: full_mask(60, 70, 85, 100).into(),
+            ..detection("text", 0.9, [60.0, 70.0, 170.0, 170.0])
+        };
+        let t2 = KoharuLayoutDetection {
+            mask: full_mask(160, 80, 30, 60).into(),
+            ..detection("text", 0.9, [156.0, 80.0, 180.0, 140.0])
+        };
+        let mut detections = vec![b1, b2, t1, t2];
+        super::merge_text_blocks(&mut detections);
+        let texts: Vec<_> = detections
+            .iter()
+            .filter(|d| d.label == "text")
+            .collect();
+        assert_eq!(texts.len(), 2, "same_text must not merge across distinct bubbles");
+    }
+
+    #[test]
+    fn comic_only_text_is_not_suppressed_by_duplicate_rfdetr_coverage() {
+        // Two duplicate RF-DETR boxes each cover 20% of a comic-only text box (the exact
+        // same 20% region). Summing raw intersections would falsely yield 40% >= 30% and
+        // drop the comic text; exact union coverage is 20% < 30% so it is preserved.
+        let layout = KoharuLayoutDetections {
+            image_width: 400,
+            image_height: 400,
+            detections: vec![
+                KoharuLayoutDetection {
+                    mask: full_mask(100, 100, 20, 100).into(),
+                    ..detection("text", 0.85, [100.0, 100.0, 120.0, 200.0])
+                },
+                KoharuLayoutDetection {
+                    mask: full_mask(100, 100, 20, 100).into(),
+                    ..detection("text", 0.75, [100.0, 100.0, 120.0, 200.0])
+                },
+            ],
+        };
+        let comic = vec![ComicTextBubbleDetection {
+            label: ComicTextBubbleLabel::TextBubble,
+            score: 0.85,
+            bbox: [100.0, 100.0, 200.0, 200.0],
+        }];
+        let fused = fuse(layout, &comic, 0.25);
+        assert!(
+            fused
+                .detections
+                .iter()
+                .any(|d| d.label == "text" && d.bbox == [100.0, 100.0, 200.0, 200.0]),
+            "comic-only text should not be suppressed by duplicate overlapping RF-DETR boxes"
+        );
+    }
+
+    #[test]
+    fn layout_order_prefers_bubble_with_higher_mask_containment() {
+        // Bubble 0 is slightly smaller in area and covers 92% of the text; bubble 1 is
+        // slightly larger and covers 100% of the text. `layout_order` should assign the
+        // text to bubble 1.
+        let b0 = KoharuLayoutDetection {
+            area: 80 * 100,
+            mask: full_mask(108, 100, 80, 100).into(),
+            ..detection("bubble", 0.9, [108.0, 100.0, 188.0, 200.0])
+        };
+        let b1 = KoharuLayoutDetection {
+            area: 120 * 120,
+            mask: full_mask(90, 90, 120, 120).into(),
+            ..detection("bubble", 0.9, [90.0, 90.0, 210.0, 210.0])
+        };
+        let text = KoharuLayoutDetection {
+            area: 100 * 50,
+            mask: full_mask(100, 120, 100, 50).into(),
+            ..detection("text", 0.9, [100.0, 120.0, 200.0, 170.0])
+        };
+        let detections = vec![b0, b1, text];
+        let order = layout_order(&detections);
+        let text_item = order.iter().find(|item| item.index == 2).unwrap();
+        assert_eq!(text_item.bubble, Some(1));
     }
 }

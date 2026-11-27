@@ -1316,8 +1316,15 @@ fn print_row(name: &str, sc: &Scorecard) {
 }
 
 fn candidate_configs() -> Vec<(String, DetectionFusionConfig)> {
-    let base = DetectionFusionConfig::default();
-    let mut list = vec![("baseline (origin/master)".to_owned(), base.clone())];
+    let base = DetectionFusionConfig::legacy();
+    let prod = DetectionFusionConfig::default();
+    let mut prod_fb = prod.clone();
+    prod_fb.fallback_rfdetr_bubble_threshold = Some(0.75);
+    let mut list = vec![
+        ("baseline (origin/master)".to_owned(), base.clone()),
+        ("default (new production)".to_owned(), prod),
+        ("default + fb0.75 (candidate)".to_owned(), prod_fb),
+    ];
 
     // Individual strategy ablations
     let mut c = base.clone();
@@ -1487,6 +1494,8 @@ fn main() -> Result<()> {
     let baseline_sc = results[0].2.clone();
     print_header();
     print_row(&results[0].0, &baseline_sc);
+    print_row(&results[1].0, &results[1].2);
+    print_row(&results[2].0, &results[2].2);
 
     // Show all single-factor ablations
     println!("\n--- Single-Factor Ablations ---");
@@ -1572,7 +1581,7 @@ fn main() -> Result<()> {
             t_test.elapsed().as_secs_f64()
         );
         print_header();
-        let mut eval_order: Vec<usize> = vec![0];
+        let mut eval_order: Vec<usize> = vec![0, 1, 2];
         for &idx in pareto_dominating
             .iter()
             .filter(|&&i| results[i].1.fallback_rfdetr_bubble_threshold.is_none())
