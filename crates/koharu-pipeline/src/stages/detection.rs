@@ -24,7 +24,7 @@ use koharu_ml::{
     koharu_layout_rfdetr_seg_2xl::{
         GlyphClaim, GlyphProposal, KoharuLayoutDetection, KoharuLayoutDetections, KoharuLayoutMask,
         KoharuLayoutRFDetrSeg2XL, KoharuLayoutThresholds, Typography as GlyphTypography,
-        fit_glyph_masks,
+        fit_glyph_masks, fit_glyph_masks_with_claims,
     },
 };
 use koharu_scene::{
@@ -934,13 +934,22 @@ fn postprocess_page(
 ) -> ReplayedDetectionPage {
     non_maximum_suppression(&mut candidates, config.duplicate_iou);
     let mut claims = audit_claims.then(Vec::new);
-    fit_glyph_masks(
-        candidates
-            .iter_mut()
-            .map(|c| (c.proposal, &mut c.detection)),
-        image,
-        claims.as_mut(),
-    );
+    if let Some(claims) = claims.as_mut() {
+        fit_glyph_masks_with_claims(
+            candidates
+                .iter_mut()
+                .map(|c| (c.proposal, &mut c.detection)),
+            image,
+            claims,
+        );
+    } else {
+        fit_glyph_masks(
+            candidates
+                .iter_mut()
+                .map(|c| (c.proposal, &mut c.detection)),
+            image,
+        );
+    }
     let mut detections: Vec<_> = candidates.into_iter().map(|c| c.detection).collect();
     let mut sources = audit_claims.then(|| (0..detections.len()).map(|i| vec![i]).collect());
     // A text block can join two balloon lobes even when only one lobe is in scope.
@@ -3635,7 +3644,6 @@ mod tests {
                 .iter_mut()
                 .map(|c| (c.proposal, &mut c.detection)),
             &page,
-            None,
         );
         let [segmented, comic] = candidates.as_slice() else {
             panic!("expected both text regions")
@@ -5165,7 +5173,6 @@ mod tests {
         koharu_ml::koharu_layout_rfdetr_seg_2xl::fit_glyph_masks(
             [(super::GlyphProposal::Segmented(text.bbox), &mut text)],
             &source,
-            None,
         );
         let found = infer_typography(&source, &text).unwrap();
         assert_eq!(found.color, [0; 3]);

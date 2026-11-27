@@ -824,9 +824,25 @@ pub struct GlyphClaim {
 
 /// Fit the fused lettering proposals to the page. Keep their original boxes
 /// until every shared pixel has an owner: growing one box over a cut glyph
-/// must not give it priority over a neighbouring text. Evaluation callers may
-/// retain the pre-ownership claims.
+/// must not give it priority over a neighbouring text.
 pub fn fit_glyph_masks<'a>(
+    proposals: impl IntoIterator<Item = (GlyphProposal, &'a mut KoharuLayoutDetection)>,
+    page: &RgbImage,
+) {
+    fit_glyph_masks_inner(proposals, page, None);
+}
+
+/// Same as [`fit_glyph_masks`], while also retaining each proposal's
+/// pre-ownership mask and core ink for evaluation diagnostics.
+pub fn fit_glyph_masks_with_claims<'a>(
+    proposals: impl IntoIterator<Item = (GlyphProposal, &'a mut KoharuLayoutDetection)>,
+    page: &RgbImage,
+    claims: &mut Vec<GlyphClaim>,
+) {
+    fit_glyph_masks_inner(proposals, page, Some(claims));
+}
+
+fn fit_glyph_masks_inner<'a>(
     proposals: impl IntoIterator<Item = (GlyphProposal, &'a mut KoharuLayoutDetection)>,
     page: &RgbImage,
     claims: Option<&mut Vec<GlyphClaim>>,
@@ -2621,11 +2637,7 @@ mod tests {
                 area: mask.pixels.iter().filter(|&&pixel| pixel != 0).count() as u32,
                 mask: Arc::new(mask),
             };
-            fit_glyph_masks(
-                [(GlyphProposal::Segmented(bbox), &mut detection)],
-                &page,
-                None,
-            );
+            fit_glyph_masks([(GlyphProposal::Segmented(bbox), &mut detection)], &page);
             let fitted = &detection.mask;
             let missing = outline
                 .enumerate_pixels()
@@ -2820,7 +2832,7 @@ mod tests {
             d.bbox = [20., 10., 40., 83.];
             (GlyphProposal::Segmented(original), d)
         });
-        fit_glyph_masks(proposals, &page, None);
+        fit_glyph_masks(proposals, &page);
         assert!(page_masks[0].mask.contains(30, 50));
         assert!(!page_masks[1].mask.contains(30, 50));
         assert!(page_masks[1].mask.contains(30, 60));
@@ -3257,7 +3269,6 @@ mod tests {
             dets.iter_mut()
                 .map(|d| (GlyphProposal::Segmented(d.bbox), d)),
             &page,
-            None,
         );
         let kept = target_ink
             .iter()

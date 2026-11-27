@@ -6,6 +6,8 @@ mod raw_detections;
 mod render;
 
 use std::{
+    collections::HashMap,
+    ffi::OsString,
     fmt::Write as _,
     fs::{self, File},
     io::{BufRead, BufWriter, ErrorKind, Write},
@@ -36,8 +38,9 @@ struct Args {
     /// Raw JSONL/gzip files, or directories of raw dumps in sorted order.
     #[arg(long, required = true, num_args = 1..)]
     raw_dumps: Vec<PathBuf>,
-    #[arg(long)]
-    images_dir: PathBuf,
+    /// One or more image root directories (searched in order, including nested shards).
+    #[arg(long, required = true, num_args = 1..)]
+    images_dir: Vec<PathBuf>,
     #[arg(long)]
     allow_missing_images: bool,
     #[arg(long)]
@@ -199,11 +202,9 @@ fn run(args: Args) -> Result<()> {
         (0.0..=1.0).contains(&args.bubble_threshold),
         "bubble threshold must be between 0 and 1"
     );
-    ensure!(
-        args.images_dir.is_dir(),
-        "{} is not an image directory",
-        args.images_dir.display()
-    );
+    for dir in &args.images_dir {
+        ensure!(dir.is_dir(), "{} is not an image directory", dir.display());
+    }
 
     let mut dumps = Vec::new();
     for input in &args.raw_dumps {
@@ -503,14 +504,14 @@ fn replay_line<'a>(
 }
 
 struct ImageDirectory<'a> {
-    root: &'a Path,
-    nested: OnceLock<std::io::Result<Vec<PathBuf>>>,
+    roots: &'a [PathBuf],
+    nested: OnceLock<std::io::Result<HashMap<OsString, Option<PathBuf>>>>,
 }
 
 impl<'a> ImageDirectory<'a> {
-    fn new(root: &'a Path) -> Self {
+    fn new(roots: &'a [PathBuf]) -> Self {
         Self {
-            root,
+            roots,
             nested: OnceLock::new(),
         }
     }
@@ -531,52 +532,56 @@ impl<'a> ImageDirectory<'a> {
             .last()
             .ok_or_else(|| std::io::Error::new(ErrorKind::InvalidInput, "empty image name"))?;
         // Dumps may retain directory prefixes from another dataset root.
-        for start in 0..components.len() {
-            let suffix: PathBuf = components[start..].iter().collect();
-            match fs::read(self.root.join(suffix)) {
-                Err(error) if error.kind() == ErrorKind::NotFound => {}
-                result => return result,
+        for root in self.roots {
+            for start in 0..components.len() {
+                let suffix: PathBuf = components[start..].iter().collect();
+                match fs::read(root.join(suffix)) {
+                    Err(error) if error.kind() == ErrorKind::NotFound => {}
+                    result => return result,
+                }
             }
         }
-        // Index directories once, only when exact/suffix lookup misses. Nested
-        // pages can then be found without keeping a catalog of image paths.
+        // Index nested filenames once on first miss so sharded trees resolve in O(1).
         let nested = self
             .nested
             .get_or_init(|| {
-                let mut nested = Vec::new();
-                let mut pending = vec![self.root.to_owned()];
-                while let Some(directory) = pending.pop() {
-                    for entry in fs::read_dir(directory)? {
-                        let entry = entry?;
-                        if entry.file_type()?.is_dir() {
-                            let child = entry.path();
-                            pending.push(child.clone());
-                            nested.push(child);
+                let mut index: HashMap<OsString, Option<PathBuf>> = HashMap::new();
+                for root in self.roots {
+                    let mut root_index: HashMap<OsString, Option<PathBuf>> = HashMap::new();
+                    let mut pending = vec![root.clone()];
+                    while let Some(directory) = pending.pop() {
+                        for entry in fs::read_dir(directory)? {
+                            let entry = entry?;
+                            let file_type = entry.file_type()?;
+                            if file_type.is_dir() {
+                                pending.push(entry.path());
+                            } else if file_type.is_file() {
+                                let name = entry.file_name();
+                                let path = entry.path();
+                                root_index
+                                    .entry(name)
+                                    .and_modify(|slot| *slot = None)
+                                    .or_insert(Some(path));
+                            }
                         }
                     }
+                    // Earlier roots win on name collision; ambiguity within one root stays flagged.
+                    for (name, path) in root_index {
+                        index.entry(name).or_insert(path);
+                    }
                 }
-                Ok(nested)
+                Ok(index)
             })
             .as_ref()
             .map_err(|error| std::io::Error::new(error.kind(), error.to_string()))?;
-        let mut found = None;
-        for directory in nested {
-            let path = directory.join(basename);
-            match path.metadata() {
-                Ok(metadata) if metadata.is_file() => {
-                    if found.replace(path).is_some() {
-                        return Err(std::io::Error::new(
-                            ErrorKind::InvalidData,
-                            "ambiguous nested image name",
-                        ));
-                    }
-                }
-                Ok(_) => {}
-                Err(error) if error.kind() == ErrorKind::NotFound => {}
-                Err(error) => return Err(error),
-            }
+        match nested.get(*basename) {
+            Some(Some(path)) => fs::read(path),
+            Some(None) => Err(std::io::Error::new(
+                ErrorKind::InvalidData,
+                "ambiguous nested image name",
+            )),
+            None => Err(std::io::Error::from(ErrorKind::NotFound)),
         }
-        fs::read(found.ok_or_else(|| std::io::Error::from(ErrorKind::NotFound))?)
     }
 }
 
@@ -685,7 +690,7 @@ mod tests {
         let output = root.join("replayed.jsonl.gz");
         run(Args {
             raw_dumps: vec![root.join("dumps")],
-            images_dir: root.to_owned(),
+            images_dir: vec![root.to_owned()],
             allow_missing_images: true,
             out: output.clone(),
             batch_size: 1,
@@ -740,7 +745,7 @@ mod tests {
         ] {
             let args = Args {
                 raw_dumps: Vec::new(),
-                images_dir: dir.path().to_owned(),
+                images_dir: vec![dir.path().to_owned()],
                 allow_missing_images: false,
                 out: PathBuf::new(),
                 batch_size: 1,
@@ -752,7 +757,8 @@ mod tests {
                 perturb,
                 render_audit: false,
             };
-            let images = ImageDirectory::new(dir.path());
+            let roots = vec![dir.path().to_owned()];
+            let images = ImageDirectory::new(&roots);
             let page = replay_line(
                 &line,
                 &images,
