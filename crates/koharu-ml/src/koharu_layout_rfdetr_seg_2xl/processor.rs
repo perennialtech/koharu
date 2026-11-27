@@ -2,6 +2,10 @@
 //!
 //! https://github.com/roboflow/rf-detr/blob/4ab7c18729de9d02ffd0495795d0831b5630f01b/src/rfdetr/detr.py
 //! https://github.com/roboflow/rf-detr/blob/4ab7c18729de9d02ffd0495795d0831b5630f01b/src/rfdetr/models/postprocess.py
+//!
+//! The HighRes checkpoint uses LongestMaxSize and top-left white padding
+//! (koharu-rs/koharu 15914d76). Its normalized boxes and masks both cover
+//! a square whose side is the page's longer dimension.
 
 use std::{borrow::Cow, sync::Arc};
 
@@ -63,10 +67,6 @@ impl KoharuLayoutRFDetrImageProcessor {
         self.recommended_thresholds
     }
 
-    /// Rescales to `[0, 1]`, resizes to the model resolution with bilinear
-    /// interpolation, then normalizes, as planar RGB. Latest upstream disables
-    /// antialiasing to match the bilinear Albumentations resize used during
-    /// training.
     pub(super) fn preprocess(&self, image: &DynamicImage) -> Result<Vec<f32>> {
         ensure!(
             image.width() > 0 && image.height() > 0,
@@ -74,48 +74,44 @@ impl KoharuLayoutRFDetrImageProcessor {
         );
         let (samples, stride) = rgb_samples(image);
         let (width, height) = (image.width() as usize, image.height() as usize);
-        let rows = bilinear_taps(height, RESOLUTION);
-        let columns = bilinear_taps(width, RESOLUTION);
-        let unit: [f32; 256] = std::array::from_fn(|value| f32::from(value as u8) / 255.0);
-        // Interpolating each source row along x, then blending two of those
-        // rows, is the same arithmetic in the same order as interpolating
-        // every pixel from its four taps.
-        let interpolate_row = |y: usize, row: &mut [[f32; 3]]| {
-            let source = &samples[y * width * stride..][..width * stride];
-            for (sample, column) in row.iter_mut().zip(&columns) {
-                let low = &source[column.low * stride..][..3];
-                let high = &source[column.high * stride..][..3];
-                *sample = std::array::from_fn(|channel| {
-                    column.low_weight * unit[usize::from(low[channel])]
-                        + column.high_weight * unit[usize::from(high[channel])]
-                });
-            }
+        let scale = RESOLUTION as f64 / width.max(height) as f64;
+        let side = |length: usize| ((length as f64 * scale).round_ties_even() as usize).max(1);
+        let (scaled_w, scaled_h) = (side(width), side(height));
+        let rgb = |x: usize, y: usize| -> [f32; 3] {
+            let i = (y * width + x) * stride;
+            std::array::from_fn(|c| f32::from(samples[i + c]))
         };
-        let plane = RESOLUTION * RESOLUTION;
-        let mut pixel_values = vec![0.0; 3 * plane];
-        let (red, rest) = pixel_values.split_at_mut(plane);
-        let (green, blue) = rest.split_at_mut(plane);
-        red.par_chunks_exact_mut(RESOLUTION)
-            .zip(green.par_chunks_exact_mut(RESOLUTION))
-            .zip(blue.par_chunks_exact_mut(RESOLUTION))
-            .zip(&rows)
-            .for_each_init(
-                || (vec![[0.0; 3]; RESOLUTION], vec![[0.0; 3]; RESOLUTION]),
-                |(low, high), (((red, green), blue), row)| {
-                    interpolate_row(row.low, low);
-                    interpolate_row(row.high, high);
-                    for (x, (low, high)) in low.iter().zip(high.iter()).enumerate() {
-                        for (channel, plane) in
-                            [&mut *red, &mut *green, &mut *blue].into_iter().enumerate()
-                        {
-                            let value =
-                                row.low_weight * low[channel] + row.high_weight * high[channel];
-                            plane[x] = (value - MEAN[channel]) / STD[channel];
-                        }
-                    }
+
+        if (width, height) == (scaled_w, scaled_h) {
+            return Ok(letterbox(scaled_w, scaled_h, rgb));
+        }
+        if scale < 1.0 {
+            let rows = area_taps(height, scaled_h);
+            let columns = area_taps(width, scaled_w);
+            return Ok(letterbox_with_rows(
+                scaled_w,
+                scaled_h,
+                |vrow, y| {
+                    vrow.resize(width, [0.0; 3]);
+                    blend_area_rows(vrow, &samples, stride, &rows[y]);
                 },
-            );
-        Ok(pixel_values)
+                |vrow, x, _| area_pixel(vrow, &columns[x]),
+            ));
+        }
+        let rows = bilinear_taps(height, scaled_h);
+        let columns = bilinear_taps(width, scaled_w);
+        Ok(letterbox(scaled_w, scaled_h, |x, y| {
+            let column = columns[x];
+            let interpolate_row = |sy| -> [f32; 3] {
+                let low = rgb(column.low, sy);
+                let high = rgb(column.high, sy);
+                std::array::from_fn(|c| column.low_weight * low[c] + column.high_weight * high[c])
+            };
+            let row = rows[y];
+            let low = interpolate_row(row.low);
+            let high = interpolate_row(row.high);
+            std::array::from_fn(|c| row.low_weight * low[c] + row.high_weight * high[c])
+        }))
     }
 
     pub(super) fn postprocess(
@@ -169,11 +165,26 @@ impl KoharuLayoutRFDetrImageProcessor {
                 *choice = Some(index);
             }
         }
-        ranked.retain(|&index| {
-            chosen[index / NUM_CLASSES_WITH_BACKGROUND] == Some(index)
-                || auxiliary(index % NUM_CLASSES_WITH_BACKGROUND)
-        });
-        if ranked.is_empty() {
+        let long_side = image_width.max(image_height);
+        let selected: Vec<_> = ranked
+            .into_iter()
+            .filter_map(|index| {
+                let query = index / NUM_CLASSES_WITH_BACKGROUND;
+                if chosen[query] != Some(index) && !auxiliary(index % NUM_CLASSES_WITH_BACKGROUND) {
+                    return None;
+                }
+                let [cx, cy, w, h]: [f32; 4] = pred_boxes[query * 4..query * 4 + 4]
+                    .try_into()
+                    .expect("box has four coordinates");
+                let bbox = [cx - w / 2.0, cy - h / 2.0, cx + w / 2.0, cy + h / 2.0]
+                    .map(|coordinate| coordinate * long_side as f32);
+                // Queries wholly in the letterbox padding have no page instance to decode.
+                (bbox[0].max(0.0) < bbox[2].min(image_width as f32)
+                    && bbox[1].max(0.0) < bbox[3].min(image_height as f32))
+                .then_some((index, bbox))
+            })
+            .collect();
+        if selected.is_empty() {
             return Ok(KoharuLayoutDetections {
                 image_width,
                 image_height,
@@ -183,7 +194,7 @@ impl KoharuLayoutRFDetrImageProcessor {
 
         let mut queries = Vec::new();
         let mut mask_slots = [None; NUM_QUERIES];
-        for &index in &ranked {
+        for &(index, _) in &selected {
             let query = index / NUM_CLASSES_WITH_BACKGROUND;
             mask_slots[query].get_or_insert_with(|| {
                 queries.push(query);
@@ -191,38 +202,23 @@ impl KoharuLayoutRFDetrImageProcessor {
             });
         }
         let logits = decode_masks(&queries)?;
-        let rows = bilinear_taps(MASK_RESOLUTION, image_height as usize);
-        let columns = bilinear_taps(MASK_RESOLUTION, image_width as usize);
+        // Project to the long-side square, then take its top-left page crop.
+        // Both axes share taps, so the padded output pixels need no storage.
+        let taps = bilinear_taps(MASK_RESOLUTION, long_side as usize);
+        let rows = &taps[..image_height as usize];
+        let columns = &taps[..image_width as usize];
         let masks: Vec<_> = logits
             .par_chunks_exact(MASK_RESOLUTION * MASK_RESOLUTION)
             .map(|logits| {
-                let (area, mask) = page_mask(logits, &rows, &columns);
+                let (area, mask) = page_mask(logits, rows, columns);
                 (area, Arc::new(mask))
             })
             .collect();
-        let size = [
-            image_width as f32,
-            image_height as f32,
-            image_width as f32,
-            image_height as f32,
-        ];
-        let detections = ranked
+        let detections = selected
             .into_iter()
-            .map(|index| {
+            .map(|(index, bbox)| {
                 let query = index / NUM_CLASSES_WITH_BACKGROUND;
                 let label_id = index % NUM_CLASSES_WITH_BACKGROUND;
-                let [center_x, center_y, width, height]: [f32; 4] = pred_boxes
-                    [query * 4..query * 4 + 4]
-                    .try_into()
-                    .expect("box has four coordinates");
-                let half_width = width / 2.0;
-                let half_height = height / 2.0;
-                let corners = [
-                    center_x - half_width,
-                    center_y - half_height,
-                    center_x + half_width,
-                    center_y + half_height,
-                ];
                 let (area, mask) = &masks[mask_slots[query].expect("selected query has a mask")];
                 KoharuLayoutDetection {
                     label_id,
@@ -232,7 +228,7 @@ impl KoharuLayoutRFDetrImageProcessor {
                         .cloned()
                         .unwrap_or_else(|| "__background__".to_owned()),
                     score: scores[index],
-                    bbox: std::array::from_fn(|axis| corners[axis] * size[axis]),
+                    bbox,
                     area: *area,
                     mask: Arc::clone(mask),
                 }
@@ -255,6 +251,122 @@ fn rgb_samples(image: &DynamicImage) -> (Cow<'_, [u8]>, usize) {
         DynamicImage::ImageRgba8(image) => (Cow::Borrowed(image.as_raw()), 4),
         image => (Cow::Owned(image.to_rgb8().into_raw()), 3),
     }
+}
+
+fn letterbox(
+    width: usize,
+    height: usize,
+    sample: impl Fn(usize, usize) -> [f32; 3] + Sync,
+) -> Vec<f32> {
+    letterbox_with_rows(width, height, |_, _| {}, |_, x, y| sample(x, y))
+}
+
+/// Store the top-left resized image on a white planar RGB canvas. OpenCV
+/// returns 8-bit samples, so round before applying ImageNet normalization.
+fn letterbox_with_rows(
+    width: usize,
+    height: usize,
+    prepare_row: impl Fn(&mut Vec<[f32; 3]>, usize) + Sync,
+    sample: impl Fn(&[[f32; 3]], usize, usize) -> [f32; 3] + Sync,
+) -> Vec<f32> {
+    let normalized: [[f32; 256]; 3] =
+        std::array::from_fn(|c| std::array::from_fn(|v| (v as f32 / 255.0 - MEAN[c]) / STD[c]));
+    let plane = RESOLUTION * RESOLUTION;
+    let mut canvas = vec![0.0; 3 * plane];
+    let (red, rest) = canvas.split_at_mut(plane);
+    let (green, blue) = rest.split_at_mut(plane);
+    red.par_chunks_exact_mut(RESOLUTION)
+        .zip(green.par_chunks_exact_mut(RESOLUTION))
+        .zip(blue.par_chunks_exact_mut(RESOLUTION))
+        .enumerate()
+        .with_min_len(8)
+        .for_each_init(Vec::new, |scratch, (y, ((red, green), blue))| {
+            let filled = if y < height {
+                prepare_row(scratch, y);
+                width
+            } else {
+                0
+            };
+            for x in 0..filled {
+                let [r, g, b] = sample(scratch, x, y).map(|v| v.round_ties_even() as u8);
+                red[x] = normalized[0][usize::from(r)];
+                green[x] = normalized[1][usize::from(g)];
+                blue[x] = normalized[2][usize::from(b)];
+            }
+            red[filled..].fill(normalized[0][255]);
+            green[filled..].fill(normalized[1][255]);
+            blue[filled..].fill(normalized[2][255]);
+        });
+    canvas
+}
+
+/// Accumulate each column in tap order before applying any horizontal weights.
+fn blend_area_rows(
+    vertical: &mut [[f32; 3]],
+    samples: &[u8],
+    stride: usize,
+    taps: &[(usize, f32)],
+) {
+    // Accumulate contiguous components so both RGB and RGBA can vectorize.
+    // Strip alpha only when copying the blended block to the RGB row.
+    const BLOCK_PIXELS: usize = 256;
+    let row_bytes = vertical.len() * stride;
+    let mut block_sums = [0.0; BLOCK_PIXELS * 4];
+    for (index, block) in vertical.chunks_mut(BLOCK_PIXELS).enumerate() {
+        let offset = index * BLOCK_PIXELS * stride;
+        let count = block.len() * stride;
+        let sums = &mut block_sums[..count];
+        sums.fill(0.0);
+        for &(sy, weight) in taps {
+            let start = sy * row_bytes + offset;
+            for (sum, &value) in sums.iter_mut().zip(&samples[start..][..count]) {
+                *sum += weight * f32::from(value);
+            }
+        }
+        if stride == 3 {
+            block.as_flattened_mut().copy_from_slice(sums);
+        } else {
+            for (rgb, &[r, g, b, _]) in block.iter_mut().zip(sums.as_chunks::<4>().0) {
+                *rgb = [r, g, b];
+            }
+        }
+    }
+}
+
+fn area_pixel(vertical: &[[f32; 3]], taps: &[(usize, f32)]) -> [f32; 3] {
+    let mut pixel = [0.0; 3];
+    for &(sx, weight) in taps {
+        let column = vertical[sx];
+        for c in 0..3 {
+            pixel[c] += weight * column[c];
+        }
+    }
+    pixel
+}
+
+/// Sparse OpenCV INTER_AREA weights, including computeResizeAreaTab's
+/// cutoffs for partial pixels. A center-sampled box filter loses these
+/// fractional contributions when the scale is nonintegral.
+fn area_taps(input: usize, output: usize) -> Vec<Vec<(usize, f32)>> {
+    let scale = 1.0 / (output as f64 / input as f64);
+    (0..output)
+        .map(|dst| {
+            let start = dst as f64 * scale;
+            let end = start + scale;
+            let cell = scale.min(input as f64 - start);
+            let last = (end.floor() as usize).min(input - 1);
+            let first = (start.ceil() as usize).min(last);
+            let mut taps = Vec::with_capacity(last - first + 2);
+            if first as f64 - start > 1e-3 {
+                taps.push((first - 1, ((first as f64 - start) / cell) as f32));
+            }
+            taps.extend((first..last).map(|src| (src, (1.0 / cell) as f32)));
+            if end - last as f64 > 1e-3 {
+                taps.push((last, ((end - last as f64).min(1.0).min(cell) / cell) as f32));
+            }
+            taps
+        })
+        .collect()
 }
 
 /// One output coordinate of PyTorch's `upsample_bilinear2d` with
@@ -308,9 +420,13 @@ fn page_mask(
     // An interpolated value is a convex combination of its taps, so a page
     // pixel can be positive only if a tap lies inside the bounds of the
     // positive mask logits. Skipping the rest is exact.
+    // Padding beyond the last interpolation neighbor cannot reach the page.
+    let source_height = rows.last().map_or(0, |tap| tap.high + 1);
+    let source_width = columns.last().map_or(0, |tap| tap.high + 1);
     let mut bounds: Option<[usize; 4]> = None;
-    for (y, row) in logits.as_chunks::<MASK_RESOLUTION>().0.iter().enumerate() {
-        for (x, &value) in row.iter().enumerate() {
+    let (logit_rows, _) = logits.as_chunks::<MASK_RESOLUTION>();
+    for (y, row) in logit_rows.iter().take(source_height).enumerate() {
+        for (x, &value) in row[..source_width].iter().enumerate() {
             if value > 0.0 {
                 let [left, top, right, bottom] = bounds.get_or_insert([x, y, x, y]);
                 *left = (*left).min(x);
@@ -331,10 +447,9 @@ fn page_mask(
         .iter()
         .rposition(|tap| touches(tap, top, bottom))
         .unwrap();
-    let first_column = columns
-        .iter()
-        .position(|tap| touches(tap, left, right))
-        .unwrap();
+    let Some(first_column) = columns.iter().position(|tap| touches(tap, left, right)) else {
+        return (0, empty);
+    };
     let last_column = columns
         .iter()
         .rposition(|tap| touches(tap, left, right))
@@ -353,7 +468,7 @@ fn page_mask(
         .par_chunks_exact_mut(window_width)
         .zip(source_top..source_bottom + 1)
         .for_each(|(values, source)| {
-            let source = &logits[source * MASK_RESOLUTION..][..MASK_RESOLUTION];
+            let source = &logit_rows[source];
             for (value, column) in values.iter_mut().zip(window_columns) {
                 *value = column.interpolate(|x| source[x]);
             }
@@ -440,7 +555,7 @@ pub struct KoharuLayoutDetection {
     pub mask: Arc<KoharuLayoutMask>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct KoharuLayoutMask {
     pub x: u32,
     pub y: u32,
@@ -469,45 +584,52 @@ impl KoharuLayoutMask {
 
 #[cfg(test)]
 mod tests {
-    use image::{DynamicImage, Rgba, RgbaImage};
+    use image::{DynamicImage, Rgb, RgbImage, Rgba, RgbaImage};
 
     use super::{
-        KoharuLayoutRFDetrImageProcessor, KoharuLayoutThresholds, MASK_RESOLUTION, MEAN,
-        RESOLUTION, STD, bilinear_taps, page_mask, validate_thresholds,
+        KoharuLayoutRFDetrImageProcessor, KoharuLayoutThresholds, MASK_RESOLUTION, RESOLUTION,
+        area_pixel, area_taps, bilinear_taps, blend_area_rows, page_mask, validate_thresholds,
     };
+
+    fn processor(
+        num_select: usize,
+        keep_bubble_proposals: bool,
+    ) -> KoharuLayoutRFDetrImageProcessor {
+        KoharuLayoutRFDetrImageProcessor {
+            num_select,
+            class_names: ["text", "onomatopoeia", "bubble", "panel"]
+                .map(str::to_owned)
+                .to_vec(),
+            keep_bubble_proposals,
+            recommended_thresholds: KoharuLayoutThresholds {
+                text: 0.5,
+                onomatopoeia: 0.5,
+                bubble: 0.05,
+                panel: 0.5,
+            },
+        }
+    }
 
     fn detect_queries(
         logits: &[[f32; 5]],
         keep_bubble_proposals: bool,
         expected_queries: &[usize],
     ) -> Vec<super::KoharuLayoutDetection> {
-        let thresholds = KoharuLayoutThresholds {
-            text: 0.5,
-            onomatopoeia: 0.5,
-            bubble: 0.05,
-            panel: 0.5,
-        };
-        let processor = KoharuLayoutRFDetrImageProcessor {
-            num_select: logits.len() * 5,
-            class_names: ["text", "onomatopoeia", "bubble", "panel"]
-                .map(str::to_owned)
-                .to_vec(),
-            keep_bubble_proposals,
-            recommended_thresholds: thresholds,
-        };
+        let processor = processor(logits.len() * 5, keep_bubble_proposals);
         let boxes = vec![[0.5, 0.5, 0.5, 0.5]; logits.len()];
         processor
             .decode_detections(
                 logits.as_flattened(),
                 boxes.as_flattened(),
                 (16, 8),
-                thresholds,
+                processor.recommended_thresholds,
                 |queries| {
                     assert_eq!(queries, expected_queries);
-                    let plane = MASK_RESOLUTION * MASK_RESOLUTION;
-                    let mut masks = vec![-1.0; queries.len() * plane];
-                    for (&query, mask) in queries.iter().zip(masks.chunks_exact_mut(plane)) {
-                        let height = MASK_RESOLUTION * (query + 1) / (logits.len() + 1);
+                    const MASK_PIXELS: usize = MASK_RESOLUTION * MASK_RESOLUTION;
+                    let mut masks = vec![-1.0; queries.len() * MASK_PIXELS];
+                    let (mask_planes, _) = masks.as_chunks_mut::<MASK_PIXELS>();
+                    for (&query, mask) in queries.iter().zip(mask_planes) {
+                        let height = MASK_RESOLUTION / 2 * (query + 1) / (logits.len() + 1);
                         mask[..height * MASK_RESOLUTION].fill(1.0);
                     }
                     Ok(masks)
@@ -559,7 +681,7 @@ mod tests {
                 &detections[a].mask,
                 &detections[b].mask
             ));
-            assert_eq!(detections[a].bbox, [4.0, 2.0, 12.0, 6.0]);
+            assert_eq!(detections[a].bbox, [4.0, 4.0, 12.0, 12.0]);
         }
 
         let standalone = detect_queries(&logits, false, &[1, 0, 2]);
@@ -570,60 +692,266 @@ mod tests {
         assert_eq!(labels, ["bubble", "text", "bubble"]);
     }
 
+    fn imagenet([r, g, b]: [u8; 3]) -> [f32; 3] {
+        [
+            (f32::from(r) / 255.0 - 0.485) / 0.229,
+            (f32::from(g) / 255.0 - 0.456) / 0.224,
+            (f32::from(b) / 255.0 - 0.406) / 0.225,
+        ]
+    }
+
     #[test]
-    fn preprocess_matches_per_pixel_interpolation() {
-        let processor = KoharuLayoutRFDetrImageProcessor {
-            num_select: 1,
-            keep_bubble_proposals: false,
-            class_names: Vec::new(),
-            recommended_thresholds: KoharuLayoutThresholds {
-                text: 0.5,
-                onomatopoeia: 0.5,
-                bubble: 0.5,
-                panel: 0.5,
-            },
-        };
-        // Upsampled along x and downsampled along y, with alpha that must be
-        // ignored.
-        let (width, height) = (301, 2203);
-        let rgba = DynamicImage::ImageRgba8(RgbaImage::from_fn(width, height, |x, y| {
-            Rgba([
-                (x * 7 + y * 3) as u8,
-                (x * y) as u8,
-                (x ^ y) as u8,
-                (x + y) as u8,
-            ])
-        }));
-        let rgb = rgba.to_rgb8();
-        let rows = bilinear_taps(height as usize, RESOLUTION);
-        let columns = bilinear_taps(width as usize, RESOLUTION);
-        let source = |y: usize, x: usize, channel: usize| {
-            f32::from(rgb.as_raw()[(y * width as usize + x) * 3 + channel]) / 255.0
-        };
-        let plane = RESOLUTION * RESOLUTION;
-        let mut expected = vec![0.0_f32; 3 * plane];
-        for (y, row) in rows.iter().enumerate() {
-            for (x, column) in columns.iter().enumerate() {
-                for channel in 0..3 {
-                    let value = row.interpolate(|source_y| {
-                        column.interpolate(|source_x| source(source_y, source_x, channel))
-                    });
-                    expected[channel * plane + y * RESOLUTION + x] =
-                        (value - MEAN[channel]) / STD[channel];
+    fn separable_area_matches_vertical_then_horizontal_sums_bit_for_bit() {
+        let (width, height) = (317, 449);
+        let columns = area_taps(width, 87);
+        let rows = area_taps(height, 123);
+        for stride in [3, 4] {
+            let samples: Vec<u8> = (0..width * height * stride)
+                .map(|i| (i * 71 + i / 13) as u8)
+                .collect();
+            let mut vertical = vec![[0.0; 3]; width];
+            for (y, row) in rows.iter().enumerate() {
+                blend_area_rows(&mut vertical, &samples, stride, row);
+                for (x, taps) in columns.iter().enumerate() {
+                    let mut expected = [0.0_f32; 3];
+                    for &(sx, wx) in taps {
+                        let mut column = [0.0; 3];
+                        for &(sy, wy) in row {
+                            let i = (sy * width + sx) * stride;
+                            for c in 0..3 {
+                                column[c] += wy * f32::from(samples[i + c]);
+                            }
+                        }
+                        for c in 0..3 {
+                            expected[c] += wx * column[c];
+                        }
+                    }
+                    assert_eq!(
+                        area_pixel(&vertical, taps).map(f32::to_bits),
+                        expected.map(f32::to_bits),
+                        "stride {stride}, pixel ({x}, {y})"
+                    );
                 }
             }
         }
+    }
 
-        for image in [rgba, DynamicImage::ImageRgb8(rgb.clone())] {
-            let actual = processor.preprocess(&image).unwrap();
-            assert!(
-                actual
-                    .iter()
-                    .zip(&expected)
-                    .all(|(actual, expected)| actual.to_bits() == expected.to_bits()),
-                "{:?} input differs from per-pixel interpolation",
-                image.color()
+    #[test]
+    fn preprocess_preserves_aspect_ratio_on_a_white_planar_canvas() {
+        let processor = processor(1, false);
+        let color = [13, 91, 207];
+        for (width, height, scaled_w, scaled_h) in [
+            (800, 1600, 960, 1920),
+            (2400, 1200, 1920, 960),
+            (1920, 1920, 1920, 1920),
+            (400, 600, 1280, 1920),
+            (1000, 3000, 640, 1920),
+            (1281, 3840, 640, 1920), // 640.5 rounds to even.
+            (1, 4000, 1, 1920),      // Keep at least one content pixel.
+        ] {
+            let image = RgbImage::from_pixel(width, height, Rgb(color));
+            let values = processor.preprocess(&image.into()).unwrap();
+            const PLANE: usize = RESOLUTION * RESOLUTION;
+            assert_eq!(values.len(), 3 * PLANE);
+            let (channels, _) = values.as_chunks::<PLANE>();
+            for (c, channel) in channels.iter().enumerate() {
+                let content = imagenet(color)[c];
+                let white = imagenet([255; 3])[c];
+                let (rows, _) = channel.as_chunks::<RESOLUTION>();
+                for (y, row) in rows.iter().enumerate() {
+                    let filled = if y < scaled_h { scaled_w } else { 0 };
+                    assert!(
+                        row[..filled].iter().all(|&v| v == content),
+                        "{width}x{height}, row {y}"
+                    );
+                    assert!(
+                        row[filled..].iter().all(|&v| v == white),
+                        "{width}x{height}, row {y}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn preprocess_uses_area_when_shrinking_and_bilinear_when_enlarging() {
+        let processor = processor(1, false);
+        let plane = RESOLUTION * RESOLUTION;
+        let pixel = |values: &[f32], x: usize, y: usize| -> [f32; 3] {
+            std::array::from_fn(|c| values[c * plane + y * RESOLUTION + x])
+        };
+
+        // 2400x3 -> 1920x2. The first cell covers 1.25 columns and 1.5
+        // rows, with different fractional contributions on the two axes.
+        let image = RgbaImage::from_fn(2400, 3, |x, y| {
+            Rgba([(x * 100) as u8, (y * 3) as u8, 41, (x + y) as u8])
+        });
+        let values = processor
+            .preprocess(&DynamicImage::ImageRgba8(image))
+            .unwrap();
+        assert_eq!(pixel(&values, 0, 0), imagenet([20, 1, 41]));
+        assert_eq!(pixel(&values, 1, 1), imagenet([140, 5, 41]));
+        assert_eq!(pixel(&values, 0, 2), imagenet([255; 3]));
+
+        // 960x1 -> 1920x2. Green interpolates to 2.5 and 3.5 before the
+        // 8-bit conversion. Alpha is ignored even for transparent pixels.
+        let image = RgbaImage::from_fn(960, 1, |x, _| {
+            if x == 0 {
+                Rgba([0, 2, 19, 0])
+            } else {
+                Rgba([100, 4, 19, 255])
+            }
+        });
+        let values = processor
+            .preprocess(&DynamicImage::ImageRgba8(image))
+            .unwrap();
+        assert_eq!(pixel(&values, 0, 0), imagenet([0, 2, 19]));
+        assert_eq!(pixel(&values, 1, 0), imagenet([25, 2, 19]));
+        assert_eq!(pixel(&values, 2, 1), imagenet([75, 4, 19]));
+    }
+
+    #[test]
+    fn boxes_and_masks_project_from_the_long_side_square_to_the_page() {
+        let processor = processor(2, false);
+        let classes = [[4.0, -8.0, -8.0, -8.0, -8.0], [3.0, -8.0, -8.0, -8.0, -8.0]];
+        // Mask cells x=48..52, y=72..76 have positive weight in every
+        // interpolated pixel strictly inside their half-pixel support.
+        for (width, height, mask_x, mask_y, mask_side) in [
+            (800, 1600, 158, 238, 17),
+            (2400, 1200, 238, 358, 24),
+            (1920, 1920, 190, 286, 20),
+            (400, 600, 59, 89, 7),
+            (1000, 3000, 297, 447, 31),
+        ] {
+            let long_side = width.max(height) as f32;
+            let page_box = [
+                long_side / 8.0,
+                long_side / 16.0,
+                long_side / 4.0,
+                long_side / 8.0,
+            ];
+            let [x0, y0, x1, y1] = page_box.map(|v| v / long_side);
+            let boxes = [
+                [(x0 + x1) / 2.0, (y0 + y1) / 2.0, x1 - x0, y1 - y0],
+                [0.5, 0.5, 1.0, 1.0],
+            ];
+            let output = processor
+                .decode_detections(
+                    classes.as_flattened(),
+                    boxes.as_flattened(),
+                    (width, height),
+                    processor.recommended_thresholds,
+                    |queries| {
+                        assert_eq!(queries, [0, 1]);
+                        let plane = MASK_RESOLUTION * MASK_RESOLUTION;
+                        let mut logits = vec![0.0; 2 * plane];
+                        for y in 72..76 {
+                            logits[y * MASK_RESOLUTION + 48..y * MASK_RESOLUTION + 52].fill(1.0);
+                        }
+                        // The second mask has support only in right/bottom padding.
+                        if width < height {
+                            logits[plane + MASK_RESOLUTION - 1] = 1.0;
+                        } else if height < width {
+                            logits[2 * plane - MASK_RESOLUTION] = 1.0;
+                        }
+                        Ok(logits)
+                    },
+                )
+                .unwrap();
+            let [content, padding] = output.detections.as_slice() else {
+                panic!("expected two detections")
+            };
+            assert_eq!(content.bbox, page_box);
+            assert_eq!(padding.bbox, [0.0, 0.0, long_side, long_side]);
+            let mask = &content.mask;
+            assert_eq!(
+                [mask.x, mask.y, mask.width, mask.height],
+                [mask_x, mask_y, mask_side, mask_side],
+                "{width}x{height}"
             );
+            assert_eq!(content.area, mask_side * mask_side);
+            assert_eq!(mask.pixels, vec![255; content.area as usize]);
+            assert_eq!(padding.area, 0);
+            let mask = &padding.mask;
+            assert_eq!([mask.x, mask.y, mask.width, mask.height], [0; 4]);
+            assert!(mask.pixels.is_empty());
+        }
+    }
+
+    #[test]
+    fn padding_only_boxes_are_dropped_before_decoding_masks() {
+        let processor = processor(2, false);
+        let classes = [[4.0, -8.0, -8.0, -8.0, -8.0]; 2];
+        let crossing = [0.5, 0.5, 0.25, 0.25];
+        for (size, padding) in [
+            ((800, 1600), [0.75, 0.5, 0.25, 0.25]),
+            ((1600, 800), [0.5, 0.75, 0.25, 0.25]),
+        ] {
+            let output = processor
+                .decode_detections(
+                    classes.as_flattened(),
+                    [padding, crossing].as_flattened(),
+                    size,
+                    processor.recommended_thresholds,
+                    |queries| {
+                        assert_eq!(queries, [1]);
+                        Ok(vec![-1.0; MASK_RESOLUTION * MASK_RESOLUTION])
+                    },
+                )
+                .unwrap();
+            assert_eq!(output.detections.len(), 1);
+            assert_eq!(output.detections[0].bbox, [600., 600., 1000., 1000.]);
+
+            let output = processor
+                .decode_detections(
+                    &classes[0],
+                    &padding,
+                    size,
+                    processor.recommended_thresholds,
+                    |_| panic!("no on-page queries"),
+                )
+                .unwrap();
+            assert!(output.detections.is_empty());
+        }
+    }
+
+    #[test]
+    fn fractional_page_edge_is_cropped_after_mask_interpolation() {
+        let processor = processor(1, false);
+        // The page occupies 240.9 native mask columns or rows. Interpolating
+        // across its edge gives the last page pixel 25% of the next logit.
+        // Rounding the native crop to 241 first would repeat cell 240 there.
+        for (width, height) in [(803, 1600), (1600, 803)] {
+            let result = processor
+                .decode_detections(
+                    &[4.0, -8.0, -8.0, -8.0, -8.0],
+                    &[0.5, 0.5, 1.0, 1.0],
+                    (width, height),
+                    processor.recommended_thresholds,
+                    |_| {
+                        let mut logits = vec![-7.0; MASK_RESOLUTION * MASK_RESOLUTION];
+                        let (rows, _) = logits.as_chunks_mut::<MASK_RESOLUTION>();
+                        for (y, row) in rows.iter_mut().enumerate() {
+                            if width < height {
+                                row[239..241].fill(1.0);
+                            } else if (239..241).contains(&y) {
+                                row.fill(1.0);
+                            }
+                        }
+                        Ok(logits)
+                    },
+                )
+                .unwrap();
+            let detection = &result.detections[0];
+            let mask = &detection.mask;
+            let expected = if width < height {
+                [798, 0, 4, height]
+            } else {
+                [0, 798, width, 4]
+            };
+            assert_eq!([mask.x, mask.y, mask.width, mask.height], expected);
+            assert_eq!(detection.area, 4 * 1600);
+            assert_eq!(mask.pixels, vec![255; detection.area as usize]);
         }
     }
 
@@ -654,8 +982,9 @@ mod tests {
         }
         logits[MASK_RESOLUTION - 1] = 0.3;
         for (width, height) in [(1013, 1517), (301, 700), (700, 301)] {
-            let rows = bilinear_taps(MASK_RESOLUTION, height);
-            let columns = bilinear_taps(MASK_RESOLUTION, width);
+            let square = bilinear_taps(MASK_RESOLUTION, width.max(height));
+            let rows = &square[..height];
+            let columns = &square[..width];
 
             let mut expected = vec![false; width * height];
             for (y, row) in rows.iter().enumerate() {
@@ -666,7 +995,7 @@ mod tests {
                     expected[y * width + x] = value > 0.0;
                 }
             }
-            let (area, mask) = page_mask(&logits, &rows, &columns);
+            let (area, mask) = page_mask(&logits, rows, columns);
 
             assert_eq!(
                 area as usize,
