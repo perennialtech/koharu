@@ -7,7 +7,7 @@ use std::{collections::HashMap, sync::Arc};
 use image::{GrayImage, ImageBuffer, Luma, Pixel, RgbImage, imageops};
 use imageproc::{
     distance_transform::{Norm, euclidean_squared_distance_transform},
-    morphology::{close, dilate, dilate_mut},
+    morphology::{close, dilate},
     region_labelling::{Connectivity, connected_components},
 };
 use rayon::prelude::*;
@@ -1117,7 +1117,8 @@ fn glyph_mask(
             bbox[3].max(y1),
         ]
     });
-    let margin = scaled(2.0, page_width, page_height);
+    let margin_f = (page_width.max(page_height) as f32 / 1024.0 * 1.75).clamp(1.0, 127.0);
+    let margin = margin_f.ceil() as u32;
     let ink_corner = [left, top];
     let left = i64::from(left) - i64::from(margin);
     let top = i64::from(top) - i64::from(margin);
@@ -1344,14 +1345,24 @@ fn glyph_mask(
     for &point in &detector_only {
         canvas[point] = Luma([0]);
     }
-    let mut fitted = dilate(&canvas, Norm::L2, margin as u8);
+    let dilate_l2 = |shape: &GrayImage, radius: f32| -> GrayImage {
+        if !shape.as_raw().contains(&255) {
+            return GrayImage::new(shape.width(), shape.height());
+        }
+        let limit = f64::from(radius) * f64::from(radius);
+        let dist = euclidean_squared_distance_transform(shape);
+        GrayImage::from_fn(shape.width(), shape.height(), |x, y| {
+            Luma([u8::from(dist[(x, y)][0] <= limit) * 255])
+        })
+    };
+    let mut fitted = dilate_l2(&canvas, margin_f);
     if !detector_only.is_empty() {
         canvas.fill(0);
         for point in detector_only {
             canvas[point] = Luma([255]);
         }
-        dilate_mut(&mut canvas, Norm::L2, (margin / 2) as u8);
-        for (fit, detector) in fitted.iter_mut().zip(canvas.as_raw()) {
+        let detector_fitted = dilate_l2(&canvas, margin_f * 0.5);
+        for (fit, detector) in fitted.iter_mut().zip(detector_fitted.as_raw()) {
             *fit |= detector;
         }
     }
@@ -3778,5 +3789,95 @@ mod tests {
         );
         assert!(reverse[1].mask.contains(65, 75));
         assert!(!reverse[0].mask.contains(65, 75));
+    }
+
+    #[test]
+    fn page_edge_glyph_still_recovers_while_interior_crop_edge_background_is_excluded() {
+        // Case 1: A valid dark glyph touching the actual left page edge (x=0..9)
+        // whose detector box starts at x=5 must still recover its cut stroke.
+        let page_edge = RgbImage::from_fn(120, 120, |x, y| {
+            let edge_glyph = (0..9).contains(&x) && (45..61).contains(&y);
+            let inner_glyph = (18..28).contains(&x) && (45..61).contains(&y);
+            Rgb(if edge_glyph || inner_glyph {
+                [15, 15, 15]
+            } else {
+                [250, 250, 250]
+            })
+        });
+        let edge_bbox = [5.0, 42.0, 32.0, 64.0];
+        let edge_mask = Mask {
+            x: 5,
+            y: 42,
+            width: 27,
+            height: 22,
+            pixels: vec![255; 27 * 22],
+        };
+        let (fitted_edge, _, _, _) =
+            glyph_mask(&edge_mask, edge_bbox, &page_edge, GlyphProposal::Box);
+        assert!(
+            fitted_edge.contains(1, 52),
+            "cut glyph at actual page edge must be recovered"
+        );
+
+        // Case 2: A compact dark background wedge outside a text box that exits
+        // an interior crop boundary (left > 0 / top > 0) must not be pulled in.
+        let page = RgbImage::from_fn(240, 240, |x, y| {
+            let dx = (x as f32 - 120.0) / 55.0;
+            let dy = (y as f32 - 120.0) / 70.0;
+            let in_bubble = dx * dx + dy * dy <= 1.0;
+            let glyph = (95..145).contains(&x)
+                && (85..155).contains(&y)
+                && (((x - 95) % 16) < 6)
+                && (((y - 85) % 24) < 16);
+            Rgb(if glyph {
+                [25, 25, 30]
+            } else if in_bubble {
+                [203, 225, 248]
+            } else {
+                [65, 130, 220]
+            })
+        });
+        let bbox = [88.0, 78.0, 152.0, 162.0];
+        let mask = crop(
+            &GrayImage::from_fn(240, 240, |x, y| {
+                let near_glyph = (92..148).contains(&x) && (82..158).contains(&y);
+                let stray_corner = (88..94).contains(&x) && (78..86).contains(&y);
+                Luma([u8::from(near_glyph || stray_corner) * 255])
+            }),
+            0,
+            0,
+            240,
+            240,
+        );
+        let (fitted, _, _, _) = glyph_mask(&mask, bbox, &page, GlyphProposal::Segmented(bbox));
+        assert!(fitted.contains(97, 90));
+        assert!(!fitted.contains(120, 20));
+        assert!(!fitted.contains(120, 220));
+    }
+
+    #[test]
+    fn continuous_l2_dilation_uses_fractional_radius_on_1024px_page() {
+        // On a 1024px page, continuous radius is 1.75px: diagonal (dist sqrt(2)=1.414)
+        // is included while 2px on-axis (dist 2.0) is excluded, distinguishing it
+        // from integer radius 2.
+        let mut page = RgbImage::from_pixel(1024, 1024, Rgb([250, 250, 250]));
+        for y in 500..520 {
+            for x in 500..506 {
+                page[(x, y)] = Rgb([15, 15, 15]);
+            }
+        }
+        let bbox = [496.0, 496.0, 510.0, 524.0];
+        let mask = Mask {
+            x: 496,
+            y: 496,
+            width: 14,
+            height: 28,
+            pixels: vec![255; 14 * 28],
+        };
+        let (fitted, _, _, _) = glyph_mask(&mask, bbox, &page, GlyphProposal::Box);
+        // Corner pixel (499, 499) is sqrt(2) from (500, 500): must be inside 1.75px.
+        assert!(fitted.contains(499, 499));
+        // On-axis pixel (498, 510) is 2.0px from (500, 510): must be outside 1.75px.
+        assert!(!fitted.contains(498, 510));
     }
 }
