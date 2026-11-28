@@ -1920,7 +1920,7 @@ fn neutral(color: [u8; 4]) -> bool {
     r.max(g).max(b) - r.min(g).min(b) < 26
 }
 
-fn contrast_color([r, g, b, _]: [u8; 4]) -> [u8; 4] {
+fn relative_luminance([r, g, b, _]: [u8; 4]) -> f32 {
     let linear = |c: u8| {
         let c = f32::from(c) / 255.0;
         if c <= 0.04045 {
@@ -1929,8 +1929,16 @@ fn contrast_color([r, g, b, _]: [u8; 4]) -> [u8; 4] {
             ((c + 0.055) / 1.055).powf(2.4)
         }
     };
-    let light = 0.2126 * linear(r) + 0.7152 * linear(g) + 0.0722 * linear(b) > 0.5;
-    let value = if light { 0 } else { 255 };
+    0.2126 * linear(r) + 0.7152 * linear(g) + 0.0722 * linear(b)
+}
+
+fn contrast_color(color: [u8; 4]) -> [u8; 4] {
+    // WCAG equal-contrast midpoint between black and white: sqrt(1.05 * 0.05) - 0.05.
+    let value = if relative_luminance(color) > 0.1791 {
+        0
+    } else {
+        255
+    };
     [value, value, value, 255]
 }
 
@@ -1938,7 +1946,11 @@ fn neutral_fill(color: [u8; 4]) -> [u8; 4] {
     if !neutral(color) {
         return color;
     }
-    let value = 255 - contrast_color(color)[0];
+    let value = if relative_luminance(color) > 0.5 {
+        255
+    } else {
+        0
+    };
     [value, value, value, color[3]]
 }
 
@@ -2998,5 +3010,34 @@ mod tests {
             .await
             .unwrap_err();
         assert!(error.to_string().contains("not contiguous"));
+    }
+
+    #[test]
+    fn contrast_color_uses_wcag_midpoint_and_resolve_stroke_preserves_high_contrast() {
+        assert_eq!(contrast_color([130, 130, 130, 255]), [0, 0, 0, 255]);
+        assert_eq!(contrast_color([110, 110, 110, 255]), [255, 255, 255, 255]);
+        let make_typo = |stroke_color: [u8; 4]| Typography {
+            origin: Origin::User,
+            preferred_font: None,
+            font_weight: None,
+            font_style: None,
+            size: Some(24.0),
+            auto_fit: true,
+            color: Some([240, 220, 100, 255]),
+            stroke_color: Some(stroke_color),
+            stroke_width: Some(2.0),
+            alignment: None,
+            writing_mode: None,
+            extensions: Default::default(),
+        };
+        // Dark chromatic fill with a neutral dark stroke must snap to white for WCAG contrast.
+        let dark_blue_stroke =
+            resolve_stroke(Some(&make_typo([10, 10, 10, 255])), [30, 50, 75, 255]).unwrap();
+        assert_eq!(dark_blue_stroke.color, [255, 255, 255, 255]);
+        assert_eq!(dark_blue_stroke.width_px, 2.0);
+        // Light yellow fill with a neutral white stroke must snap to black.
+        let yellow_stroke =
+            resolve_stroke(Some(&make_typo([250, 250, 250, 255])), [240, 220, 100, 255]).unwrap();
+        assert_eq!(yellow_stroke.color, [0, 0, 0, 255]);
     }
 }

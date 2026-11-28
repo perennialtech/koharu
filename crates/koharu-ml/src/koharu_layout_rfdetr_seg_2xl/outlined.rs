@@ -103,7 +103,12 @@ pub(super) fn outlined(
             else {
                 continue;
             };
+            let band_in_exterior =
+                exterior.len() >= 16 && exterior_share(found.color, SEED_TOLERANCE) >= 0.15;
             let band_color = GrayImage::from_fn(block.width, block.height, |x, y| {
+                if band_in_exterior && block.pixels[(y * block.width + x) as usize] == 0 {
+                    return Luma([0]);
+                }
                 let error = color_distance(color_at(x, y), found.color);
                 Luma([64u8.saturating_sub(error).saturating_mul(8)])
             });
@@ -929,6 +934,85 @@ mod tests {
         assert!(
             outlined(&page, &block, &block, &ink, false, |_| 32.0).is_none(),
             "framed caption paper must not be recovered as a glyph fill"
+        );
+    }
+
+    #[test]
+    fn exterior_matching_outline_color_does_not_admit_art_strokes_outside_block() {
+        // White-outlined black glyphs inside a diagonal block on white-dominant
+        // art, with a dark art bar right beside the block edge. Because white
+        // also dominates the exterior, outside-block white paper must not count
+        // as outline support for the edge art bar.
+        let mut page = RgbImage::from_pixel(160, 160, Rgb(WHITE));
+        for y in 20..140 {
+            for x in 20..140 {
+                let near_bar = (87..99).contains(&x) && (44..70).contains(&y);
+                if !near_bar && (x + y) % 19 < 4 {
+                    page[(x, y)] = Rgb([140, 140, 140]);
+                }
+            }
+        }
+        let mut glyphs = GrayImage::new(160, 160);
+        for step in 0..3 {
+            let cx = 54 + step * 20;
+            let cy = 54 + step * 20;
+            for y in cy..cy + 14 {
+                for x in cx..cx + 14 {
+                    if x < cx + 4 || y < cy + 4 || x >= cx + 10 || y >= cy + 10 {
+                        glyphs[(x, y)] = Luma([255]);
+                    }
+                }
+            }
+        }
+        let outline_band = dilate(&glyphs, Norm::L2, 4);
+        for (x, y, p) in outline_band.enumerate_pixels() {
+            if p[0] != 0 {
+                page[(x, y)] = Rgb(if glyphs[(x, y)][0] != 0 { BLACK } else { WHITE });
+            }
+        }
+        // Dark art stroke ending exactly at the block edge, well away from the
+        // diagonal glyphs' own outlines and surrounded by exterior white paper
+        // outside the block.
+        for y in 49..65 {
+            for x in 92..94 {
+                page[(x, y)] = Rgb(BLACK);
+            }
+        }
+        let mut block_img = dilate(&outline_band, Norm::L2, 2);
+        for y in 49..65 {
+            for x in 92..94 {
+                block_img[(x, y)] = Luma([255]);
+            }
+        }
+        let (x0, y0, w, h) = (44, 44, 72, 72);
+        let block_ref = &block_img;
+        let mask = Mask {
+            x: x0,
+            y: y0,
+            width: w,
+            height: h,
+            pixels: (y0..y0 + h)
+                .flat_map(|y| (x0..x0 + w).map(move |x| block_ref[(x, y)][0]))
+                .collect(),
+        };
+        let ink_in_block = GrayImage::from_fn(w, h, |x, y| {
+            let inside_block = block_ref[(x0 + x, y0 + y)][0] != 0;
+            let dark = page[(x0 + x, y0 + y)].0 == BLACK;
+            Luma([u8::from(inside_block && dark) * 255])
+        });
+        let found = outlined(&page, &mask, &mask, &ink_in_block, true, |_| 14.0)
+            .expect("tilted outlined glyphs");
+        assert_eq!(found.ink, BLACK);
+        assert_eq!(found.outline.color, WHITE);
+        assert_eq!(
+            found.glyphs[(56 - x0, 56 - y0)][0],
+            255,
+            "real glyph should be recovered"
+        );
+        assert_eq!(
+            found.glyphs[(93 - x0, 56 - y0)][0],
+            0,
+            "edge art bar exposed to exterior white must not be recovered into glyph mask"
         );
     }
 }
