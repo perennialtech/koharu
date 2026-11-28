@@ -602,7 +602,11 @@ fn coverage<'a>(
     score
 }
 
-fn clear(jobs: &mut [Lettering], page: &CompiledPage, mut groups: Vec<Vec<usize>>) -> Result<()> {
+fn clear(
+    jobs: &mut [Lettering],
+    page: &CompiledPage,
+    mut groups: Vec<(Vec<usize>, bool)>,
+) -> Result<()> {
     let sheet = InkBox::from_rect(
         Rect::new(0.0, 0.0, page.width.into(), page.height.into()),
         Affine::IDENTITY,
@@ -617,7 +621,7 @@ fn clear(jobs: &mut [Lettering], page: &CompiledPage, mut groups: Vec<Vec<usize>
             2
         }
     };
-    groups.sort_by(|a, b| {
+    groups.sort_by(|(a, _), (b, _)| {
         rank(&jobs[a[0]]).cmp(&rank(&jobs[b[0]])).then_with(|| {
             let area = |group: &[usize]| {
                 group
@@ -629,7 +633,7 @@ fn clear(jobs: &mut [Lettering], page: &CompiledPage, mut groups: Vec<Vec<usize>
             area(b).total_cmp(&area(a))
         })
     });
-    for group in groups {
+    for (group, check_walls) in groups {
         let first = &jobs[group[0]];
         let (text, intent) = inputs(&page.layers[first.index]);
         let obstacles: Vec<_> = jobs
@@ -638,21 +642,41 @@ fn clear(jobs: &mut [Lettering], page: &CompiledPage, mut groups: Vec<Vec<usize>
             .filter(|(i, j)| !group.contains(i) && visible(&page.layers[j.index]))
             .flat_map(|(_, j)| &j.measured.ink)
             .collect();
-        let walls: Vec<_> = page
+        let all_walls: Vec<_> = page
             .balloons
             .iter()
             .filter(|(id, _)| Some(*id) != intent.balloon)
             .map(|(_, wall)| wall)
             .collect();
+        let initial_walls: &[&BalloonOutline] = if check_walls { &all_walls } else { &[] };
         let mut score = coverage(
             group.iter().map(|&i| &jobs[i].measured),
             &sheet,
             &obstacles,
-            &walls,
+            initial_walls,
         );
         if score <= 0.000001 {
             continue;
         }
+        // When an un-lifted, un-matched group resizes to clear colliding text,
+        // still guard against reflowing into any neighboring balloon outline it
+        // did not already overlap.
+        let trial_walls: Vec<_> = if check_walls {
+            all_walls
+        } else {
+            all_walls
+                .into_iter()
+                .filter(|wall| {
+                    group.iter().all(|&i| {
+                        jobs[i]
+                            .measured
+                            .ink
+                            .iter()
+                            .all(|line| line.overlap(wall) <= 0.000001)
+                    })
+                })
+                .collect()
+        };
         let high = first.measured.size;
         let low = group
             .iter()
@@ -681,13 +705,25 @@ fn clear(jobs: &mut [Lettering], page: &CompiledPage, mut groups: Vec<Vec<usize>
                 })
                 .collect()
         };
-        let cost = |trial: &[Measured]| coverage(trial.iter(), &sheet, &obstacles, &walls);
+        let cost = |trial: &[Measured]| coverage(trial.iter(), &sheet, &obstacles, &trial_walls);
+        let hits_guarded_wall = |trial: &[Measured]| -> bool {
+            !check_walls
+                && trial.iter().any(|measured| {
+                    measured
+                        .ink
+                        .iter()
+                        .any(|line| trial_walls.iter().any(|wall| line.overlap(wall) > 0.000001))
+                })
+        };
         let mut best = None;
         // Reflow can make a smaller run wider. Search down in eighths before
         // refining the first clear interval, retaining least coverage if none clears.
         for step in 1..=8 {
             let em = high - (high - low) * step as f32 / 8.0;
             let trial = at(em)?;
+            if hits_guarded_wall(&trial) {
+                continue;
+            }
             let covered = cost(&trial);
             if covered < score {
                 score = covered;
@@ -697,7 +733,7 @@ fn clear(jobs: &mut [Lettering], page: &CompiledPage, mut groups: Vec<Vec<usize>
                     for _ in 0..8 {
                         let middle = (l + h) * 0.5;
                         let trial = at(middle)?;
-                        if cost(&trial) <= 0.000001 {
+                        if !hits_guarded_wall(&trial) && cost(&trial) <= 0.000001 {
                             l = middle;
                             best = Some(trial);
                         } else {
@@ -719,7 +755,7 @@ fn clear(jobs: &mut [Lettering], page: &CompiledPage, mut groups: Vec<Vec<usize>
 
 /// Match visible siblings first. A size change can reflow several lines into
 /// one wider line. Keep matched siblings together in all clearance trials.
-fn together(jobs: &mut [Lettering], page: &CompiledPage) -> Result<Vec<Vec<usize>>> {
+fn together(jobs: &mut [Lettering], page: &CompiledPage) -> Result<Vec<(Vec<usize>, bool)>> {
     let mut movable = Vec::new();
     let mut balloons = BTreeMap::<EntityId, Vec<(usize, f32)>>::new();
     for (i, job) in jobs.iter().enumerate() {
@@ -737,7 +773,7 @@ fn together(jobs: &mut [Lettering], page: &CompiledPage) -> Result<Vec<Vec<usize
                 .or_default()
                 .push((i, text.source_font_size.unwrap_or(text.minimum_font_size)));
         } else if job.floor.is_some() {
-            movable.push(vec![i]);
+            movable.push((vec![i], true));
         }
     }
     for members in balloons.values_mut() {
@@ -751,12 +787,10 @@ fn together(jobs: &mut [Lettering], page: &CompiledPage) -> Result<Vec<Vec<usize
                 .iter()
                 .map(|&(i, _)| jobs[i].measured.size)
                 .fold(f32::INFINITY, f32::min);
-            if group
+            let check_walls = group
                 .iter()
-                .any(|&(i, _)| jobs[i].floor.is_some() || jobs[i].measured.size > least)
-            {
-                movable.push(group.iter().map(|&(i, _)| i).collect());
-            }
+                .any(|&(i, _)| jobs[i].floor.is_some() || jobs[i].measured.size > least);
+            movable.push((group.iter().map(|&(i, _)| i).collect(), check_walls));
             for &(i, _) in group {
                 let job = &mut jobs[i];
                 if job.measured.size > least {
@@ -2000,5 +2034,100 @@ mod tests {
         assert!(new.font_size >= old.font_size * 0.5);
         assert!(new.rendered_bounds.x + new.rendered_bounds.width < left);
         assert_eq!(metadata(&after, fixed).font_size, 48.0);
+    }
+
+    #[tokio::test]
+    async fn matching_non_lifted_siblings_clear_an_untranslated_neighbor_balloon()
+    -> anyhow::Result<()> {
+        let mut session = Session::memory().await?;
+        let mut edit = session.snapshot().edit();
+        let page = edit.add_page(PageDraft::new("sheet", 1200.0, 800.0), At::End)?;
+        let bubble = edit.add_analysis_region::<BubbleRegion>(
+            page,
+            At::End,
+            &Geometry::rectangle(120.0, 180.0, 680.0, 250.0),
+            None,
+        )?;
+        // Neither sibling is lifted (`floor == None` for both): both fit well
+        // above the 12px page dialogue size and their own 12px source size.
+        // `second` fits smaller than `first`, so matching shrinks `first` from
+        // two narrow lines into one wider line.
+        let (first, _) = text_layer(
+            &mut edit,
+            page,
+            "WAVE WAVE",
+            12.0,
+            true,
+            Geometry::rectangle(160.0, 200.0, 240.0, 190.0),
+            false,
+        )?;
+        let (second, _) = text_layer(
+            &mut edit,
+            page,
+            "WAVE",
+            24.0,
+            true,
+            Geometry::rectangle(540.0, 250.0, 125.0, 80.0),
+            false,
+        )?;
+        edit.relate::<FlowsIn>(first, bubble)?;
+        edit.relate::<FlowsIn>(second, bubble)?;
+        for x in [40.0, 340.0, 640.0] {
+            text_layer(
+                &mut edit,
+                page,
+                "Hi",
+                12.0,
+                false,
+                Geometry::rectangle(x, 520.0, 220.0, 120.0),
+                true,
+            )?;
+        }
+        let snapshot = session.commit(edit.finish()?).await?.snapshot;
+        let renderer = renderer();
+        let separate = renderer.render(&snapshot, page).await?;
+        let two = committed_ink(&renderer, &separate, first)?;
+        assert_eq!(two.len(), 2);
+
+        // Make `second` source-alike to `first` so size-matching triggers without lifting.
+        let mut style = snapshot.component::<Typography>(second)?.unwrap();
+        style.size = Some(12.0);
+        let matched = session
+            .commit(snapshot.patch(|edit| edit.set(second, &style))?)
+            .await?;
+        let frame = renderer
+            .update(&separate, &matched.snapshot, &matched.changes)
+            .await?;
+        let one = committed_ink(&renderer, &frame, first)?;
+        assert_eq!(one.len(), 1);
+        assert!(two.iter().all(|line| line.bounds.x1 < one[0].bounds.x1));
+
+        // Add an untranslated neighboring balloon right where the reflowed line
+        // extends. Size-matched siblings must still check balloon walls and shrink.
+        let before_bounds = metadata(&frame, first).rendered_bounds;
+        let before_right = f64::from(before_bounds.x + before_bounds.width);
+        let neighbor_left = before_right - 12.0;
+        let neighbor_mid_y = f64::from(before_bounds.y + before_bounds.height * 0.5);
+        let neighbor_rect = Geometry::rectangle(neighbor_left, neighbor_mid_y - 20.0, 20.0, 40.0);
+        let mut edit = matched.snapshot.edit();
+        edit.add_analysis_region::<BubbleRegion>(page, At::End, &neighbor_rect, None)?;
+        let change = session.commit(edit.finish()?).await?;
+        let cleared = renderer.render(&change.snapshot, page).await?;
+        let after_bounds = metadata(&cleared, first).rendered_bounds;
+        let after_right = f64::from(after_bounds.x + after_bounds.width);
+        assert!(
+            metadata(&cleared, first).font_size < metadata(&frame, first).font_size,
+            "size-matched non-lifted sibling must shrink to clear neighbor balloon"
+        );
+        assert!(
+            after_right <= neighbor_left + 1.5 && after_right < before_right - 10.0,
+            "size-matched non-lifted sibling must clear untranslated neighbor balloon: before_size={} after_size={} before_right={} after_right={} neighbor_left={}",
+            metadata(&frame, first).font_size,
+            metadata(&cleared, first).font_size,
+            before_right,
+            after_right,
+            neighbor_left
+        );
+        Ok(())
     }
 }
