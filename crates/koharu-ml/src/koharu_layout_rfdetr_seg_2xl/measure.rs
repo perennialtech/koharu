@@ -140,10 +140,12 @@ impl Mask {
             .map(|(x, y, _)| (x as f32, y as f32))
             .collect();
         // Subsample deterministically on very high-resolution masks so the angle
-        // sweep stays fast.
+        // sweep stays fast without sudden integer-step jumps.
         if points.len() > 4096 {
-            let step = points.len() / 4096;
-            points = points.into_iter().step_by(step).collect();
+            let total = points.len() as u64;
+            points = (0..4096u64)
+                .map(|i| points[(i * total / 4096) as usize])
+                .collect();
         }
         let max_dim = (width.max(height) as f32).max(1.0);
         // Scale bin size gently on very large crops so projection energy measures
@@ -164,18 +166,26 @@ impl Mask {
                 min_v = min_v.min(v);
                 max_v = max_v.max(v);
             }
-            let len_u = (((max_u - min_u) / bin_size).floor() as usize) + 1;
-            let len_v = (((max_v - min_v) / bin_size).floor() as usize) + 1;
-            let mut hist_u = vec![0u32; len_u];
-            let mut hist_v = vec![0u32; len_v];
+            let len_u = (((max_u - min_u) / bin_size).floor() as usize) + 2;
+            let len_v = (((max_v - min_v) / bin_size).floor() as usize) + 2;
+            let mut hist_u = vec![0.0f64; len_u];
+            let mut hist_v = vec![0.0f64; len_v];
             for &(x, y) in &points {
-                let u = (((x * cos + y * sin) - min_u) / bin_size).floor() as usize;
-                let v = (((y * cos - x * sin) - min_v) / bin_size).floor() as usize;
-                hist_u[u] += 1;
-                hist_v[v] += 1;
+                let fu = ((x * cos + y * sin) - min_u) / bin_size;
+                let iu = (fu.floor() as usize).min(len_u - 2);
+                let tu = f64::from((fu - iu as f32).clamp(0.0, 1.0));
+                hist_u[iu] += 1.0 - tu;
+                hist_u[iu + 1] += tu;
+                let fv = ((y * cos - x * sin) - min_v) / bin_size;
+                let iv = (fv.floor() as usize).min(len_v - 2);
+                let tv = f64::from((fv - iv as f32).clamp(0.0, 1.0));
+                hist_v[iv] += 1.0 - tv;
+                hist_v[iv + 1] += tv;
             }
-            let eu: f64 = hist_u.iter().map(|&c| f64::from(c) * f64::from(c)).sum();
-            let ev: f64 = hist_v.iter().map(|&c| f64::from(c) * f64::from(c)).sum();
+            // Linear tent splatting removes rational-slope integer-lattice Moiré
+            // spikes (such as -45°) without over-smoothing thin strokes.
+            let eu: f64 = hist_u.iter().map(|&c| c * c).sum();
+            let ev: f64 = hist_v.iter().map(|&c| c * c).sum();
             eu + ev
         };
         let narrower_span = |deg: f32| {
@@ -425,14 +435,101 @@ fn lines(ink: &GrayImage, vertical: bool, tilt: f32) -> Vec<Line> {
             line.length = last - first + 1.0;
         }
     };
+    let merge_connected = |lines: Vec<Line>, max_valley: Option<usize>, gap: u32| -> Vec<Line> {
+        let bridgeable = |left: &Line, right: &Line| {
+            let valley = &profile[left.start + left.breadth..right.start];
+            max_valley.is_none_or(|limit| valley.len() <= limit)
+                && valley.iter().all(|&n| 2 * n > gap)
+        };
+        if !lines.windows(2).any(|pair| bridgeable(&pair[0], &pair[1])) {
+            return lines;
+        }
+        let labels = connected_components(ink, Connectivity::Eight, Luma([0]));
+        let count = labels.pixels().map(|label| label[0]).max().unwrap_or(0) as usize;
+        let mut spans = vec![(usize::MAX, 0); count + 1];
+        let mut in_bin = vec![Vec::new(); profile.len()];
+        for &(across, along, x, y) in &points {
+            let bin = (across - low) as usize;
+            let label = labels[(x, y)][0] as usize;
+            in_bin[bin].push((label, along.round() as i32));
+            let (first, last) = &mut spans[label];
+            *first = (*first).min(bin);
+            *last = (*last).max(bin);
+        }
+        let merge: Vec<_> = lines
+            .windows(2)
+            .map(|pair| {
+                let [left, right] = [&pair[0], &pair[1]];
+                if !bridgeable(left, right) {
+                    return false;
+                }
+                let left_end = left.start + left.breadth;
+                let side_shared = |line: &Line| {
+                    let shared = in_bin[line.start..line.start + line.breadth]
+                        .iter()
+                        .flatten()
+                        .filter(|&&(label, _)| {
+                            let (first, last) = spans[label];
+                            first < left_end && last >= right.start
+                        })
+                        .count();
+                    if 2 * shared < line.ink as usize {
+                        return false;
+                    }
+                    if max_valley.is_some() {
+                        return true;
+                    }
+                    // Wide valleys inside stronger_gap belong to one column only
+                    // when shared glyphs cover at least half of each side's full
+                    // along-axis extent, not when a crossing heading touches one
+                    // end of a short column.
+                    let (mut min_row, mut max_row) = (i32::MAX, i32::MIN);
+                    let mut shared_rows = Vec::new();
+                    for &(label, row) in in_bin[line.start..line.start + line.breadth]
+                        .iter()
+                        .flatten()
+                    {
+                        min_row = min_row.min(row);
+                        max_row = max_row.max(row);
+                        let (first, last) = spans[label];
+                        if first < left_end && last >= right.start {
+                            shared_rows.push(row);
+                        }
+                    }
+                    shared_rows.sort_unstable();
+                    shared_rows.dedup();
+                    let line_span = (max_row - min_row + 1).max(1) as usize;
+                    2 * shared_rows.len() >= line_span
+                };
+                if max_valley.is_some() {
+                    [left, right].into_iter().any(side_shared)
+                } else {
+                    [left, right].into_iter().all(side_shared)
+                }
+            })
+            .collect();
+        let mut merged: Vec<Line> = Vec::with_capacity(lines.len());
+        for (line, join) in lines.into_iter().zip(std::iter::once(false).chain(merge)) {
+            if join {
+                let previous = merged.last_mut().expect("the valley follows a run");
+                let end = previous.start + previous.breadth;
+                previous.breadth = line.start + line.breadth - previous.start;
+                previous.ink += line.ink + profile[end..line.start].iter().sum::<u32>();
+            } else {
+                merged.push(line);
+            }
+        }
+        merged
+    };
     let mut gap = peak / 8;
     let mut lines = runs(gap);
     // A crossing heading or overlapping edges can hide gutters in the
     // aggregate profile. Prefer the deeper cuts only when they reveal
-    // several comparable runs long enough to hold multiple glyphs.
+    // several comparable runs long enough to hold multiple glyphs, after
+    // re-merging strokes that belong to the same connected glyphs.
     if lines.iter().any(|line| 2 * line.breadth > profile.len()) {
         let stronger_gap = peak / 4;
-        let mut tighter = runs(stronger_gap);
+        let mut tighter = merge_connected(runs(stronger_gap), None, stronger_gap);
         measure_lengths(&mut tighter);
         let breadth = median(&tighter).expect("the peak is a run").breadth;
         let long = tighter.iter().filter(|line| {
@@ -448,57 +545,7 @@ fn lines(ink: &GrayImage, vertical: bool, tilt: f32) -> Vec<Line> {
     // A thin connection can run between strokes of one glyph. It must
     // belong to components that account for a substantial part of a run:
     // the occasional crossing elsewhere along two columns is not a stroke.
-    let bridgeable = |left: &Line, right: &Line| {
-        let valley = &profile[left.start + left.breadth..right.start];
-        valley.len() <= 4 && valley.iter().all(|&n| 2 * n > gap)
-    };
-    if lines.windows(2).any(|pair| bridgeable(&pair[0], &pair[1])) {
-        let labels = connected_components(ink, Connectivity::Eight, Luma([0]));
-        let count = labels.pixels().map(|label| label[0]).max().unwrap_or(0) as usize;
-        let mut spans = vec![(usize::MAX, 0); count + 1];
-        let mut in_bin = vec![Vec::new(); profile.len()];
-        for &(across, _, x, y) in &points {
-            let bin = (across - low) as usize;
-            let label = labels[(x, y)][0] as usize;
-            in_bin[bin].push(label);
-            let (first, last) = &mut spans[label];
-            *first = (*first).min(bin);
-            *last = (*last).max(bin);
-        }
-        let merge: Vec<_> = lines
-            .windows(2)
-            .map(|pair| {
-                let [left, right] = [&pair[0], &pair[1]];
-                if !bridgeable(left, right) {
-                    return false;
-                }
-                let left_end = left.start + left.breadth;
-                [left, right].into_iter().any(|line| {
-                    let shared = in_bin[line.start..line.start + line.breadth]
-                        .iter()
-                        .flatten()
-                        .filter(|&&label| {
-                            let (first, last) = spans[label];
-                            first < left_end && last >= right.start
-                        })
-                        .count();
-                    2 * shared >= line.ink as usize
-                })
-            })
-            .collect();
-        let mut merged: Vec<Line> = Vec::with_capacity(lines.len());
-        for (line, join) in lines.into_iter().zip(std::iter::once(false).chain(merge)) {
-            if join {
-                let previous = merged.last_mut().expect("the valley follows a run");
-                let end = previous.start + previous.breadth;
-                previous.breadth = line.start + line.breadth - previous.start;
-                previous.ink += line.ink + profile[end..line.start].iter().sum::<u32>();
-            } else {
-                merged.push(line);
-            }
-        }
-        lines = merged;
-    }
+    lines = merge_connected(lines, Some(4), gap);
     if let Some(first) = lines.first_mut() {
         let end = first.start + first.breadth;
         let start = (0..first.start)
@@ -2327,7 +2374,7 @@ fn find_stroke_width(ink: &GrayImage, threshold: f32) -> Option<f32> {
 
 /// Minimum relative projection-energy gain over upright (0°) and over the
 /// mean across all candidate angles required before emitting a non-zero tilt.
-const MIN_TILT_GAIN_OVER_UPRIGHT: f64 = 1.05;
+const MIN_TILT_GAIN_OVER_UPRIGHT: f64 = 1.035;
 const MIN_TILT_GAIN_OVER_MEAN: f64 = 1.15;
 
 /// Cap on the block closing and stroke-extension radius in pixels so
@@ -3879,5 +3926,91 @@ mod tests {
         assert!(fitted.contains(499, 499));
         // On-axis pixel (498, 510) is 2.0px from (500, 510): must be outside 1.75px.
         assert!(!fitted.contains(498, 510));
+    }
+
+    #[test]
+    fn round_glyph_with_diagonal_stroke_does_not_snap_to_45_deg_aliasing() {
+        // A round glyph with a single diagonal stroke has only a ~4% projection
+        // bias at -45°, well below the 15% tilt threshold. Hard floor binning
+        // adds a ~12% integer-lattice Moiré spike at -45°, pushing it over the
+        // threshold and snapping upright lettering to -45°.
+        let mut page = RgbImage::from_pixel(160, 160, Rgb([255, 255, 255]));
+        let mut pixels = vec![0u8; 160 * 160];
+        for y in 0..160u32 {
+            for x in 0..160u32 {
+                let dx = x as i32 - 80;
+                let dy = y as i32 - 80;
+                let r2 = dx * dx + dy * dy;
+                let on_ring = (20 * 20..=30 * 30).contains(&r2);
+                let on_diag = (dx + dy).abs() <= 4 && r2 <= 30 * 30;
+                if on_ring || on_diag {
+                    page[(x, y)] = Rgb([10, 10, 10]);
+                    pixels[(y * 160 + x) as usize] = 255;
+                }
+            }
+        }
+        let mask = Mask {
+            x: 0,
+            y: 0,
+            width: 160,
+            height: 160,
+            pixels,
+        };
+        let typo = mask.typography(&page).expect("glyph holds ink");
+        assert_eq!(
+            typo.tilt, 0.0,
+            "upright round glyph must not snap to -45° lattice aliasing"
+        );
+    }
+
+    #[test]
+    fn stronger_gap_remerges_connected_hollow_glyph_strokes() {
+        // Five stacked hollow 24x24 glyphs with left, middle, and right vertical
+        // bars (3 px wide) joined by top and bottom horizontal bars (3 px tall).
+        // The interior valleys fall below peak / 4, which would slice one column
+        // into three thin strokes unless connected glyphs are re-merged first.
+        let ink = GrayImage::from_fn(28, 140, |x, y| {
+            let local_y = y % 28;
+            let in_glyph = local_y < 24 && (2..26).contains(&x);
+            let vertical_bar =
+                (2..5).contains(&x) || (12..15).contains(&x) || (23..26).contains(&x);
+            let horizontal_bar = !(3..21).contains(&local_y);
+            Luma([u8::from(in_glyph && (vertical_bar || horizontal_bar)) * 255])
+        });
+        let cols = lines(&ink, true, 0.0);
+        assert_eq!(
+            cols.len(),
+            1,
+            "single column of connected hollow glyphs must not split"
+        );
+        assert_eq!(breadth(&ink, true, 0.0), 24.0);
+    }
+
+    #[test]
+    fn crossing_heading_touching_first_glyphs_preserves_three_columns() {
+        // Three 12 px columns separated by 6 px gutters, with a 6 px horizontal
+        // heading touching the top glyph of each column — including a short
+        // trailing column with only one lower glyph. Even when the heading plus
+        // top glyph holds most of the short column's ink, it only covers the
+        // top section of the column, so stronger_gap must keep all three columns.
+        let ink = GrayImage::from_fn(48, 56, |x, y| {
+            let heading = (0..48).contains(&x) && (0..6).contains(&y);
+            let col01 = (0..12).contains(&x) || (18..30).contains(&x);
+            let col2 = (36..48).contains(&x);
+            let col01_top = (6..16).contains(&y);
+            let col2_top = (6..22).contains(&y);
+            let col01_lower = ((20..30).contains(&y) || (34..44).contains(&y)) && (x % 18) < 8;
+            let col2_lower = (34..42).contains(&y) && (36..44).contains(&x);
+            Luma([u8::from(
+                heading || col01 && (col01_top || col01_lower) || col2 && (col2_top || col2_lower),
+            ) * 255])
+        });
+        let cols = lines(&ink, true, 0.0);
+        assert_eq!(
+            cols.len(),
+            3,
+            "three columns under a heading must stay split"
+        );
+        assert_eq!(breadth(&ink, true, 0.0), 12.0);
     }
 }
