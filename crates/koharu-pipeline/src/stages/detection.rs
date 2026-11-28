@@ -178,6 +178,7 @@ pub fn fuse_detections(
     let mut detections: Vec<_> = candidates.into_iter().map(|c| c.detection).collect();
     merge_text_blocks(&mut detections, config, None);
     join_split_bubbles(&mut detections, config, None);
+    suppress_nested_bubbles(&mut detections, config, None);
     let order = layout_order(&detections, config);
     FusedDetectionLayout { detections, order }
 }
@@ -955,6 +956,7 @@ fn postprocess_page(
     // A text block can join two balloon lobes even when only one lobe is in scope.
     merge_text_blocks(&mut detections, config, sources.as_mut());
     join_split_bubbles(&mut detections, config, sources.as_mut());
+    suppress_nested_bubbles(&mut detections, config, sources.as_mut());
     if let Some(region) = selection {
         detections.retain(|detection| intersects(detection.bbox, region));
     }
@@ -999,7 +1001,14 @@ fn measure_glyph_claims(
     if claims.is_empty() {
         return result;
     }
-    let mut owners = vec![0; sources.iter().map(Vec::len).sum()];
+    let max_source = sources
+        .iter()
+        .flatten()
+        .copied()
+        .chain(claims.iter().map(|c| c.index))
+        .max()
+        .map_or(0, |m| m + 1);
+    let mut owners = vec![usize::MAX; max_source];
     for (index, sources) in sources.iter().enumerate() {
         for &source in sources {
             owners[source] = index;
@@ -1387,6 +1396,7 @@ fn infer_typography(
     if stroke_color.is_none()
         && let (Some(ink), Some(outline)) = (measured.ink, measured.outline)
         && normalize_text_color(ink) != normalize_text_color(outline.color)
+        && color_distance_squared(outline.color, background) >= COLOR_CLUSTER_MIN_DISTANCE_SQUARED
         && !color_lies_between(outline.color, ink, background)
         // A single thick island matching the outside paper is a counter.
         && (ink != background || measured.stroke_width.is_none_or(|w| w < 0.6 * measured.size))
@@ -2615,6 +2625,139 @@ fn join_split_bubbles(
         groups.push(parts);
     }
     replace_with_unions(detections, &groups, sources);
+}
+
+/// Removes redundant nested bubble detections so two overlapping balloon boxes
+/// do not render dialogue on top of one another. When an outer bubble holds no
+/// dialogue outside its nested inner bubbles, the outer wrapper is dropped;
+/// otherwise the nested sub-lobe is dropped so both flows share the outer
+/// balloon and partition it cleanly.
+fn suppress_nested_bubbles(
+    detections: &mut Vec<KoharuLayoutDetection>,
+    config: &DetectionFusionConfig,
+    sources: Option<&mut Vec<Vec<usize>>>,
+) {
+    const NESTED_CONTAINMENT: f32 = 0.85;
+    let bubbles = indices_with_label(detections, "bubble");
+    if bubbles.len() < 2 {
+        return;
+    }
+    let text_masks: Vec<(usize, MaskWindow<'_>)> = indices_with_label(detections, "text")
+        .into_iter()
+        .filter_map(|i| MaskWindow::new(&detections[i].mask, detections[i].bbox).map(|m| (i, m)))
+        .collect();
+    let bubble_texts = |bubble: usize| -> Vec<usize> {
+        let Some(mask) = foreground_mask(&detections[bubble].mask) else {
+            return Vec::new();
+        };
+        text_masks
+            .iter()
+            .filter(|(_, text)| {
+                mask_containment(mask, text) >= config.dialogue_mask_containment_threshold
+            })
+            .map(|&(i, _)| i)
+            .collect()
+    };
+    let ellipse_nested = |outer_bbox: [f32; 4], inner_bbox: [f32; 4]| -> bool {
+        let orx = (outer_bbox[2] - outer_bbox[0]) * 0.5;
+        let ory = (outer_bbox[3] - outer_bbox[1]) * 0.5;
+        let irx = (inner_bbox[2] - inner_bbox[0]) * 0.5;
+        let iry = (inner_bbox[3] - inner_bbox[1]) * 0.5;
+        if orx <= 0.0 || ory <= 0.0 || irx <= 0.0 || iry <= 0.0 {
+            return false;
+        }
+        let (ocx, ocy) = (outer_bbox[0] + orx, outer_bbox[1] + ory);
+        let (icx, icy) = (inner_bbox[0] + irx, inner_bbox[1] + iry);
+        let x0 = inner_bbox[0].floor() as i32;
+        let y0 = inner_bbox[1].floor() as i32;
+        let x1 = inner_bbox[2].ceil() as i32;
+        let y1 = inner_bbox[3].ceil() as i32;
+        let mut total = 0usize;
+        let mut covered = 0usize;
+        for y in y0..y1 {
+            let py = y as f32 + 0.5;
+            let idy = (py - icy) / iry;
+            let ody = (py - ocy) / ory;
+            for x in x0..x1 {
+                let px = x as f32 + 0.5;
+                let idx = (px - icx) / irx;
+                if idx * idx + idy * idy > 1.0 {
+                    continue;
+                }
+                total += 1;
+                let odx = (px - ocx) / orx;
+                if odx * odx + ody * ody <= 1.0 {
+                    covered += 1;
+                }
+            }
+        }
+        total > 0 && covered as f32 / total as f32 >= NESTED_CONTAINMENT
+    };
+    let mut drop = vec![false; detections.len()];
+    // Visit largest outer bubbles first.
+    let mut ordered = bubbles.clone();
+    ordered.sort_by(|&a, &b| area(detections[b].bbox).total_cmp(&area(detections[a].bbox)));
+    for &outer in &ordered {
+        if drop[outer] {
+            continue;
+        }
+        let outer_mask = foreground_mask(&detections[outer].mask);
+        let inners: Vec<usize> = bubbles
+            .iter()
+            .copied()
+            .filter(|&inner| {
+                inner != outer
+                    && !drop[inner]
+                    && area(detections[inner].bbox) < area(detections[outer].bbox)
+                    && containment(detections[outer].bbox, detections[inner].bbox)
+                        >= NESTED_CONTAINMENT
+                    && ellipse_nested(detections[outer].bbox, detections[inner].bbox)
+                    && match (
+                        outer_mask,
+                        MaskWindow::new(&detections[inner].mask, detections[inner].bbox),
+                    ) {
+                        (Some(outer_m), Some(inner_m)) => {
+                            mask_containment(outer_m, &inner_m) >= NESTED_CONTAINMENT
+                        }
+                        _ => true,
+                    }
+            })
+            .collect();
+        if inners.is_empty() {
+            continue;
+        }
+        let outer_texts: BTreeSet<usize> = bubble_texts(outer).into_iter().collect();
+        let inner_text_sets: Vec<(usize, Vec<usize>)> = inners
+            .iter()
+            .map(|&inner| (inner, bubble_texts(inner)))
+            .collect();
+        let inner_texts: BTreeSet<usize> = inner_text_sets
+            .iter()
+            .flat_map(|(_, texts)| texts.iter().copied())
+            .collect();
+        let outer_only = outer_texts.iter().any(|t| !inner_texts.contains(t));
+        if !outer_only && !inner_texts.is_empty() {
+            drop[outer] = true;
+        } else {
+            for (inner, texts) in inner_text_sets {
+                if !texts.is_empty() && texts.iter().all(|t| outer_texts.contains(t)) {
+                    drop[inner] = true;
+                }
+            }
+        }
+    }
+    if !drop.iter().any(|&d| d) {
+        return;
+    }
+    if let Some(sources) = sources {
+        let mut keep = drop.iter().map(|&d| !d);
+        sources.retain(|_| keep.next().expect("each detection has sources"));
+    }
+    let mut index = 0;
+    detections.retain(|_| {
+        index += 1;
+        !drop[index - 1]
+    });
 }
 
 /// Replaces each group of same-label detections with one detection covering
@@ -5395,5 +5538,233 @@ mod tests {
         let order = layout_order(&detections, &DetectionFusionConfig::default());
         let text_item = order.iter().find(|item| item.index == 2).unwrap();
         assert_eq!(text_item.bubble, Some(1));
+    }
+
+    #[test]
+    fn nested_bubble_dedup_drops_redundant_wrapper_or_inner_lobe() {
+        // Case 1: Outer wrapper contains two inner bubbles and no text outside them.
+        let outer = KoharuLayoutDetection {
+            area: 200 * 200,
+            mask: full_mask(50, 50, 200, 200).into(),
+            ..detection("bubble", 0.9, [50.0, 50.0, 250.0, 250.0])
+        };
+        let inner_a = KoharuLayoutDetection {
+            area: 80 * 160,
+            mask: full_mask(60, 70, 80, 160).into(),
+            ..detection("bubble", 0.9, [60.0, 70.0, 140.0, 230.0])
+        };
+        let inner_b = KoharuLayoutDetection {
+            area: 80 * 160,
+            mask: full_mask(160, 70, 80, 160).into(),
+            ..detection("bubble", 0.9, [160.0, 70.0, 240.0, 230.0])
+        };
+        let text_a = KoharuLayoutDetection {
+            area: 40 * 100,
+            mask: full_mask(80, 90, 40, 100).into(),
+            ..detection("text", 0.9, [80.0, 90.0, 120.0, 190.0])
+        };
+        let text_b = KoharuLayoutDetection {
+            area: 40 * 100,
+            mask: full_mask(180, 90, 40, 100).into(),
+            ..detection("text", 0.9, [180.0, 90.0, 220.0, 190.0])
+        };
+        let mut detections = vec![
+            outer.clone(),
+            inner_a.clone(),
+            inner_b,
+            text_a.clone(),
+            text_b,
+        ];
+        super::suppress_nested_bubbles(&mut detections, &DetectionFusionConfig::default(), None);
+        let bubbles: Vec<_> = detections.iter().filter(|d| d.label == "bubble").collect();
+        assert_eq!(
+            bubbles.len(),
+            2,
+            "redundant outer wrapper should be dropped"
+        );
+
+        // Case 2: Outer bubble holds extra text outside a single nested lobe.
+        let text_outer = KoharuLayoutDetection {
+            area: 40 * 100,
+            mask: full_mask(180, 90, 40, 100).into(),
+            ..detection("text", 0.9, [180.0, 90.0, 220.0, 190.0])
+        };
+        let mut detections2 = vec![outer, inner_a, text_a, text_outer];
+        super::suppress_nested_bubbles(&mut detections2, &DetectionFusionConfig::default(), None);
+        let bubbles2: Vec<_> = detections2.iter().filter(|d| d.label == "bubble").collect();
+        assert_eq!(bubbles2.len(), 1, "nested inner sub-lobe should be dropped");
+        assert_eq!(bubbles2[0].bbox, [50.0, 50.0, 250.0, 250.0]);
+
+        // Case 3: Overlapping non-nested bubbles whose bboxes overlap >= 85%
+        // while each mask owns its own dialogue must both survive.
+        let ellipse_mask = |x: u32, y: u32, w: u32, h: u32| KoharuLayoutMask {
+            x,
+            y,
+            width: w,
+            height: h,
+            pixels: (0..h)
+                .flat_map(|py| {
+                    (0..w).map(move |px| {
+                        let dx = (px as f32 + 0.5 - w as f32 * 0.5) / (w as f32 * 0.5);
+                        let dy = (py as f32 + 0.5 - h as f32 * 0.5) / (h as f32 * 0.5);
+                        if dx * dx + dy * dy <= 1.0 { 255 } else { 0 }
+                    })
+                })
+                .collect(),
+        };
+        let outer_ell = KoharuLayoutDetection {
+            area: 200 * 200,
+            mask: ellipse_mask(50, 50, 200, 200).into(),
+            ..detection("bubble", 0.9, [50.0, 50.0, 250.0, 250.0])
+        };
+        let inner_ell = KoharuLayoutDetection {
+            area: 90 * 90,
+            mask: ellipse_mask(170, 170, 90, 90).into(),
+            ..detection("bubble", 0.9, [170.0, 170.0, 260.0, 260.0])
+        };
+        let outer_txt = KoharuLayoutDetection {
+            area: 40 * 40,
+            mask: full_mask(100, 100, 40, 40).into(),
+            ..detection("text", 0.9, [100.0, 100.0, 140.0, 140.0])
+        };
+        let inner_txt = KoharuLayoutDetection {
+            area: 30 * 30,
+            mask: full_mask(210, 210, 30, 30).into(),
+            ..detection("text", 0.9, [210.0, 210.0, 240.0, 240.0])
+        };
+        let mut detections3 = vec![outer_ell, inner_ell, outer_txt, inner_txt];
+        super::suppress_nested_bubbles(&mut detections3, &DetectionFusionConfig::default(), None);
+        let bubbles3: Vec<_> = detections3.iter().filter(|d| d.label == "bubble").collect();
+        assert_eq!(
+            bubbles3.len(),
+            2,
+            "bubble owning dialogue outside the outer mask must survive"
+        );
+
+        // Case 4: End-to-end fuse_detections with fallback ellipses where bare
+        // overlap is 79.8% (< 85%) while text stamping pushes naive mask overlap
+        // and text-excluded overlap past 85%: distinct inner bubble must survive
+        // and each dialogue block must keep its own balloon.
+        let fused = super::fuse_detections(
+            KoharuLayoutDetections {
+                image_width: 300,
+                image_height: 300,
+                detections: vec![
+                    KoharuLayoutDetection {
+                        area: 30 * 30,
+                        mask: full_mask(90, 90, 30, 30).into(),
+                        ..detection("text", 0.9, [90.0, 90.0, 120.0, 120.0])
+                    },
+                    KoharuLayoutDetection {
+                        area: 24 * 42,
+                        mask: full_mask(225, 179, 24, 42).into(),
+                        ..detection("text", 0.9, [225.0, 179.0, 249.0, 221.0])
+                    },
+                ],
+            },
+            &[
+                ComicTextBubbleDetection {
+                    label: ComicTextBubbleLabel::Bubble,
+                    bbox: [50.0, 50.0, 250.0, 250.0],
+                    score: 0.9,
+                },
+                ComicTextBubbleDetection {
+                    label: ComicTextBubbleLabel::Bubble,
+                    bbox: [180.0, 145.0, 260.0, 225.0],
+                    score: 0.9,
+                },
+            ],
+            0.3,
+            &DetectionFusionConfig::default(),
+        );
+        let fused_bubbles: Vec<_> = fused
+            .detections
+            .iter()
+            .filter(|d| d.label == "bubble")
+            .collect();
+        assert_eq!(
+            fused_bubbles.len(),
+            2,
+            "fallback ellipse text-stamping must not cause distinct inner bubble to be dropped"
+        );
+        let assigned_bubbles: std::collections::BTreeSet<Option<usize>> = fused
+            .order
+            .iter()
+            .filter(|item| fused.detections[item.index].label == "text")
+            .map(|item| item.bubble)
+            .collect();
+        assert_eq!(
+            assigned_bubbles.len(),
+            2,
+            "each dialogue block must keep its own distinct balloon: {assigned_bubbles:?}"
+        );
+        assert!(assigned_bubbles.iter().all(Option::is_some));
+
+        // Case 4b: Same geometry after glyph fitting narrows the inner text mask
+        // to a thin glyph column while the bubble masks retain the pre-fit stamp:
+        // pure ellipse nesting remains 79.8% (< 85%), so both bubbles still survive.
+        let mut post_fit = fused.detections.clone();
+        for det in &mut post_fit {
+            if det.label == "text" && det.bbox[0] > 200.0 {
+                det.mask = full_mask(235, 182, 4, 36).into();
+                det.area = 4 * 36;
+                det.bbox = [235.0, 182.0, 239.0, 218.0];
+            }
+        }
+        super::suppress_nested_bubbles(&mut post_fit, &DetectionFusionConfig::default(), None);
+        let post_fit_bubbles: Vec<_> = post_fit.iter().filter(|d| d.label == "bubble").collect();
+        assert_eq!(
+            post_fit_bubbles.len(),
+            2,
+            "post-fit stale text stamps must not cause distinct inner bubble to be dropped"
+        );
+
+        // Case 5: An empty inner bubble (no recognized text) must not be dropped.
+        let outer_rect = KoharuLayoutDetection {
+            area: 200 * 200,
+            mask: full_mask(50, 50, 200, 200).into(),
+            ..detection("bubble", 0.9, [50.0, 50.0, 250.0, 250.0])
+        };
+        let empty_inner = KoharuLayoutDetection {
+            area: 40 * 40,
+            mask: full_mask(180, 180, 40, 40).into(),
+            ..detection("bubble", 0.9, [180.0, 180.0, 220.0, 220.0])
+        };
+        let outer_only_txt = KoharuLayoutDetection {
+            area: 40 * 40,
+            mask: full_mask(80, 80, 40, 40).into(),
+            ..detection("text", 0.9, [80.0, 80.0, 120.0, 120.0])
+        };
+        let mut detections5 = vec![outer_rect, empty_inner, outer_only_txt];
+        super::suppress_nested_bubbles(&mut detections5, &DetectionFusionConfig::default(), None);
+        let bubbles5: Vec<_> = detections5.iter().filter(|d| d.label == "bubble").collect();
+        assert_eq!(bubbles5.len(), 2, "empty inner bubble must survive");
+    }
+
+    #[test]
+    fn oversized_uncorroborated_enclosure_is_not_inferred_as_outline() {
+        // Small black glyphs inside a wide white bubble on a dark background:
+        // the wide white bubble interior (~18px thick around 10px glyphs) must
+        // not be inferred as an outline.
+        let mut image = RgbImage::from_pixel(120, 120, Rgb([40, 45, 55]));
+        for y in 20..100 {
+            for x in 20..100 {
+                image.put_pixel(x, y, Rgb([255, 255, 255]));
+            }
+        }
+        for col in [48, 62] {
+            for y in 42..78 {
+                for x in col..col + 10 {
+                    if x < col + 3 || y % 12 < 3 {
+                        image.put_pixel(x, y, Rgb([0, 0, 0]));
+                    }
+                }
+            }
+        }
+        let detection = boxed_detection("text", 0.9, [22.0, 22.0, 98.0, 98.0]);
+        let inferred = infer_typography(&image, &detection).unwrap();
+        assert_eq!(inferred.color, [0, 0, 0]);
+        assert_eq!(inferred.stroke_color, None, "{inferred:?}");
+        assert_eq!(inferred.stroke_width, None, "{inferred:?}");
     }
 }
